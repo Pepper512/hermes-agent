@@ -19,6 +19,7 @@ from typing import Final
 
 
 _ALLOWED_FORMATS: Final[frozenset[str]] = frozenset({"mp3", "wav", "ogg", "flac"})
+MAX_ANONYMOUS_AUDIO_BYTES: Final[int] = 25 * 1024 * 1024
 _STAGE_ERROR: Final[str] = "tts_anonymous_stage_failed"
 _UNSUPPORTED_ERROR: Final[str] = "tts_anonymous_stage_unsupported"
 _SCRUB_ERROR: Final[str] = "tts_anonymous_scrub_failed"
@@ -84,6 +85,7 @@ def _validate_request(output_format: str, maximum_bytes: int) -> None:
         not isinstance(maximum_bytes, int)
         or isinstance(maximum_bytes, bool)
         or maximum_bytes <= 0
+        or maximum_bytes > MAX_ANONYMOUS_AUDIO_BYTES
     ):
         raise AnonymousAudioStageError(_STAGE_ERROR)
 
@@ -208,7 +210,6 @@ class AnonymousAudioStage:
         audio_fd = -1
         root_basename: str | None = None
         audio_basename: str | None = None
-        audio_unlinked = False
         try:
             parent_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
             parent_fd = os.open(parent_path, parent_flags)
@@ -241,7 +242,6 @@ class AnonymousAudioStage:
                 raise AnonymousAudioStageError(_STAGE_ERROR)
 
             os.unlink(audio_basename, dir_fd=root_fd)
-            audio_unlinked = True
             file_stat = os.fstat(audio_fd)
             if not cls._valid_held_file(file_stat, require_unlinked=True):
                 raise AnonymousAudioStageError(_STAGE_ERROR)
@@ -267,8 +267,6 @@ class AnonymousAudioStage:
         except AnonymousAudioStageError:
             cls._close_failed_creation(
                 audio_fd=audio_fd,
-                audio_basename=audio_basename,
-                audio_unlinked=audio_unlinked,
                 root_fd=root_fd,
                 parent_fd=parent_fd,
             )
@@ -276,8 +274,6 @@ class AnonymousAudioStage:
         except (OSError, ValueError, TypeError):
             cls._close_failed_creation(
                 audio_fd=audio_fd,
-                audio_basename=audio_basename,
-                audio_unlinked=audio_unlinked,
                 root_fd=root_fd,
                 parent_fd=parent_fd,
             )
@@ -308,8 +304,6 @@ class AnonymousAudioStage:
     def _close_failed_creation(
         *,
         audio_fd: int,
-        audio_basename: str | None,
-        audio_unlinked: bool,
         root_fd: int,
         parent_fd: int,
     ) -> None:
@@ -319,12 +313,11 @@ class AnonymousAudioStage:
             except OSError:
                 pass
             try:
-                os.close(audio_fd)
+                os.fsync(audio_fd)
             except OSError:
                 pass
-        if not audio_unlinked and audio_basename is not None and root_fd >= 0:
             try:
-                os.unlink(audio_basename, dir_fd=root_fd)
+                os.close(audio_fd)
             except OSError:
                 pass
         if root_fd >= 0:

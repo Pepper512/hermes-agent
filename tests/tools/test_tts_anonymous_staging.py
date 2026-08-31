@@ -384,14 +384,42 @@ def test_unsupported_format_and_invalid_cap_reject_before_materialization(
     tmp_path: Path,
 ):
     before = set(tmp_path.iterdir())
-    for output_format, maximum_bytes in (("aac", 1024), ("mp3", 0), ("mp3", True)):
+    for output_format, maximum_bytes in (
+        ("aac", 1024),
+        ("mp3", 0),
+        ("mp3", True),
+        ("mp3", 1.5),
+        ("mp3", "1024"),
+        ("mp3", None),
+    ):
         with pytest.raises(AnonymousAudioStageError):
             _create_anonymous_audio_stage_for_test(
                 output_format=output_format,
-                maximum_bytes=maximum_bytes,
+                maximum_bytes=maximum_bytes,  # type: ignore[arg-type]
                 parent=tmp_path,
             )
         assert set(tmp_path.iterdir()) == before
+
+
+def test_fixed_25_mib_cap_is_accepted(tmp_path: Path):
+    stage = _test_stage("mp3", 25 * 1024 * 1024, tmp_path)
+    stage.scrub_and_close()
+
+
+@pytest.mark.parametrize("maximum_bytes", [25 * 1024 * 1024 + 1, 2**60])
+def test_cap_above_fixed_25_mib_limit_rejects_before_root_creation(
+    tmp_path: Path, maximum_bytes: int
+):
+    before = set(tmp_path.iterdir())
+    stage = None
+    try:
+        with pytest.raises(AnonymousAudioStageError) as exc_info:
+            stage = _test_stage("mp3", maximum_bytes, tmp_path)
+        assert str(exc_info.value) == "tts_anonymous_stage_failed"
+        assert set(tmp_path.iterdir()) == before
+    finally:
+        if stage is not None:
+            stage.scrub_and_close()
 
 
 def test_untrusted_format_object_rejects_without_invoking_hash(tmp_path: Path):
@@ -426,6 +454,99 @@ def test_seal_rejects_malformed_mp3_headers(tmp_path: Path, invalid_mp3: bytes):
             stage.seal(None)
     finally:
         stage.scrub_and_close()
+
+
+def test_seal_rejects_bad_flac_signature(tmp_path: Path):
+    stage = _test_stage("flac", 1024, tmp_path)
+    try:
+        os.write(_sink_fd(stage), b"not-flac")
+        with pytest.raises(AnonymousAudioStageError):
+            stage.seal(None)
+    finally:
+        stage.scrub_and_close()
+
+
+def test_failed_initial_unlink_scrubs_held_inode_and_preserves_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    real_ftruncate = os.ftruncate
+    real_fsync = os.fsync
+    real_close = os.close
+    original_inode: tuple[int, int] | None = None
+    replacement_basename: str | None = None
+    unlink_attempts = 0
+    held_operations: list[str] = []
+
+    def is_original(fd: int) -> bool:
+        if original_inode is None:
+            return False
+        try:
+            current = os.fstat(fd)
+        except OSError:
+            return False
+        return (current.st_dev, current.st_ino) == original_inode
+
+    def record_ftruncate(fd: int, length: int):
+        if is_original(fd):
+            held_operations.append("ftruncate")
+        return real_ftruncate(fd, length)
+
+    def record_fsync(fd: int):
+        if is_original(fd):
+            held_operations.append("fsync")
+        return real_fsync(fd)
+
+    def record_close(fd: int):
+        if is_original(fd):
+            held_operations.append("close")
+        return real_close(fd)
+
+    def move_replace_and_raise(path: str, *, dir_fd: int):
+        nonlocal original_inode, replacement_basename, unlink_attempts
+        unlink_attempts += 1
+        if unlink_attempts == 1:
+            writer_fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+            os.write(writer_fd, b"private-audio")
+            original = os.fstat(writer_fd)
+            original_inode = (original.st_dev, original.st_ino)
+            replacement_basename = path
+            real_close(writer_fd)
+            os.rename(
+                path,
+                "moved-original",
+                src_dir_fd=dir_fd,
+                dst_dir_fd=dir_fd,
+            )
+            replacement_fd = os.open(
+                path,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=dir_fd,
+            )
+            os.write(replacement_fd, b"replacement")
+            real_close(replacement_fd)
+        raise OSError("injected unlink failure")
+
+    supported_dir_fd = set(os.supports_dir_fd)
+    supported_dir_fd.add(move_replace_and_raise)
+    monkeypatch.setattr(os, "supports_dir_fd", supported_dir_fd)
+    monkeypatch.setattr(os, "unlink", move_replace_and_raise)
+    monkeypatch.setattr(os, "ftruncate", record_ftruncate)
+    monkeypatch.setattr(os, "fsync", record_fsync)
+    monkeypatch.setattr(os, "close", record_close)
+
+    with pytest.raises(AnonymousAudioStageError) as exc_info:
+        _test_stage("mp3", 1024, tmp_path)
+
+    assert str(exc_info.value) == "tts_anonymous_stage_failed"
+    assert "injected" not in str(exc_info.value)
+    assert unlink_attempts == 1
+    assert held_operations == ["ftruncate", "fsync", "close"]
+    roots = list(tmp_path.glob("hermes-tts-*"))
+    assert len(roots) == 1
+    assert (roots[0] / "moved-original").read_bytes() == b""
+    assert replacement_basename is not None
+    assert (roots[0] / replacement_basename).read_bytes() == b"replacement"
 
 
 def test_scrub_targets_held_inode_only(tmp_path: Path):
