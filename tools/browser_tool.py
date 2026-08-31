@@ -3892,6 +3892,10 @@ def _store_full_snapshot(snapshot_text: str) -> Optional[str]:
     None on failure (storage is best-effort; the truncated view is still
     returned to the model).
     """
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return None
     try:
         import hashlib
         from hermes_constants import get_hermes_dir

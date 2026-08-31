@@ -130,6 +130,15 @@ def _prepare_subprocess_home(home: Path) -> None:
     )
 
 
+def _prepare_subprocess_skill(home: Path, name: str) -> None:
+    skill_dir = home / "skills" / name
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: subprocess fixture\n---\n\n# Fixture\n",
+        encoding="utf-8",
+    )
+
+
 def _assert_no_transcript_sinks(home: Path, private_marker: str) -> None:
     forbidden_names = {
         "state.db",
@@ -799,6 +808,8 @@ def test_temp_home_ephemeral_construction_creates_no_session_or_memory_sinks(
                 "local-model",
                 "--provider",
                 "custom",
+                "--skills",
+                "private-preloaded-skill",
             ],
             "private-chat-form",
             "private-chat-form",
@@ -810,6 +821,8 @@ def test_temp_home_ephemeral_construction_creates_no_session_or_memory_sinks(
                 "local-model",
                 "--provider",
                 "custom",
+                "--skills",
+                "private-preloaded-skill",
                 "-z",
                 "private-top-form",
             ],
@@ -831,12 +844,15 @@ def test_both_real_cli_forms_leave_temp_home_sink_free(
     )
     home = tmp_path / "ephemeral-home"
     _prepare_subprocess_home(home)
+    _prepare_subprocess_skill(home, "private-preloaded-skill")
 
     result = _run_ephemeral_subprocess(home, injection, argv, stdin=stdin)
 
     assert result.returncode == 0
     assert result.stdout == "subprocess-ok\n"
     assert result.stderr == ""
+    assert not (home / "skills" / ".usage.json").exists()
+    assert not (home / "skills" / ".usage.json.lock").exists()
     _assert_no_transcript_sinks(home, private_marker)
 
 

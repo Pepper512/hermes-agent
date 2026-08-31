@@ -540,6 +540,28 @@ class TestBuildPreloadedSkillsPrompt:
             task_id="task-preloaded",
         )
 
+    def test_ephemeral_preload_keeps_selected_skill_usage_in_memory(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli.persistence import PersistencePolicy, bind_persistence_policy
+
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        with patch("tools.skills_tool.SKILLS_DIR", skills_dir):
+            _make_skill(skills_dir, "private-selected-skill")
+            with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
+                prompt, loaded, missing = build_preloaded_skills_prompt(
+                    ["private-selected-skill"],
+                    task_id="private-preload-task",
+                )
+
+        assert loaded == ["private-selected-skill"]
+        assert missing == []
+        assert "private-selected-skill" in prompt
+        assert not (skills_dir / ".usage.json").exists()
+        assert not (skills_dir / ".usage.json.lock").exists()
+
 
     def test_skips_disabled_skill(self, tmp_path, monkeypatch):
         """A globally-disabled skill must not be force-loaded via -s /

@@ -198,6 +198,10 @@ _index_lock = threading.Lock()
 
 
 def _cache_dir() -> Optional[Path]:
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return None
     try:
         from hermes_constants import get_hermes_dir
         d = get_hermes_dir("cache/web", "web_cache")
@@ -403,7 +407,9 @@ def extract_cache_put(
     truncate-store ceiling are not cached: serving a capped copy back as if
     whole would silently lose the tail.
     """
-    if not cache_enabled() or not content:
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled() or not cache_enabled() or not content:
         return
     if _is_local_dev_url(url) or _is_cache_exempt_host(url):
         return
