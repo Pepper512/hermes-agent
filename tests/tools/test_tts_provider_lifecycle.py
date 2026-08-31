@@ -367,17 +367,9 @@ def _assert_command_cancel_reaps_tree(tmp_path: Path, monkeypatch) -> None:
     sink_fd = int(Path(stage.sink.path).name)
     real_popen = subprocess.Popen
 
-    class CancelProxy:
-        def __init__(self, proc: subprocess.Popen):
-            self._proc = proc
-            self.pid = proc.pid
-            self.stdin = proc.stdin
-            self.stdout = proc.stdout
-            self.stderr = proc.stderr
-
-        @property
-        def returncode(self):
-            return self._proc.returncode
+    class CancelPopen(real_popen):
+        def __init__(self, *args, **kwargs):
+            real_popen.__init__(self, *args, **kwargs)
 
         def poll(self):
             deadline = time.monotonic() + 2
@@ -386,15 +378,12 @@ def _assert_command_cancel_reaps_tree(tmp_path: Path, monkeypatch) -> None:
             raise KeyboardInterrupt()
 
         def wait(self, timeout=None):
-            return self._proc.wait(timeout=timeout)
+            return real_popen.wait(self, timeout=timeout)
 
         def kill(self):
-            return self._proc.kill()
+            return real_popen.kill(self)
 
-    def spawn(*args, **kwargs):
-        return CancelProxy(real_popen(*args, **kwargs))
-
-    monkeypatch.setattr(tts_tool.subprocess, "Popen", spawn)
+    monkeypatch.setattr(tts_tool.subprocess, "Popen", CancelPopen)
     try:
         with pytest.raises(CommandSinkLifecycleError) as excinfo:
             tts_tool._run_command_tts(
@@ -431,10 +420,10 @@ def _assert_forced_stop_failure_runs_all_cleanup(tmp_path: Path, monkeypatch) ->
     fallback_calls = []
     before_threads = {thread.ident for thread in threading.enumerate()}
 
-    def recording_popen(*args, **kwargs):
-        proc = real_popen(*args, **kwargs)
-        captured["proc"] = proc
-        return proc
+    class RecordingPopen(real_popen):
+        def __init__(self, *args, **kwargs):
+            real_popen.__init__(self, *args, **kwargs)
+            captured["proc"] = self
 
     real_fallback = tts_tool._fallback_stop_command_tts_process_group
 
@@ -442,7 +431,7 @@ def _assert_forced_stop_failure_runs_all_cleanup(tmp_path: Path, monkeypatch) ->
         fallback_calls.append(pgid)
         return real_fallback(proc, pgid)
 
-    monkeypatch.setattr(tts_tool.subprocess, "Popen", recording_popen)
+    monkeypatch.setattr(tts_tool.subprocess, "Popen", RecordingPopen)
     monkeypatch.setattr(
         tts_tool,
         "_stop_command_tts_process_group",
@@ -580,3 +569,278 @@ def test_fallback_clock_failure_still_attempts_direct_kill_and_wait(monkeypatch)
 @pytest.mark.linux_only
 def test_fallback_clock_failure_still_attempts_direct_kill_and_wait_linux(monkeypatch):
     test_fallback_clock_failure_still_attempts_direct_kill_and_wait(monkeypatch)
+
+
+def _cleanup_partial_init_test_process(pid: int | None) -> None:
+    if not isinstance(pid, int):
+        return
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        os.waitpid(pid, 0)
+    except (ChildProcessError, ProcessLookupError):
+        pass
+
+
+def _fixed_error_text(exc: BaseException) -> str:
+    return " ".join((str(exc), repr(exc), repr(exc.args), repr(vars(exc))))
+
+
+def _assert_callable_popen_boundary_rejects_before_invocation(monkeypatch) -> None:
+    from tools import tts_tool
+    from tools.tts_tool import CommandSinkLifecycleError
+
+    invoked = []
+
+    def forbidden_wrapper(*_args, **_kwargs):
+        invoked.append(True)
+        raise KeyboardInterrupt("wrapper-secret")
+
+    monkeypatch.setattr(tts_tool.subprocess, "Popen", forbidden_wrapper)
+    with pytest.raises(CommandSinkLifecycleError) as excinfo:
+        tts_tool._run_command_tts("wrapper-command-secret", 1, input_text="secret")
+    assert invoked == []
+    assert "secret" not in _fixed_error_text(excinfo.value)
+
+
+@pytest.mark.macos_only
+def test_callable_popen_boundary_rejects_before_invocation(monkeypatch):
+    _assert_callable_popen_boundary_rejects_before_invocation(monkeypatch)
+
+
+@pytest.mark.linux_only
+def test_callable_popen_boundary_rejects_before_invocation_linux(monkeypatch):
+    _assert_callable_popen_boundary_rejects_before_invocation(monkeypatch)
+
+
+def _assert_partial_popen_init_failure_reaps_real_child(monkeypatch) -> None:
+    from tools import tts_tool
+    from tools.tts_tool import CommandSinkLifecycleError
+
+    real_popen = subprocess.Popen
+    assert issubclass(real_popen, tts_tool._REVIEWED_POPEN_CLASS)
+
+    class RaisesAfterSpawn(real_popen):
+        spawned_pid = None
+
+        def __init__(self, *args, **kwargs):
+            real_popen.__init__(self, *args, **kwargs)
+            type(self).spawned_pid = self.pid
+            raise KeyboardInterrupt("initializer-secret")
+
+    monkeypatch.setattr(tts_tool.subprocess, "Popen", RaisesAfterSpawn)
+    try:
+        with pytest.raises(CommandSinkLifecycleError) as excinfo:
+            tts_tool._run_command_tts("exec /bin/sleep 30", 1, input_text="secret")
+        pid = RaisesAfterSpawn.spawned_pid
+        assert isinstance(pid, int)
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+        with pytest.raises(ChildProcessError):
+            os.waitpid(pid, os.WNOHANG)
+        assert "secret" not in _fixed_error_text(excinfo.value)
+    finally:
+        _cleanup_partial_init_test_process(RaisesAfterSpawn.spawned_pid)
+
+
+@pytest.mark.macos_only
+def test_partial_popen_init_failure_reaps_real_child(monkeypatch):
+    _assert_partial_popen_init_failure_reaps_real_child(monkeypatch)
+
+
+@pytest.mark.linux_only
+def test_partial_popen_init_failure_reaps_real_child_linux(monkeypatch):
+    _assert_partial_popen_init_failure_reaps_real_child(monkeypatch)
+
+
+def _assert_partial_popen_without_methods_uses_pid_fallback(monkeypatch) -> None:
+    from tools import tts_tool
+    from tools.tts_tool import CommandSinkLifecycleError
+
+    real_popen = subprocess.Popen
+    assert issubclass(real_popen, tts_tool._REVIEWED_POPEN_CLASS)
+
+    class BrokenMethodsAfterSpawn(real_popen):
+        spawned_pid = None
+
+        def __init__(self, *args, **kwargs):
+            real_popen.__init__(self, *args, **kwargs)
+            type(self).spawned_pid = self.pid
+            raise KeyboardInterrupt("partial-secret")
+
+        def poll(self):
+            raise AttributeError("poll unavailable")
+
+        def wait(self, timeout=None):
+            raise AttributeError("wait unavailable")
+
+        def kill(self):
+            raise AttributeError("kill unavailable")
+
+    monkeypatch.setattr(tts_tool.subprocess, "Popen", BrokenMethodsAfterSpawn)
+    try:
+        with pytest.raises(CommandSinkLifecycleError) as excinfo:
+            tts_tool._run_command_tts("exec /bin/sleep 30", 1, input_text="secret")
+        pid = BrokenMethodsAfterSpawn.spawned_pid
+        assert isinstance(pid, int)
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+        with pytest.raises(ChildProcessError):
+            os.waitpid(pid, os.WNOHANG)
+        assert "secret" not in _fixed_error_text(excinfo.value)
+    finally:
+        _cleanup_partial_init_test_process(BrokenMethodsAfterSpawn.spawned_pid)
+
+
+@pytest.mark.macos_only
+def test_partial_popen_without_methods_uses_pid_fallback(monkeypatch):
+    _assert_partial_popen_without_methods_uses_pid_fallback(monkeypatch)
+
+
+@pytest.mark.linux_only
+def test_partial_popen_without_methods_uses_pid_fallback_linux(monkeypatch):
+    _assert_partial_popen_without_methods_uses_pid_fallback(monkeypatch)
+
+
+def _assert_initializer_failure_before_spawn_creates_no_process(monkeypatch) -> None:
+    from tools import tts_tool
+    from tools.tts_tool import CommandSinkLifecycleError
+
+    real_popen = subprocess.Popen
+    assert issubclass(real_popen, tts_tool._REVIEWED_POPEN_CLASS)
+
+    class FailsBeforeSpawn(real_popen):
+        initialized = False
+
+        def __init__(self, *_args, **_kwargs):
+            type(self).initialized = True
+            raise KeyboardInterrupt("before-spawn-secret")
+
+    monkeypatch.setattr(tts_tool.subprocess, "Popen", FailsBeforeSpawn)
+    with pytest.raises(CommandSinkLifecycleError) as excinfo:
+        tts_tool._run_command_tts("command-secret", 1, input_text="secret")
+    assert FailsBeforeSpawn.initialized is True
+    assert not hasattr(excinfo.value, "pid")
+    assert "secret" not in _fixed_error_text(excinfo.value)
+
+
+@pytest.mark.macos_only
+def test_initializer_failure_before_spawn_creates_no_process(monkeypatch):
+    _assert_initializer_failure_before_spawn_creates_no_process(monkeypatch)
+
+
+@pytest.mark.linux_only
+def test_initializer_failure_before_spawn_creates_no_process_linux(monkeypatch):
+    _assert_initializer_failure_before_spawn_creates_no_process(monkeypatch)
+
+
+def _assert_invalid_partial_pid_never_reaches_process_control(monkeypatch) -> None:
+    from tools import tts_tool
+
+    events = []
+
+    class Partial:
+        pid = -1
+        _child_created = True
+        returncode = None
+        stdin = None
+        stdout = None
+        stderr = None
+
+    monkeypatch.setattr(
+        tts_tool,
+        "_stop_command_tts_process_group",
+        lambda *_args: events.append("stop"),
+    )
+    monkeypatch.setattr(
+        tts_tool,
+        "_fallback_stop_command_tts_process_group",
+        lambda *_args: events.append("fallback"),
+    )
+    monkeypatch.setattr(tts_tool.os, "killpg", lambda *_args: events.append("killpg"))
+    monkeypatch.setattr(tts_tool.os, "kill", lambda *_args: events.append("kill"))
+    monkeypatch.setattr(tts_tool.os, "waitpid", lambda *_args: events.append("waitpid"))
+    tts_tool._emergency_cleanup_spawned_command_tts_process(Partial())
+    assert events == []
+
+
+@pytest.mark.macos_only
+def test_invalid_partial_pid_never_reaches_process_control(monkeypatch):
+    _assert_invalid_partial_pid_never_reaches_process_control(monkeypatch)
+
+
+@pytest.mark.linux_only
+def test_invalid_partial_pid_never_reaches_process_control_linux(monkeypatch):
+    _assert_invalid_partial_pid_never_reaches_process_control(monkeypatch)
+
+
+def _assert_unconfirmed_partial_pid_never_reaches_process_control(monkeypatch) -> None:
+    from tools import tts_tool
+
+    events = []
+
+    class Partial:
+        pid = 424242
+        _child_created = False
+        returncode = None
+        stdin = None
+        stdout = None
+        stderr = None
+
+    monkeypatch.setattr(
+        tts_tool,
+        "_stop_command_tts_process_group",
+        lambda *_args: events.append("stop"),
+    )
+    monkeypatch.setattr(tts_tool.os, "killpg", lambda *_args: events.append("killpg"))
+    monkeypatch.setattr(tts_tool.os, "kill", lambda *_args: events.append("kill"))
+    monkeypatch.setattr(tts_tool.os, "waitpid", lambda *_args: events.append("waitpid"))
+    tts_tool._emergency_cleanup_spawned_command_tts_process(Partial())
+    assert events == []
+
+
+@pytest.mark.macos_only
+def test_unconfirmed_partial_pid_never_reaches_process_control(monkeypatch):
+    _assert_unconfirmed_partial_pid_never_reaches_process_control(monkeypatch)
+
+
+@pytest.mark.linux_only
+def test_unconfirmed_partial_pid_never_reaches_process_control_linux(monkeypatch):
+    _assert_unconfirmed_partial_pid_never_reaches_process_control(monkeypatch)
+
+
+def _assert_successful_high_level_cleanup_skips_raw_pid_fallback(monkeypatch) -> None:
+    from tools import tts_tool
+
+    events = []
+
+    class Partial:
+        pid = 424242
+        _child_created = True
+        returncode = 0
+        stdin = None
+        stdout = None
+        stderr = None
+
+    monkeypatch.setattr(
+        tts_tool,
+        "_stop_command_tts_process_group",
+        lambda *_args: events.append("stop"),
+    )
+    monkeypatch.setattr(tts_tool.os, "killpg", lambda *_args: events.append("killpg"))
+    monkeypatch.setattr(tts_tool.os, "kill", lambda *_args: events.append("kill"))
+    monkeypatch.setattr(tts_tool.os, "waitpid", lambda *_args: events.append("waitpid"))
+    tts_tool._emergency_cleanup_spawned_command_tts_process(Partial())
+    assert events == ["stop"]
+
+
+@pytest.mark.macos_only
+def test_successful_high_level_cleanup_skips_raw_pid_fallback(monkeypatch):
+    _assert_successful_high_level_cleanup_skips_raw_pid_fallback(monkeypatch)
+
+
+@pytest.mark.linux_only
+def test_successful_high_level_cleanup_skips_raw_pid_fallback_linux(monkeypatch):
+    _assert_successful_high_level_cleanup_skips_raw_pid_fallback(monkeypatch)

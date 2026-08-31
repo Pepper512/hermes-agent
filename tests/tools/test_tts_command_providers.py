@@ -359,11 +359,12 @@ class TestRunCommandTts:
 
         real_popen = subprocess.Popen
 
-        def delayed_popen(*args, **kwargs):
-            time.sleep(0.08)
-            return real_popen(*args, **kwargs)
+        class DelayedPopen(real_popen):
+            def __init__(self, *args, **kwargs):
+                time.sleep(0.08)
+                real_popen.__init__(self, *args, **kwargs)
 
-        monkeypatch.setattr(tts_tool.subprocess, "Popen", delayed_popen)
+        monkeypatch.setattr(tts_tool.subprocess, "Popen", DelayedPopen)
         command = _shell_command(
             sys.executable,
             "-c",
@@ -397,12 +398,12 @@ class TestRunCommandTts:
             def closed(self):
                 return self._stream.closed
 
-        def delayed_reader_popen(*args, **kwargs):
-            proc = real_popen(*args, **kwargs)
-            proc.stdout = SlowReader(proc.stdout)
-            return proc
+        class DelayedReaderPopen(real_popen):
+            def __init__(self, *args, **kwargs):
+                real_popen.__init__(self, *args, **kwargs)
+                self.stdout = SlowReader(self.stdout)
 
-        monkeypatch.setattr(tts_tool.subprocess, "Popen", delayed_reader_popen)
+        monkeypatch.setattr(tts_tool.subprocess, "Popen", DelayedReaderPopen)
         command = _shell_command(sys.executable, "-c", "print('drain me')")
         with pytest.raises(CommandSinkLifecycleError):
             tts_tool._run_command_tts(command, 0.1, input_text="x")
@@ -414,23 +415,20 @@ class TestRunCommandTts:
         real_popen = subprocess.Popen
         captured = {}
 
-        class PidFailsOnce:
-            def __init__(self, proc):
-                object.__setattr__(self, "_proc", proc)
-                object.__setattr__(self, "_failed", False)
+        class PidFailsOnce(real_popen):
+            def __init__(self, *args, **kwargs):
+                self._fail_pid_access = False
+                real_popen.__init__(self, *args, **kwargs)
+                captured["proc"] = self
+                self._fail_pid_access = True
 
-            def __getattr__(self, name):
-                if name == "pid" and not object.__getattribute__(self, "_failed"):
-                    object.__setattr__(self, "_failed", True)
+            def __getattribute__(self, name):
+                if name == "pid" and object.__getattribute__(self, "_fail_pid_access"):
+                    object.__setattr__(self, "_fail_pid_access", False)
                     raise KeyboardInterrupt
-                return getattr(object.__getattribute__(self, "_proc"), name)
+                return real_popen.__getattribute__(self, name)
 
-        def failing_pid_popen(*args, **kwargs):
-            proc = real_popen(*args, **kwargs)
-            captured["proc"] = proc
-            return PidFailsOnce(proc)
-
-        monkeypatch.setattr(tts_tool.subprocess, "Popen", failing_pid_popen)
+        monkeypatch.setattr(tts_tool.subprocess, "Popen", PidFailsOnce)
         command = "exec " + _shell_command(
             sys.executable,
             "-c",
@@ -447,12 +445,12 @@ class TestRunCommandTts:
         real_popen = subprocess.Popen
         captured = {}
 
-        def recording_popen(*args, **kwargs):
-            proc = real_popen(*args, **kwargs)
-            captured["proc"] = proc
-            return proc
+        class RecordingPopen(real_popen):
+            def __init__(self, *args, **kwargs):
+                real_popen.__init__(self, *args, **kwargs)
+                captured["proc"] = self
 
-        monkeypatch.setattr(tts_tool.subprocess, "Popen", recording_popen)
+        monkeypatch.setattr(tts_tool.subprocess, "Popen", RecordingPopen)
         class FailingThreading:
             Thread = threading.Thread
 
@@ -479,7 +477,11 @@ class TestRunCommandTts:
 
         def fixed_error_after_spawn(command, timeout, env_passthrough, **kwargs):
             del timeout, env_passthrough
-            proc = kwargs["popen"](
+            popen_class = kwargs["popen_class"]
+            proc = tts_tool._REVIEWED_POPEN_CLASS.__new__(popen_class)
+            kwargs["ownership"][0] = proc
+            popen_class.__init__(
+                proc,
                 command,
                 shell=True,
                 stdin=subprocess.DEVNULL,
@@ -512,7 +514,11 @@ class TestRunCommandTts:
 
         def fixed_error_after_exit(command, timeout, env_passthrough, **kwargs):
             del timeout, env_passthrough
-            proc = kwargs["popen"](
+            popen_class = kwargs["popen_class"]
+            proc = tts_tool._REVIEWED_POPEN_CLASS.__new__(popen_class)
+            kwargs["ownership"][0] = proc
+            popen_class.__init__(
+                proc,
                 command,
                 shell=True,
                 stdin=subprocess.PIPE,
@@ -588,12 +594,19 @@ class TestRunCommandTts:
             def close(self):
                 pass
 
-        class Proc:
-            pid = 12345
-            returncode = 0
-            stdin = Stream()
-            stdout = Stream()
-            stderr = Stream()
+        from tools import tts_tool
+
+        real_popen = tts_tool._REVIEWED_POPEN_CLASS
+
+        class Proc(real_popen):
+            def __init__(self, command, **kwargs):
+                del command
+                captured.update(kwargs)
+                self.pid = 12345
+                self.returncode = 0
+                self.stdin = Stream()
+                self.stdout = Stream()
+                self.stderr = Stream()
 
             def wait(self, timeout=None):
                 return 0
@@ -601,11 +614,7 @@ class TestRunCommandTts:
             def poll(self):
                 return self.returncode
 
-        def fake_popen(command, **kwargs):
-            captured.update(kwargs)
-            return Proc()
-
-        monkeypatch.setattr("tools.tts_tool.subprocess.Popen", fake_popen)
+        monkeypatch.setattr("tools.tts_tool.subprocess.Popen", Proc)
         monkeypatch.setattr("tools.tts_tool._stop_command_tts_process_group", lambda *a, **k: None)
         _run_command_tts("writer", 1, inherited_sink_fd=17, input_text="hello")
         assert captured["pass_fds"] == (17,)
@@ -699,12 +708,13 @@ class TestRunCommandTts:
         captured = {}
         real_popen = subprocess.Popen
 
-        def recording_popen(command, **kwargs):
-            captured["command"] = command
-            captured["env"] = dict(kwargs["env"])
-            return real_popen(command, **kwargs)
+        class RecordingPopen(real_popen):
+            def __init__(self, command, **kwargs):
+                captured["command"] = command
+                captured["env"] = dict(kwargs["env"])
+                real_popen.__init__(self, command, **kwargs)
 
-        monkeypatch.setattr(tts_tool.subprocess, "Popen", recording_popen)
+        monkeypatch.setattr(tts_tool.subprocess, "Popen", RecordingPopen)
         stage = _create_anonymous_audio_stage_for_test("mp3", 4096, tmp_path)
         adapter = command_adapter(
             "failed-writer",

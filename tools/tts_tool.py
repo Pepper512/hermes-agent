@@ -67,6 +67,11 @@ from hermes_constants import display_hermes_home
 logger = logging.getLogger(__name__)
 
 _COMMAND_SINK_LIFECYCLE_ERROR = "tts_command_sink_lifecycle_failed"
+_REVIEWED_POPEN_CLASS = next(
+    candidate
+    for candidate in subprocess.Popen.__mro__
+    if candidate.__module__ == "subprocess" and candidate.__name__ == "Popen"
+)
 
 
 class CommandSinkLifecycleError(RuntimeError):
@@ -1529,20 +1534,81 @@ def _run_command_tts_named_legacy(
 
 def _emergency_cleanup_spawned_command_tts_process(proc: subprocess.Popen) -> None:
     """Best-effort fixed-boundary cleanup for failures before lifecycle setup."""
+    candidate_pid: int | None = None
     try:
-        candidate_pid = getattr(proc, "pid", None)
+        observed_pid = getattr(proc, "pid", None)
+        child_created = getattr(proc, "_child_created", False) is True
+        candidate_pid = (
+            observed_pid
+            if child_created
+            and isinstance(observed_pid, int)
+            and not isinstance(observed_pid, bool)
+            and observed_pid > 0
+            else None
+        )
         owned_pgid = (
             candidate_pid
-            if os.name == "posix" and isinstance(candidate_pid, int)
+            if os.name == "posix" and candidate_pid is not None
             else None
         )
     except BaseException:
         owned_pgid = None
     try:
-        _stop_command_tts_process_group(proc, owned_pgid)
+        getattr(proc, "returncode", None)
     except BaseException:
+        pass
+    cleanup_succeeded = False
+    if candidate_pid is not None:
         try:
-            _fallback_stop_command_tts_process_group(proc, owned_pgid)
+            _stop_command_tts_process_group(proc, owned_pgid)
+            cleanup_succeeded = True
+        except BaseException:
+            try:
+                _fallback_stop_command_tts_process_group(proc, owned_pgid)
+                cleanup_succeeded = True
+            except BaseException:
+                pass
+    try:
+        liveness_uncertain = getattr(proc, "returncode", None) is None
+    except BaseException:
+        liveness_uncertain = True
+    if (
+        os.name == "posix"
+        and candidate_pid is not None
+        and (not cleanup_succeeded or liveness_uncertain)
+    ):
+        if owned_pgid is not None:
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(owned_pgid, sig)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                except BaseException:
+                    pass
+        try:
+            os.kill(candidate_pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        except BaseException:
+            pass
+        try:
+            deadline = time.monotonic() + 0.5
+            while True:
+                try:
+                    waited_pid, status = os.waitpid(candidate_pid, os.WNOHANG)
+                except (ChildProcessError, ProcessLookupError):
+                    break
+                except BaseException:
+                    break
+                if waited_pid == candidate_pid:
+                    try:
+                        proc.returncode = os.waitstatus_to_exitcode(status)
+                    except BaseException:
+                        pass
+                    break
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.01)
         except BaseException:
             pass
     for name in ("stdin", "stdout", "stderr"):
@@ -1591,12 +1657,12 @@ def _run_command_tts_sink_process(
     input_text: str | None,
 ) -> None:
     """Fixed boundary which owns a spawned child before Python setup resumes."""
-    spawned: subprocess.Popen | None = None
-
-    def owned_popen(*args: Any, **kwargs: Any) -> subprocess.Popen:
-        nonlocal spawned
-        spawned = subprocess.Popen(*args, **kwargs)
-        return spawned
+    popen_class = subprocess.Popen
+    if not isinstance(popen_class, type) or not issubclass(
+        popen_class, _REVIEWED_POPEN_CLASS
+    ):
+        raise CommandSinkLifecycleError(_COMMAND_SINK_LIFECYCLE_ERROR) from None
+    ownership: list[subprocess.Popen | None] = [None]
 
     try:
         return _run_command_tts_sink_process_impl(
@@ -1605,15 +1671,18 @@ def _run_command_tts_sink_process(
             env_passthrough,
             inherited_sink_fd=inherited_sink_fd,
             input_text=input_text,
-            popen=owned_popen,
+            popen_class=popen_class,
+            ownership=ownership,
         )
     except CommandSinkLifecycleError:
+        spawned = ownership[0]
         if spawned is not None and _spawned_command_tts_process_needs_cleanup(
             spawned
         ):
             _emergency_cleanup_spawned_command_tts_process(spawned)
         raise
     except BaseException:
+        spawned = ownership[0]
         if spawned is not None:
             _emergency_cleanup_spawned_command_tts_process(spawned)
         raise CommandSinkLifecycleError(_COMMAND_SINK_LIFECYCLE_ERROR) from None
@@ -1626,7 +1695,8 @@ def _run_command_tts_sink_process_impl(
     *,
     inherited_sink_fd: int | None,
     input_text: str | None,
-    popen: Callable[..., subprocess.Popen],
+    popen_class: type[subprocess.Popen],
+    ownership: list[subprocess.Popen | None],
 ) -> None:
     """Run one sink command within an absolute bounded lifecycle.
 
@@ -1688,7 +1758,11 @@ def _run_command_tts_sink_process_impl(
         writer: threading.Thread | None = None
         started_threads: list[threading.Thread] = []
         cleanup_failures = 0
-        proc = popen(command, **popen_kwargs)
+        proc = _REVIEWED_POPEN_CLASS.__new__(popen_class)
+        ownership[0] = proc
+        proc._child_created = False
+        proc.returncode = None
+        popen_class.__init__(proc, command, **popen_kwargs)
     except BaseException:
         raise CommandSinkLifecycleError(_COMMAND_SINK_LIFECYCLE_ERROR) from None
 
