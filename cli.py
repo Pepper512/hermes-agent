@@ -1400,7 +1400,9 @@ def _flush_one_shot_session_store(cli) -> None:
     session_id = getattr(agent, "session_id", None) or getattr(cli, "session_id", None)
     if not session_id or session_id in _handed_off_session_ids:
         return
-    if getattr(agent, "_persist_disabled", False):
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled(agent):
         return
     # Retry persistence for any rows the in-turn flush failed to write.
     # ``cli.conversation_history`` holds the resumed history's live dicts, so

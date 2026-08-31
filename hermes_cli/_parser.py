@@ -147,6 +147,7 @@ def build_top_level_parser():
         description="Hermes Agent - AI assistant with tool-calling capabilities",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=_EPILOGUE,
+        allow_abbrev=False,
     )
 
     parser.add_argument(
@@ -361,6 +362,7 @@ def build_top_level_parser():
         "chat",
         help="Interactive chat with the agent",
         description="Start an interactive chat session with Hermes Agent",
+        allow_abbrev=False,
     )
     _query_group = chat_parser.add_mutually_exclusive_group()
     _query_group.add_argument(

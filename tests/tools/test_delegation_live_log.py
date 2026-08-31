@@ -29,6 +29,106 @@ from tools.delegation_live_log import (
 )
 
 
+def test_ephemeral_creation_returns_no_paths_and_creates_no_live_tree(
+    tmp_path, monkeypatch
+):
+    from hermes_cli.persistence import PersistencePolicy, bind_persistence_policy
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
+        delegation_id, writers, paths = create_live_transcripts(
+            [
+                {
+                    "goal": "private-live-delegation-goal",
+                    "context": "private-live-context",
+                }
+            ],
+            model="private-model",
+            provider="private-provider",
+        )
+
+    assert delegation_id is None
+    assert writers == [None]
+    assert paths == []
+    assert not (tmp_path / "cache" / "delegation" / "live").exists()
+
+
+def test_ephemeral_writer_constructor_cannot_create_or_append_live_log(
+    tmp_path, monkeypatch
+):
+    from hermes_cli.persistence import PersistencePolicy, bind_persistence_policy
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
+        writer = LiveTranscriptWriter(
+            "deleg_private",
+            0,
+            "private-live-delegation-goal",
+            context="private-live-context",
+        )
+        writer.event("assistant", "private-live-output")
+
+    assert writer.path is None
+    assert not (tmp_path / "cache" / "delegation" / "live").exists()
+
+
+@pytest.mark.parametrize("background", [False, True])
+def test_ephemeral_delegate_callers_return_no_live_paths(
+    tmp_path, monkeypatch, background
+):
+    from hermes_cli.persistence import PersistencePolicy, bind_persistence_policy
+    from tools import delegate_tool
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    parent = _make_parent()
+    parent.persistence_policy = PersistencePolicy.EPHEMERAL
+    parent._persist_disabled = False
+    child = MagicMock()
+    child.persistence_policy = PersistencePolicy.EPHEMERAL
+    child.model = "private-model"
+    child.session_prompt_tokens = 0
+    child.session_completion_tokens = 0
+    child.run_conversation.return_value = {
+        "final_response": "private-summary",
+        "completed": True,
+        "interrupted": False,
+        "api_calls": 1,
+        "messages": [],
+    }
+    monkeypatch.setattr(
+        delegate_tool,
+        "_build_child_preserving_parent_tools",
+        lambda **_kwargs: child,
+    )
+    if background:
+        monkeypatch.setattr(
+            "gateway.session_context.async_delivery_supported", lambda: True
+        )
+        monkeypatch.setattr(
+            "tools.async_delegation.dispatch_async_delegation_batch",
+            lambda **_kwargs: {
+                "status": "dispatched",
+                "delegation_id": "deleg_ephemeral",
+            },
+        )
+
+    with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
+        payload = json.loads(
+            delegate_tool.delegate_task(
+                goal="private-live-delegation-goal",
+                parent_agent=parent,
+                background=background,
+            )
+        )
+
+    assert "live_transcript" not in payload
+    assert "live_transcripts" not in payload
+    assert "live_transcripts_hint" not in payload
+    assert not (tmp_path / "cache" / "delegation" / "live").exists()
+
+
 # ---------------------------------------------------------------------------
 # Writer unit tests
 # ---------------------------------------------------------------------------

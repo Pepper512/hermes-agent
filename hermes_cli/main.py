@@ -74,14 +74,21 @@ suppress_platform_ver_console()
 import os
 import sys
 
+
+def _argv_before_separator(argv=None):
+    """Return option-bearing argv tokens, excluding literal prompt data."""
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    if "--" in tokens:
+        return tokens[: tokens.index("--")]
+    return tokens
+
+
 # Establish the restrictive policy before importing the CLI startup graph.
 # Full-parser registration imports many optional command modules, and some of
 # those import session-aware helpers.  Raw detection is safe because the
 # public flag is a const option and anything after ``--`` is prompt data;
 # argparse performs the authoritative closed-grammar validation later.
-_bootstrap_argv = sys.argv[1:]
-if "--" in _bootstrap_argv:
-    _bootstrap_argv = _bootstrap_argv[: _bootstrap_argv.index("--")]
+_bootstrap_argv = _argv_before_separator()
 if "--ephemeral-session" in _bootstrap_argv:
     from hermes_cli.persistence import (
         PersistencePolicy as _BootstrapPersistencePolicy,
@@ -12495,7 +12502,7 @@ def _plugin_cli_discovery_needed() -> bool:
     """
     # The ephemeral surface is deliberately closed to plugin commands.  Do
     # not import/discover plugin code merely to reject such an invocation.
-    if "--ephemeral-session" in sys.argv[1:]:
+    if "--ephemeral-session" in _argv_before_separator():
         return False
     first = _first_positional_argv()
     if first is None:
@@ -13210,11 +13217,7 @@ def main():
     that parser; normal validation still supplies the authoritative parsed
     value and rejects every unsupported combination.
     """
-    argv_before_separator = sys.argv[1:]
-    if "--" in argv_before_separator:
-        argv_before_separator = argv_before_separator[
-            : argv_before_separator.index("--")
-        ]
+    argv_before_separator = _argv_before_separator()
     from hermes_cli.persistence import PersistencePolicy, bind_persistence_policy
 
     policy = (

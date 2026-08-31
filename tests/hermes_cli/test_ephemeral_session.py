@@ -190,6 +190,34 @@ def test_parser_defaults_to_durable_policy() -> None:
 @pytest.mark.parametrize(
     "argv",
     [
+        ["--ephemeral-sess", "-z", "private"],
+        ["chat", "--query-file", "-", "--oneshot", "--ephemeral-sess"],
+    ],
+)
+def test_ephemeral_flag_rejects_long_option_abbreviations(argv: list[str]) -> None:
+    from hermes_cli._parser import build_top_level_parser
+
+    parser, _subparsers, _chat_parser = build_top_level_parser()
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(argv)
+
+    assert exc_info.value.code == 2
+
+
+def test_plugin_discovery_treats_ephemeral_flag_after_separator_as_prompt(
+    monkeypatch,
+) -> None:
+    import hermes_cli.main as main_mod
+
+    monkeypatch.setattr(sys, "argv", ["hermes", "--", "--ephemeral-session"])
+
+    assert main_mod._plugin_cli_discovery_needed() is True
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
         ["--ephemeral-session"],
         ["--ephemeral-session", "--resume", "latest", "-z", "hello"],
         ["--ephemeral-session", "--continue", "-z", "hello"],
@@ -337,6 +365,38 @@ def test_ephemeral_policy_suppresses_all_lifecycle_hooks(monkeypatch) -> None:
         assert lifecycle.has_hook("pre_api_request") is False
         assert lifecycle.invoke_hook("pre_api_request", user_message="private") == []
         assert lifecycle.finalize_session(session_id="private") == []
+
+
+def test_ephemeral_policy_suppresses_direct_preverify_and_precommand_dispatch(
+    monkeypatch,
+) -> None:
+    from hermes_cli import plugins
+    from hermes_cli.persistence import PersistencePolicy, bind_persistence_policy
+
+    raw_dispatch = MagicMock(return_value=[{"action": "continue", "message": "raw"}])
+    manager = MagicMock()
+    manager.has_hook.return_value = True
+    monkeypatch.setattr(plugins, "invoke_hook", raw_dispatch)
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+
+    with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
+        assert (
+            plugins.get_pre_verify_continue_message(
+                final_response="private-final",
+                changed_paths=["/private/path"],
+            )
+            is None
+        )
+        plugins.fire_pre_command_hook(
+            surface="cli",
+            command="private-command",
+            alias_used="private-alias",
+            args_raw="private arguments",
+        )
+
+    raw_dispatch.assert_not_called()
+    manager.has_hook.assert_not_called()
+    manager.invoke_hook.assert_not_called()
 
 
 def test_delegated_child_inherits_ephemeral_policy_without_opening_db() -> None:
