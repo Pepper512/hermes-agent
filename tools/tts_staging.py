@@ -18,8 +18,11 @@ import tempfile
 from typing import Final
 
 
-_ALLOWED_FORMATS: Final[frozenset[str]] = frozenset({"mp3", "wav", "ogg", "flac"})
+_ALLOWED_FORMATS: Final[frozenset[str]] = frozenset(
+    {"mp3", "wav", "ogg", "flac", "m4a", "aac", "amr", "opus"}
+)
 MAX_ANONYMOUS_AUDIO_BYTES: Final[int] = 25 * 1024 * 1024
+_MAX_SIGNATURE_BYTES: Final[int] = 64 * 1024
 _STAGE_ERROR: Final[str] = "tts_anonymous_stage_failed"
 _UNSUPPORTED_ERROR: Final[str] = "tts_anonymous_stage_unsupported"
 _SCRUB_ERROR: Final[str] = "tts_anonymous_scrub_failed"
@@ -99,7 +102,9 @@ def _require_host_capabilities(platform: str) -> None:
         raise AnonymousAudioStageUnsupported(_UNSUPPORTED_ERROR)
 
 
-def _valid_format_signature(output_format: str, header: bytes) -> bool:
+def _valid_format_signature(
+    output_format: str, header: bytes, *, total_size: int
+) -> bool:
     if output_format == "mp3":
         if header.startswith(b"ID3"):
             return (
@@ -126,7 +131,59 @@ def _valid_format_signature(output_format: str, header: bytes) -> bool:
         return header.startswith(b"OggS")
     if output_format == "flac":
         return header.startswith(b"fLaC")
+    if output_format == "m4a":
+        if len(header) < 16 or header[4:8] != b"ftyp":
+            return False
+        box_size = int.from_bytes(header[:4], "big")
+        return 16 <= box_size <= total_size
+    if output_format == "aac":
+        if len(header) < 7 or header[0] != 0xFF or header[1] & 0xF0 != 0xF0:
+            return False
+        layer = (header[1] >> 1) & 0x03
+        sample_rate_index = (header[2] >> 2) & 0x0F
+        frame_length = (
+            ((header[3] & 0x03) << 11) | (header[4] << 3) | (header[5] >> 5)
+        )
+        return (
+            layer == 0
+            and sample_rate_index < 0x0D
+            and 7 <= frame_length <= total_size
+        )
+    if output_format == "amr":
+        return header.startswith(b"#!AMR\n") or header.startswith(b"#!AMR-WB\n")
+    if output_format == "opus":
+        return _valid_opus_first_page(header, total_size=total_size)
     return False
+
+
+def _valid_opus_first_page(header: bytes, *, total_size: int) -> bool:
+    if len(header) < 27 or header[:5] != b"OggS\x00":
+        return False
+    if header[5] & 0x01 or not header[5] & 0x02:
+        return False
+    segment_count = header[26]
+    segment_table_end = 27 + segment_count
+    if segment_count == 0 or len(header) < segment_table_end:
+        return False
+    segment_sizes = header[27:segment_table_end]
+    page_end = segment_table_end + sum(segment_sizes)
+    if page_end > len(header) or page_end > total_size:
+        return False
+    first_packet_size = 0
+    packet_terminated = False
+    for segment_size in segment_sizes:
+        first_packet_size += segment_size
+        if segment_size < 255:
+            packet_terminated = True
+            break
+    if not packet_terminated or first_packet_size < 19:
+        return False
+    first_packet = header[segment_table_end : segment_table_end + first_packet_size]
+    return (
+        first_packet.startswith(b"OpusHead")
+        and first_packet[8] == 1
+        and first_packet[9] > 0
+    )
 
 
 class AnonymousAudioStage:
@@ -349,9 +406,13 @@ class AnonymousAudioStage:
             if not self._valid_final_stat(held):
                 raise AnonymousAudioStageError(_STAGE_ERROR)
             os.lseek(self._fd, 0, os.SEEK_SET)
-            header = os.read(self._fd, min(held.st_size, 12))
+            header = os.read(self._fd, min(held.st_size, _MAX_SIGNATURE_BYTES))
             os.lseek(self._fd, 0, os.SEEK_SET)
-            if not _valid_format_signature(self._sink.output_format, header):
+            if not _valid_format_signature(
+                self._sink.output_format,
+                header,
+                total_size=held.st_size,
+            ):
                 raise AnonymousAudioStageError(_STAGE_ERROR)
             digest = self._digest_held_bytes(held.st_size)
             after_digest = os.fstat(self._fd)
@@ -416,7 +477,11 @@ class AnonymousAudioStage:
             data = b"".join(chunks)
             if hashlib.sha256(data).digest() != sealed._digest:
                 raise AnonymousAudioStageError(_STAGE_ERROR)
-            if not _valid_format_signature(sealed._output_format, data[:12]):
+            if not _valid_format_signature(
+                sealed._output_format,
+                data[:_MAX_SIGNATURE_BYTES],
+                total_size=len(data),
+            ):
                 raise AnonymousAudioStageError(_STAGE_ERROR)
             return data
         except AnonymousAudioStageError:

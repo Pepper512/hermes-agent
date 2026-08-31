@@ -10,6 +10,7 @@ import tempfile
 import pytest
 
 from tools.tts_staging import (
+    _ALLOWED_FORMATS,
     AnonymousAudioStage,
     AnonymousAudioStageError,
     AnonymousAudioStageUnsupported,
@@ -20,11 +21,37 @@ from tools.tts_staging import (
 )
 
 
+VALID_OPUS = (
+    b"OggS"
+    + b"\x00"
+    + b"\x02"
+    + b"\x00" * 20
+    + b"\x01"
+    + b"\x13"
+    + b"OpusHead"
+    + b"\x01\x02\x00\x00\x80\xbb\x00\x00\x00\x00\x00"
+)
+
 VALID_AUDIO = {
     "mp3": b"ID3\x04\x00\x00\x00\x00\x00\x00payload",
     "wav": b"RIFF\x04\x00\x00\x00WAVEpayload",
     "ogg": b"OggS\x00payload",
     "flac": b"fLaCpayload",
+    "m4a": b"\x00\x00\x00\x18ftypM4A \x00\x00\x00\x00M4A isom",
+    "aac": b"\xff\xf1\x50\x80\x00\xff\xfc",
+    "amr": b"#!AMR\npayload",
+    "opus": VALID_OPUS,
+}
+
+INVALID_AUDIO = {
+    "mp3": b"not-mp3",
+    "wav": b"RIFF\x04\x00\x00\x00NOPEpayload",
+    "ogg": b"not-ogg",
+    "flac": b"not-flac",
+    "m4a": b"\x00\x00\x01\x00ftypM4A ",
+    "aac": b"\xff\xf1\x34\x80\x00\xff\xfc",
+    "amr": b"#!AMRpayload",
+    "opus": b"OggS\x00payload",
 }
 
 
@@ -163,7 +190,15 @@ def test_production_temp_root_resolution_failure_is_fixed_and_path_free(
     assert "sensitive" not in str(exc_info.value)
 
 
-@pytest.mark.parametrize("output_format", ["mp3", "wav", "ogg", "flac"])
+def test_stage_format_allowlist_matches_command_provider_formats():
+    from tools.tts_tool import COMMAND_TTS_OUTPUT_FORMATS
+
+    assert _ALLOWED_FORMATS == COMMAND_TTS_OUTPUT_FORMATS
+
+
+@pytest.mark.parametrize(
+    "output_format", ["mp3", "wav", "ogg", "flac", "m4a", "aac", "amr", "opus"]
+)
 def test_seal_accepts_none_ack_for_allowlisted_valid_audio(
     tmp_path: Path, output_format: str
 ):
@@ -295,12 +330,7 @@ def test_seal_rejects_size_over_cap(tmp_path: Path):
 
 @pytest.mark.parametrize(
     ("output_format", "invalid_audio"),
-    [
-        ("mp3", b"not-mp3"),
-        ("wav", b"RIFF\x04\x00\x00\x00NOPEpayload"),
-        ("ogg", b"not-ogg"),
-        ("flac", b"not-flac"),
-    ],
+    sorted(INVALID_AUDIO.items()),
 )
 def test_seal_rejects_invalid_format_signatures(
     tmp_path: Path, output_format: str, invalid_audio: bytes
@@ -308,6 +338,62 @@ def test_seal_rejects_invalid_format_signatures(
     stage = _test_stage(output_format, 1024, tmp_path)
     try:
         os.write(_sink_fd(stage), invalid_audio)
+        with pytest.raises(AnonymousAudioStageError):
+            stage.seal(None)
+    finally:
+        stage.scrub_and_close()
+
+
+def test_amr_wideband_signature_is_accepted(tmp_path: Path):
+    stage = _test_stage("amr", 1024, tmp_path)
+    try:
+        audio = b"#!AMR-WB\npayload"
+        os.write(_sink_fd(stage), audio)
+        sealed = stage.seal(None)
+        assert stage.read_bounded(sealed) == audio
+    finally:
+        stage.scrub_and_close()
+
+
+def test_plain_ogg_header_is_not_accepted_as_opus(tmp_path: Path):
+    stage = _test_stage("opus", 1024, tmp_path)
+    try:
+        os.write(_sink_fd(stage), VALID_AUDIO["ogg"])
+        with pytest.raises(AnonymousAudioStageError):
+            stage.seal(None)
+    finally:
+        stage.scrub_and_close()
+
+
+@pytest.mark.parametrize(("field_offset", "invalid_value"), [(36, 0), (37, 0)])
+def test_opus_rejects_invalid_version_or_channel_count(
+    tmp_path: Path, field_offset: int, invalid_value: int
+):
+    stage = _test_stage("opus", 1024, tmp_path)
+    try:
+        audio = bytearray(VALID_OPUS)
+        audio[field_offset] = invalid_value
+        os.write(_sink_fd(stage), audio)
+        with pytest.raises(AnonymousAudioStageError):
+            stage.seal(None)
+    finally:
+        stage.scrub_and_close()
+
+
+def test_opus_rejects_unterminated_identification_packet(tmp_path: Path):
+    stage = _test_stage("opus", 1024, tmp_path)
+    try:
+        audio = (
+            b"OggS"
+            + b"\x00"
+            + b"\x02"
+            + b"\x00" * 20
+            + b"\x01"
+            + b"\xff"
+            + b"OpusHead\x01\x02"
+            + b"\x00" * 245
+        )
+        os.write(_sink_fd(stage), audio)
         with pytest.raises(AnonymousAudioStageError):
             stage.seal(None)
     finally:
@@ -385,7 +471,7 @@ def test_unsupported_format_and_invalid_cap_reject_before_materialization(
 ):
     before = set(tmp_path.iterdir())
     for output_format, maximum_bytes in (
-        ("aac", 1024),
+        ("webm", 1024),
         ("mp3", 0),
         ("mp3", True),
         ("mp3", 1.5),
