@@ -3484,7 +3484,282 @@ def _text_to_speech_single(
                     remove_directories = False
             return valid_result and remove_directories
 
+    class LateRebindArtifact:
+        """Lexically private evidence for one durable requested destination."""
+
+        def __init__(self) -> None:
+            if (
+                not getattr(os, "O_NOFOLLOW", 0)
+                or not getattr(os, "O_DIRECTORY", 0)
+                or os.open not in os.supports_dir_fd
+                or os.stat not in os.supports_dir_fd
+                or os.stat not in os.supports_follow_symlinks
+            ):
+                raise ValueError("requested destination cannot be attested")
+            self.parent = Path(os.path.abspath(file_path.parent))
+            self.basename = file_path.name
+            if (
+                not self.basename
+                or self.basename in {".", ".."}
+                or Path(self.basename).name != self.basename
+            ):
+                raise ValueError("requested destination cannot be attested")
+            self.parent_fd = -1
+            self.artifact_fd = -1
+            self.closed = False
+            directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            try:
+                self.parent_fd = os.open(self.parent, directory_flags)
+                parent_held = os.fstat(self.parent_fd)
+                parent_named = self.parent.lstat()
+                self.parent_before = self._full_identity(parent_held)
+                if (
+                    not self._same_full(parent_named, self.parent_before)
+                    or not self._safe_parent(parent_held)
+                ):
+                    raise ValueError("requested destination cannot be attested")
+                try:
+                    existing = os.stat(
+                        self.basename,
+                        dir_fd=self.parent_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    self.preexisting = False
+                    self.preexisting_identity = None
+                else:
+                    self.preexisting = True
+                    self.preexisting_identity = self._full_identity(existing)
+
+                if not self.preexisting:
+                    self.artifact_fd = os.open(
+                        self.basename,
+                        os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=self.parent_fd,
+                    )
+                    os.fchmod(self.artifact_fd, 0o600)
+                    os.fchown(self.artifact_fd, -1, os.getgid())
+                    artifact = os.fstat(self.artifact_fd)
+                    self.artifact_identity = self._artifact_identity(artifact)
+                    self.artifact_initial = self._full_identity(artifact)
+                    self.parent_during = self._full_identity(
+                        os.fstat(self.parent_fd)
+                    )
+                    if not self._parent_path_matches(self.parent_during):
+                        raise ValueError("requested destination cannot be attested")
+            except BaseException:
+                self._abort()
+                raise
+
+        @staticmethod
+        def _full_identity(info: os.stat_result) -> tuple[int, ...]:
+            return (
+                info.st_dev,
+                info.st_ino,
+                info.st_uid,
+                info.st_gid,
+                stat.S_IMODE(info.st_mode),
+                info.st_nlink,
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
+            )
+
+        @staticmethod
+        def _artifact_identity(info: os.stat_result) -> tuple[int, ...]:
+            return (
+                info.st_dev,
+                info.st_ino,
+                info.st_uid,
+                info.st_gid,
+                stat.S_IMODE(info.st_mode),
+                info.st_nlink,
+            )
+
+        @staticmethod
+        def _same_full(info: os.stat_result, identity: tuple[int, ...]) -> bool:
+            return LateRebindArtifact._full_identity(info) == identity
+
+        @staticmethod
+        def _safe_parent(info: os.stat_result) -> bool:
+            return (
+                stat.S_ISDIR(info.st_mode)
+                and not stat.S_ISLNK(info.st_mode)
+                and info.st_uid == os.getuid()
+                and stat.S_IMODE(info.st_mode) & 0o022 == 0
+            )
+
+        def _parent_path_matches(self, identity: tuple[int, ...]) -> bool:
+            try:
+                held = os.fstat(self.parent_fd)
+                named = self.parent.lstat()
+            except OSError:
+                return False
+            return (
+                self._safe_parent(held)
+                and self._same_full(held, identity)
+                and self._same_full(named, identity)
+            )
+
+        def _artifact_matches(self) -> bool:
+            if self.artifact_fd < 0:
+                return False
+            try:
+                held = os.fstat(self.artifact_fd)
+                named = os.stat(
+                    self.basename,
+                    dir_fd=self.parent_fd,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                return False
+            return (
+                stat.S_ISREG(held.st_mode)
+                and stat.S_ISREG(named.st_mode)
+                and not stat.S_ISLNK(named.st_mode)
+                and self._artifact_identity(held) == self.artifact_identity
+                and self._artifact_identity(named) == self.artifact_identity
+                and self.artifact_identity[2] == os.getuid()
+                and self.artifact_identity[3] == os.getgid()
+                and self.artifact_identity[4] == 0o600
+                and self.artifact_identity[5] == 1
+            )
+
+        def _unlink_exact_artifact(self) -> bool:
+            if (
+                self.preexisting
+                or not self._parent_path_matches(self.parent_during)
+                or not self._artifact_matches()
+            ):
+                return False
+            try:
+                # Revalidate immediately before the descriptor-relative unlink.
+                named = os.stat(
+                    self.basename,
+                    dir_fd=self.parent_fd,
+                    follow_symlinks=False,
+                )
+                held = os.fstat(self.artifact_fd)
+                if (
+                    self._artifact_identity(named) != self.artifact_identity
+                    or self._artifact_identity(held) != self.artifact_identity
+                ):
+                    return False
+                os.unlink(self.basename, dir_fd=self.parent_fd)
+                try:
+                    os.stat(
+                        self.basename,
+                        dir_fd=self.parent_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                else:
+                    return False
+                parent_held = os.fstat(self.parent_fd)
+                parent_named = self.parent.lstat()
+                return (
+                    self._safe_parent(parent_held)
+                    and self._artifact_identity(parent_held)
+                    == self._artifact_identity_from_full(self.parent_before)
+                    and self._artifact_identity(parent_named)
+                    == self._artifact_identity_from_full(self.parent_before)
+                )
+            except OSError:
+                return False
+
+        @staticmethod
+        def _artifact_identity_from_full(identity: tuple[int, ...]) -> tuple[int, ...]:
+            return identity[:6]
+
+        def _abort(self) -> None:
+            # Constructor failure may occur after exclusive placeholder creation.
+            # Remove only that exact object when its held and named identities
+            # agree, including failures before artifact_identity was assigned.
+            try:
+                held = os.fstat(self.artifact_fd)
+                named = os.stat(
+                    self.basename,
+                    dir_fd=self.parent_fd,
+                    follow_symlinks=False,
+                )
+                parent_held = os.fstat(self.parent_fd)
+                parent_named = self.parent.lstat()
+                exact_created_artifact = (
+                    self.artifact_fd >= 0
+                    and stat.S_ISREG(held.st_mode)
+                    and stat.S_ISREG(named.st_mode)
+                    and not stat.S_ISLNK(named.st_mode)
+                    and (held.st_dev, held.st_ino)
+                    == (named.st_dev, named.st_ino)
+                    and held.st_uid == os.getuid()
+                    and named.st_uid == os.getuid()
+                    and held.st_nlink == 1
+                    and named.st_nlink == 1
+                )
+                exact_parent = (
+                    hasattr(self, "parent_before")
+                    and stat.S_ISDIR(parent_held.st_mode)
+                    and stat.S_ISDIR(parent_named.st_mode)
+                    and (parent_held.st_dev, parent_held.st_ino)
+                    == self.parent_before[:2]
+                    and (parent_named.st_dev, parent_named.st_ino)
+                    == self.parent_before[:2]
+                    and parent_held.st_uid == os.getuid()
+                    and parent_named.st_uid == os.getuid()
+                )
+                if exact_created_artifact and exact_parent:
+                    os.unlink(self.basename, dir_fd=self.parent_fd)
+            except BaseException:
+                pass
+            self._close_descriptors()
+
+        def _close_descriptors(self) -> bool:
+            closed = True
+            for name in ("artifact_fd", "parent_fd"):
+                descriptor = getattr(self, name, -1)
+                if descriptor >= 0:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        closed = False
+                    setattr(self, name, -1)
+            return closed
+
+        def finish(self) -> tuple[bool, bool]:
+            if self.closed:
+                return persistence_disabled(), False
+            self.closed = True
+            late_ephemeral = persistence_disabled()
+            cleanup_ok = True
+            try:
+                if late_ephemeral:
+                    if self.preexisting:
+                        cleanup_ok = True
+                    else:
+                        cleanup_ok = self._unlink_exact_artifact()
+                elif not self.preexisting:
+                    # Preserve durable no-write behavior by removing only the
+                    # untouched placeholder created by this boundary.
+                    try:
+                        unchanged = (
+                            self._same_full(
+                                os.fstat(self.artifact_fd), self.artifact_initial
+                            )
+                            and self._artifact_matches()
+                            and self._parent_path_matches(self.parent_during)
+                        )
+                    except OSError:
+                        unchanged = False
+                    if unchanged:
+                        cleanup_ok = self._unlink_exact_artifact()
+            finally:
+                cleanup_ok = self._close_descriptors() and cleanup_ok
+            return late_ephemeral, cleanup_ok
+
     owner: Optional[EphemeralOwner] = None
+    late_rebind_artifact: Optional[LateRebindArtifact] = None
 
     # The wrapper already normalizes text via prepare_spoken_text; the inner
     # function should not re-normalize or truncate.
@@ -3596,7 +3871,11 @@ def _text_to_speech_single(
     if not ephemeral:
         file_path.parent.mkdir(parents=True, exist_ok=True)
     file_str = str(file_path)
-    durable_output_existed = not ephemeral and file_path.exists()
+    if not ephemeral:
+        try:
+            late_rebind_artifact = LateRebindArtifact()
+        except BaseException:
+            return tool_error("TTS generation failed", success=False)
 
     try:
         if not ephemeral and persistence_disabled():
@@ -3748,11 +4027,6 @@ def _text_to_speech_single(
                 }, ensure_ascii=False)
 
         if not ephemeral and persistence_disabled():
-            if not durable_output_existed and file_str == str(file_path):
-                try:
-                    os.unlink(file_path)
-                except OSError:
-                    pass
             return tool_error("TTS generation failed", success=False)
 
         # Prove provider-returned paths before any repair, conversion, result,
@@ -3857,27 +4131,31 @@ def _text_to_speech_single(
         }, ensure_ascii=False)
 
     except ValueError as e:
-        if ephemeral:
+        if ephemeral or persistence_disabled():
             return tool_error("TTS generation failed", success=False)
         # Configuration errors (missing API keys, etc.)
         error_msg = f"TTS configuration error ({provider}): {e}"
         logger.error("%s", error_msg)
         return tool_error(error_msg, success=False)
     except FileNotFoundError as e:
-        if ephemeral:
+        if ephemeral or persistence_disabled():
             return tool_error("TTS generation failed", success=False)
         # Missing dependencies or files
         error_msg = f"TTS dependency missing ({provider}): {e}"
         logger.error("%s", error_msg, exc_info=True)
         return tool_error(error_msg, success=False)
     except Exception as e:
-        if ephemeral:
+        if ephemeral or persistence_disabled():
             return tool_error("TTS generation failed", success=False)
         # Unexpected errors
         error_msg = f"TTS generation failed ({provider}): {e}"
         logger.error("%s", error_msg, exc_info=True)
         return tool_error(error_msg, success=False)
     finally:
+        if late_rebind_artifact is not None:
+            late_ephemeral, cleanup_ok = late_rebind_artifact.finish()
+            if late_ephemeral or not cleanup_ok:
+                return tool_error("TTS generation failed", success=False)
         if owner is not None and not owner.cleanup():
             return tool_error("TTS generation failed", success=False)
 
@@ -4071,6 +4349,8 @@ def text_to_speech_tool(
                 "tts_config_override": tts_config,
             }
             raw_result = _text_to_speech_single(**single_kwargs)
+            if persistence_disabled():
+                return tool_error("TTS generation failed", success=False)
             try:
                 chunk_result = json.loads(raw_result)
             except (json.JSONDecodeError, TypeError):
@@ -4079,6 +4359,8 @@ def text_to_speech_tool(
                 )
             if not chunk_result.get("success"):
                 error_msg = chunk_result.get("error", "unknown error")
+                if error_msg == "TTS generation failed":
+                    return tool_error("TTS generation failed", success=False)
                 return tool_error(
                     f"TTS chunk {index} failed ({provider}): {error_msg}",
                     success=False,
@@ -4140,6 +4422,8 @@ def text_to_speech_tool(
         logger.error("%s", error_msg, exc_info=True)
         return tool_error(error_msg, success=False)
     finally:
+        if persistence_disabled():
+            generated_artifacts.clear()
         final_absolute = {os.path.abspath(path) for path in final_paths}
         for artifact in generated_artifacts:
             if os.path.abspath(artifact) in final_absolute:
