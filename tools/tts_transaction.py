@@ -8,8 +8,9 @@ opaque durable-publication permit, or destroys every held descriptor.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from threading import RLock
-from typing import Iterator
+from typing import Callable, Iterator
 
 from hermes_cli.persistence import (
     PersistenceObservation,
@@ -36,7 +37,13 @@ class TTSTransactionStop(TTSTransactionError):
 
 
 def _create_transaction_boundary():
-    construction_identity = object()
+    boundary_lock = RLock()
+    claimed_stages: dict[object, object] = {}
+    issued_permits: dict[object, object] = {}
+    active_transactions: ContextVar[tuple[object, ...]] = ContextVar(
+        "hermes_tts_active_transactions",
+        default=(),
+    )
 
     class EphemeralDelivery:
         """Bounded in-memory audio returned only by an ephemeral transaction."""
@@ -77,7 +84,7 @@ def _create_transaction_boundary():
     class DurablePublicationPermit:
         """Opaque ownership transfer for a later trusted durable publisher."""
 
-        __slots__ = ("__identity", "__observation", "__stages")
+        __slots__ = ()
 
         def __new__(cls, *args: object, **kwargs: object):
             raise TypeError(
@@ -102,6 +109,15 @@ def _create_transaction_boundary():
         def __deepcopy__(self, memo: object):
             raise TypeError("DurablePublicationPermit cannot be copied")
 
+        def _consume_for_publication(
+            self,
+            consumer: Callable[
+                [tuple[tuple[AnonymousAudioStage, SealedAudio], ...], PersistenceObservation],
+                object,
+            ],
+        ) -> object:
+            return consume_permit(self, consumer)
+
     def issue_delivery(chunks: list[bytes]) -> EphemeralDelivery:
         delivery = object.__new__(EphemeralDelivery)
         immutable_chunks = tuple(chunks)
@@ -115,26 +131,34 @@ def _create_transaction_boundary():
         )
         return delivery
 
-    def issue_permit(
-        identity: object,
-        observation: PersistenceObservation,
-        stages: list[tuple[AnonymousAudioStage, SealedAudio]],
-    ) -> DurablePublicationPermit:
+    def issue_permit(transaction: object) -> DurablePublicationPermit:
         permit = object.__new__(DurablePublicationPermit)
-        object.__setattr__(
-            permit,
-            "_DurablePublicationPermit__identity",
-            (construction_identity, identity),
-        )
-        object.__setattr__(
-            permit,
-            "_DurablePublicationPermit__observation",
-            observation,
-        )
-        object.__setattr__(
-            permit, "_DurablePublicationPermit__stages", tuple(stages)
-        )
+        with boundary_lock:
+            issued_permits[permit] = transaction
         return permit
+
+    def unregister_permit(permit: object, transaction: object) -> None:
+        if permit is None:
+            return
+        with boundary_lock:
+            if issued_permits.get(permit) is transaction:
+                del issued_permits[permit]
+
+    def consume_permit(
+        permit: object,
+        consumer: Callable[
+            [tuple[tuple[AnonymousAudioStage, SealedAudio], ...], PersistenceObservation],
+            object,
+        ],
+    ) -> object:
+        if type(permit) is not DurablePublicationPermit or not callable(consumer):
+            raise TTSTransactionError(_TRANSACTION_ERROR)
+        with boundary_lock:
+            transaction = issued_permits.get(permit)
+        active = active_transactions.get()
+        if transaction is None or not active or active[-1] is not transaction:
+            raise TTSTransactionError(_TRANSACTION_ERROR)
+        return transaction._TTSTransaction__consume_permit(permit, consumer)
 
     class TTSTransaction:
         """One lexical GENERATE/SEAL/DECIDE ownership boundary."""
@@ -145,6 +169,7 @@ def _create_transaction_boundary():
             "__identity",
             "__lock",
             "__observation",
+            "__permit",
             "__stages",
             "__state",
         )
@@ -184,23 +209,32 @@ def _create_transaction_boundary():
                     transaction, "_TTSTransaction__observation", observation
                 )
                 object.__setattr__(
+                    transaction, "_TTSTransaction__permit", None
+                )
+                object.__setattr__(
                     transaction, "_TTSTransaction__stages", []
                 )
                 object.__setattr__(
                     transaction, "_TTSTransaction__state", "open"
                 )
+                active_token = active_transactions.set(
+                    (*active_transactions.get(), transaction)
+                )
                 try:
-                    yield transaction
-                except TTSTransactionStop as exc:
-                    transaction.__abort_if_untransferred()
-                    if str(exc) == _SCRUB_ERROR:
-                        raise
-                    raise TTSTransactionError(_TRANSACTION_ERROR) from None
-                except Exception:
-                    transaction.__abort_if_untransferred()
-                    raise TTSTransactionError(_TRANSACTION_ERROR) from None
+                    try:
+                        yield transaction
+                    except TTSTransactionStop as exc:
+                        transaction.__abort_if_unconsumed()
+                        if str(exc) == _SCRUB_ERROR:
+                            raise
+                        raise TTSTransactionError(_TRANSACTION_ERROR) from None
+                    except Exception:
+                        transaction.__abort_if_unconsumed()
+                        raise TTSTransactionError(_TRANSACTION_ERROR) from None
+                    finally:
+                        transaction.__abort_if_unconsumed()
                 finally:
-                    transaction.__abort_if_untransferred()
+                    active_transactions.reset(active_token)
 
         def add_sealed(
             self,
@@ -208,11 +242,20 @@ def _create_transaction_boundary():
             sealed: SealedAudio,
         ) -> None:
             with self.__lock:
-                if self.__state != "open" or not self.__valid_pair(stage, sealed):
-                    raise TTSTransactionError(_TRANSACTION_ERROR)
-                if any(held_stage is stage for held_stage, _ in self.__stages):
-                    raise TTSTransactionError(_TRANSACTION_ERROR)
-                self.__stages.append((stage, sealed))
+                if self.__state != "open":
+                    self.__fail_add(stage)
+                if not self.__valid_pair(stage, sealed):
+                    self.__fail_add(stage)
+                with boundary_lock:
+                    stage_key = stage._authority
+                    owner = claimed_stages.get(stage_key)
+                    if owner is not None:
+                        self.__fail_add(stage)
+                    claimed_stages[stage_key] = self.__identity
+                try:
+                    self.__stages.append((stage, sealed))
+                except BaseException:
+                    self.__fail_add(stage)
 
         def decide(self) -> EphemeralDelivery | DurablePublicationPermit:
             with self.__lock:
@@ -222,44 +265,38 @@ def _create_transaction_boundary():
                 if not self.__stages:
                     self.__scrub_all()
                     raise TTSTransactionError(_TRANSACTION_ERROR)
-                if (
-                    self.__entry_policy is PersistencePolicy.DURABLE
-                    and not self.__observation.ever_ephemeral
-                    and self.__observation.current_policy
-                    is PersistencePolicy.DURABLE
-                ):
-                    permit = issue_permit(
-                        self.__identity,
-                        self.__observation,
-                        self.__stages,
-                    )
-                    self.__stages = []
-                    self.__state = "transferred"
-                    return permit
-                if self.__entry_policy is PersistencePolicy.DURABLE:
-                    self.__scrub_all()
-                    raise TTSTransactionError(_TRANSACTION_ERROR)
-
-                chunks: list[bytes] = []
-                allocated = 0
                 try:
-                    for stage, sealed in self.__stages:
-                        size = sealed._size
-                        if (
-                            type(size) is not int
-                            or size <= 0
-                            or size > self.__aggregate_cap - allocated
-                        ):
-                            raise TTSTransactionError(_TRANSACTION_ERROR)
-                        chunk = stage.read_bounded(sealed)
-                        if len(chunk) != size:
-                            raise TTSTransactionError(_TRANSACTION_ERROR)
-                        chunks.append(chunk)
-                        allocated += size
-                    delivery = issue_delivery(chunks)
+                    declared_total = self.__validate_all_declared()
                 except BaseException:
                     self.__scrub_all()
                     raise TTSTransactionError(_TRANSACTION_ERROR) from None
+                if (
+                    self.__entry_policy is PersistencePolicy.DURABLE
+                    and (
+                        self.__observation.ever_ephemeral
+                        or self.__observation.current_policy
+                        is not PersistencePolicy.DURABLE
+                    )
+                ):
+                    self.__scrub_all()
+                    raise TTSTransactionError(_TRANSACTION_ERROR)
+
+                try:
+                    chunks = self.__revalidate_all(
+                        retain=self.__entry_policy is PersistencePolicy.EPHEMERAL,
+                        declared_total=declared_total,
+                    )
+                except BaseException:
+                    self.__scrub_all()
+                    raise TTSTransactionError(_TRANSACTION_ERROR) from None
+
+                if self.__entry_policy is PersistencePolicy.DURABLE:
+                    permit = issue_permit(self)
+                    self.__permit = permit
+                    self.__state = "permitted"
+                    return permit
+
+                delivery = issue_delivery(chunks)
                 self.__scrub_all()
                 return delivery
 
@@ -272,24 +309,159 @@ def _create_transaction_boundary():
                 and stage._sealed
                 and sealed._authority is stage._authority
                 and sealed._fd == stage._fd
+                and sealed._output_format == stage.sink.output_format
             )
 
+        def __validate_all_declared(self) -> int:
+            total = 0
+            for stage, sealed in self.__stages:
+                if not self.__valid_pair(stage, sealed):
+                    raise TTSTransactionError(_TRANSACTION_ERROR)
+                size = sealed._size
+                if (
+                    type(size) is not int
+                    or size <= 0
+                    or size > self.__aggregate_cap - total
+                ):
+                    raise TTSTransactionError(_TRANSACTION_ERROR)
+                total += size
+            return total
+
+        def __revalidate_all(
+            self,
+            *,
+            retain: bool,
+            declared_total: int,
+        ) -> list[bytes]:
+            chunks: list[bytes] = []
+            actual_total = 0
+            for stage, sealed in self.__stages:
+                chunk = stage.read_bounded(sealed)
+                size = sealed._size
+                if len(chunk) != size or len(chunk) > self.__aggregate_cap - actual_total:
+                    raise TTSTransactionError(_TRANSACTION_ERROR)
+                actual_total += len(chunk)
+                if retain:
+                    chunks.append(chunk)
+            if actual_total != declared_total:
+                raise TTSTransactionError(_TRANSACTION_ERROR)
+            return chunks
+
+        def __consume_permit(
+            self,
+            permit: object,
+            consumer: Callable[
+                [tuple[tuple[AnonymousAudioStage, SealedAudio], ...], PersistenceObservation],
+                object,
+            ],
+        ) -> object:
+            with self.__lock:
+                with boundary_lock:
+                    authentic = issued_permits.get(permit) is self
+                if (
+                    not authentic
+                    or self.__state != "permitted"
+                    or self.__permit is not permit
+                ):
+                    raise TTSTransactionError(_TRANSACTION_ERROR)
+                if (
+                    self.__observation.ever_ephemeral
+                    or self.__observation.current_policy
+                    is not PersistencePolicy.DURABLE
+                ):
+                    self.__scrub_all()
+                    raise TTSTransactionError(_TRANSACTION_ERROR)
+                self.__state = "consuming"
+                try:
+                    declared_total = self.__validate_all_declared()
+                    self.__revalidate_all(
+                        retain=False,
+                        declared_total=declared_total,
+                    )
+                    result = consumer(tuple(self.__stages), self.__observation)
+                except TTSTransactionStop:
+                    self.__scrub_all()
+                    raise
+                except Exception:
+                    self.__scrub_all()
+                    raise TTSTransactionError(_TRANSACTION_ERROR) from None
+                except BaseException:
+                    self.__scrub_all()
+                    raise
+                if any(not stage._closed for stage, _ in self.__stages):
+                    self.__scrub_all()
+                    raise TTSTransactionError(_TRANSACTION_ERROR)
+                self.__release_closed_claims()
+                unregister_permit(self.__permit, self)
+                self.__permit = None
+                self.__stages = []
+                self.__state = "consumed"
+                return result
+
+        def __reject_presented(self, stage: object) -> None:
+            if type(stage) is not AnonymousAudioStage or stage._closed:
+                return
+            with boundary_lock:
+                stage_key = stage._authority
+                owner = claimed_stages.get(stage_key)
+                if owner is not None and owner is not self.__identity:
+                    return
+                claimed_stages[stage_key] = self.__identity
+            try:
+                stage.scrub_and_close()
+            except BaseException:
+                if stage._closed:
+                    self.__release_claim(stage)
+                raise TTSTransactionStop(_SCRUB_ERROR) from None
+            self.__release_claim(stage)
+
+        def __fail_add(self, stage: object) -> None:
+            failed_scrub = False
+            try:
+                self.__reject_presented(stage)
+            except TTSTransactionStop:
+                failed_scrub = True
+            try:
+                self.__scrub_all()
+            except TTSTransactionStop:
+                failed_scrub = True
+            if failed_scrub:
+                raise TTSTransactionStop(_SCRUB_ERROR) from None
+            raise TTSTransactionError(_TRANSACTION_ERROR)
+
+        def __release_claim(self, stage: AnonymousAudioStage) -> None:
+            with boundary_lock:
+                stage_key = stage._authority
+                if claimed_stages.get(stage_key) is self.__identity:
+                    del claimed_stages[stage_key]
+
+        def __release_closed_claims(self) -> None:
+            for stage, _ in self.__stages:
+                if stage._closed:
+                    self.__release_claim(stage)
+
         def __scrub_all(self) -> None:
-            stages = self.__stages
-            self.__stages = []
+            unregister_permit(self.__permit, self)
+            self.__permit = None
             failed = False
-            for stage, _ in stages:
+            remaining: list[tuple[AnonymousAudioStage, SealedAudio]] = []
+            for stage, sealed in self.__stages:
                 try:
                     stage.scrub_and_close()
                 except BaseException:
                     failed = True
-            self.__state = "scrubbed"
-            if failed:
+                if stage._closed:
+                    self.__release_claim(stage)
+                else:
+                    remaining.append((stage, sealed))
+            self.__stages = remaining
+            self.__state = "scrub_failed" if remaining else "scrubbed"
+            if failed or remaining:
                 raise TTSTransactionStop(_SCRUB_ERROR) from None
 
-        def __abort_if_untransferred(self) -> None:
+        def __abort_if_unconsumed(self) -> None:
             with self.__lock:
-                if self.__state in ("transferred", "scrubbed"):
+                if self.__state in ("consumed", "scrubbed"):
                     return
                 self.__scrub_all()
 

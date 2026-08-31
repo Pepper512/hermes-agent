@@ -33,6 +33,14 @@ def _assert_scrubbed(stage) -> None:
     assert stage._fd == -1
 
 
+def _consume_and_scrub(stages, _observation):
+    payloads = []
+    for stage, sealed in stages:
+        payloads.append(stage.read_bounded(sealed))
+        stage.scrub_and_close()
+    return tuple(payloads)
+
+
 @pytest.mark.parametrize(
     ("entry", "transitions", "expected"),
     [
@@ -146,13 +154,11 @@ def test_ephemeral_multiple_chunks_enforces_aggregate_cap_before_second_read(
 ):
     first, first_sealed = _sealed_stage(tmp_path / "first")
     second, second_sealed = _sealed_stage(tmp_path / "second")
-    called = False
+    calls: list[object] = []
     real_read = type(second).read_bounded
 
     def record_read(self, sealed):
-        nonlocal called
-        if self is second:
-            called = True
+        calls.append(self)
         return real_read(self, sealed)
 
     monkeypatch.setattr(type(second), "read_bounded", record_read)
@@ -163,7 +169,7 @@ def test_ephemeral_multiple_chunks_enforces_aggregate_cap_before_second_read(
             with pytest.raises(TTSTransactionError, match="^tts_generation_failed$"):
                 transaction.decide()
 
-    assert called is False
+    assert calls == []
     _assert_scrubbed(first)
     _assert_scrubbed(second)
 
@@ -260,18 +266,313 @@ def test_durable_permit_is_unforgeable_path_free_and_owns_stages(tmp_path: Path)
         with TTSTransaction.begin(4096) as transaction:
             transaction.add_sealed(stage, sealed)
             permit = transaction.decide()
+            assert type(permit) is DurablePublicationPermit
+            assert not any(
+                hasattr(permit, name)
+                for name in (
+                    "path",
+                    "destination",
+                    "cleanup",
+                    "delete",
+                    "token",
+                    "descriptor",
+                    "fd",
+                )
+            )
+            with pytest.raises(TypeError):
+                DurablePublicationPermit("/tmp/caller")
+            with pytest.raises(TypeError):
+                vars(permit)
+            assert stage._closed is False
+            assert permit._consume_for_publication(_consume_and_scrub) == (
+                VALID_MP3,
+            )
+    _assert_scrubbed(stage)
 
-    assert type(permit) is DurablePublicationPermit
-    assert not any(
-        hasattr(permit, name)
-        for name in ("path", "destination", "cleanup", "delete", "token", "descriptor", "fd")
-    )
-    with pytest.raises(TypeError):
-        DurablePublicationPermit("/tmp/caller")
-    with pytest.raises(TypeError):
-        vars(permit)
-    assert stage._closed is False
-    stage.scrub_and_close()
+
+def test_same_stage_cannot_be_claimed_by_nested_transactions(tmp_path: Path):
+    stage, sealed = _sealed_stage(tmp_path)
+    with bind_persistence_policy(PersistencePolicy.DURABLE):
+        with TTSTransaction.begin(4096) as outer:
+            outer.add_sealed(stage, sealed)
+            with TTSTransaction.begin(4096) as inner:
+                with pytest.raises(
+                    TTSTransactionError, match="^tts_generation_failed$"
+                ):
+                    inner.add_sealed(stage, sealed)
+                assert stage._closed is False
+            permit = outer.decide()
+            assert permit._consume_for_publication(_consume_and_scrub) == (
+                VALID_MP3,
+            )
+    _assert_scrubbed(stage)
+
+
+def test_slot_cloned_stage_cannot_bypass_exclusive_claim(tmp_path: Path):
+    from tools.tts_staging import AnonymousAudioStage
+
+    stage, sealed = _sealed_stage(tmp_path)
+    clone = object.__new__(AnonymousAudioStage)
+    for slot in AnonymousAudioStage.__slots__:
+        object.__setattr__(clone, slot, object.__getattribute__(stage, slot))
+
+    with bind_persistence_policy(PersistencePolicy.DURABLE):
+        with TTSTransaction.begin(4096) as outer:
+            outer.add_sealed(stage, sealed)
+            with TTSTransaction.begin(4096) as inner:
+                with pytest.raises(
+                    TTSTransactionError, match="^tts_generation_failed$"
+                ):
+                    inner.add_sealed(clone, sealed)
+                assert stage._closed is False
+            permit = outer.decide()
+            permit._consume_for_publication(_consume_and_scrub)
+    _assert_scrubbed(stage)
+
+
+@pytest.mark.parametrize("exit_mode", ["normal", "error", "cancel"])
+def test_unconsumed_permit_is_scrubbed_on_every_context_exit(
+    tmp_path: Path, exit_mode: str
+):
+    class Cancelled(BaseException):
+        pass
+
+    stage, sealed = _sealed_stage(tmp_path)
+    with bind_persistence_policy(PersistencePolicy.DURABLE):
+        if exit_mode == "error":
+            with pytest.raises(TTSTransactionError, match="^tts_generation_failed$"):
+                with TTSTransaction.begin(4096) as transaction:
+                    transaction.add_sealed(stage, sealed)
+                    transaction.decide()
+                    raise RuntimeError("private provider failure")
+        elif exit_mode == "cancel":
+            with pytest.raises(Cancelled):
+                with TTSTransaction.begin(4096) as transaction:
+                    transaction.add_sealed(stage, sealed)
+                    transaction.decide()
+                    raise Cancelled
+        else:
+            with TTSTransaction.begin(4096) as transaction:
+                transaction.add_sealed(stage, sealed)
+                transaction.decide()
+    _assert_scrubbed(stage)
+
+
+def test_duplicate_add_scrubs_transaction_owned_stage(tmp_path: Path):
+    stage, sealed = _sealed_stage(tmp_path)
+    with bind_persistence_policy(PersistencePolicy.DURABLE):
+        with TTSTransaction.begin(4096) as transaction:
+            transaction.add_sealed(stage, sealed)
+            with pytest.raises(TTSTransactionError, match="^tts_generation_failed$"):
+                transaction.add_sealed(stage, sealed)
+    _assert_scrubbed(stage)
+
+
+def test_mismatched_add_scrubs_unclaimed_presented_stage_only(tmp_path: Path):
+    presented, _presented_seal = _sealed_stage(tmp_path / "presented")
+    other, other_seal = _sealed_stage(tmp_path / "other")
+    try:
+        with bind_persistence_policy(PersistencePolicy.DURABLE):
+            with TTSTransaction.begin(4096) as transaction:
+                with pytest.raises(
+                    TTSTransactionError, match="^tts_generation_failed$"
+                ):
+                    transaction.add_sealed(presented, other_seal)
+        _assert_scrubbed(presented)
+        assert other._closed is False
+    finally:
+        other.scrub_and_close()
+
+
+def test_mismatched_add_scrubs_presented_and_prior_transaction_stage(
+    tmp_path: Path,
+):
+    prior, prior_seal = _sealed_stage(tmp_path / "prior")
+    presented, _presented_seal = _sealed_stage(tmp_path / "presented")
+    other, other_seal = _sealed_stage(tmp_path / "other")
+    try:
+        with bind_persistence_policy(PersistencePolicy.DURABLE):
+            with TTSTransaction.begin(4096) as transaction:
+                transaction.add_sealed(prior, prior_seal)
+                with pytest.raises(
+                    TTSTransactionError, match="^tts_generation_failed$"
+                ):
+                    transaction.add_sealed(presented, other_seal)
+        _assert_scrubbed(prior)
+        _assert_scrubbed(presented)
+        assert other._closed is False
+    finally:
+        other.scrub_and_close()
+
+
+def test_partial_add_failure_scrubs_presented_stage(tmp_path: Path):
+    class FailingAppend(list):
+        def append(self, _value):
+            raise MemoryError("injected append failure")
+
+    stage, sealed = _sealed_stage(tmp_path)
+    with bind_persistence_policy(PersistencePolicy.DURABLE):
+        with TTSTransaction.begin(4096) as transaction:
+            object.__setattr__(
+                transaction,
+                "_TTSTransaction__stages",
+                FailingAppend(),
+            )
+            with pytest.raises(TTSTransactionError) as exc_info:
+                transaction.add_sealed(stage, sealed)
+    assert str(exc_info.value) == "tts_generation_failed"
+    assert "injected" not in str(exc_info.value)
+    _assert_scrubbed(stage)
+
+
+def test_add_after_decision_scrubs_new_stage_and_recovers_original(tmp_path: Path):
+    original, original_seal = _sealed_stage(tmp_path / "original")
+    rejected, rejected_seal = _sealed_stage(tmp_path / "rejected")
+    with bind_persistence_policy(PersistencePolicy.DURABLE):
+        with TTSTransaction.begin(4096) as transaction:
+            transaction.add_sealed(original, original_seal)
+            transaction.decide()
+            with pytest.raises(TTSTransactionError, match="^tts_generation_failed$"):
+                transaction.add_sealed(rejected, rejected_seal)
+            _assert_scrubbed(rejected)
+    _assert_scrubbed(original)
+
+
+def test_cloned_permit_is_rejected_before_consumer_or_stage_access(tmp_path: Path):
+    stage, sealed = _sealed_stage(tmp_path)
+    called = False
+    with bind_persistence_policy(PersistencePolicy.DURABLE):
+        with TTSTransaction.begin(4096) as transaction:
+            transaction.add_sealed(stage, sealed)
+            permit = transaction.decide()
+            clone = object.__new__(DurablePublicationPermit)
+            for slot in getattr(DurablePublicationPermit, "__slots__", ()):
+                object.__setattr__(
+                    clone,
+                    slot,
+                    object.__getattribute__(permit, slot),
+                )
+
+            def forbidden_consumer(*_args):
+                nonlocal called
+                called = True
+                raise AssertionError("forged permit reached consumer")
+
+            with pytest.raises(
+                TTSTransactionError, match="^tts_generation_failed$"
+            ):
+                clone._consume_for_publication(forbidden_consumer)
+            assert called is False
+            assert stage._closed is False
+            permit._consume_for_publication(_consume_and_scrub)
+    _assert_scrubbed(stage)
+
+
+def test_permit_rejects_cross_transaction_and_replay(tmp_path: Path):
+    stage, sealed = _sealed_stage(tmp_path)
+    with bind_persistence_policy(PersistencePolicy.DURABLE):
+        with TTSTransaction.begin(4096) as owner:
+            owner.add_sealed(stage, sealed)
+            permit = owner.decide()
+            with TTSTransaction.begin(4096):
+                with pytest.raises(
+                    TTSTransactionError, match="^tts_generation_failed$"
+                ):
+                    permit._consume_for_publication(_consume_and_scrub)
+                assert stage._closed is False
+            permit._consume_for_publication(_consume_and_scrub)
+            with pytest.raises(TTSTransactionError, match="^tts_generation_failed$"):
+                permit._consume_for_publication(_consume_and_scrub)
+    _assert_scrubbed(stage)
+
+
+def test_permit_cannot_escape_with_inactive_observation(tmp_path: Path):
+    stage, sealed = _sealed_stage(tmp_path)
+    with bind_persistence_policy(PersistencePolicy.DURABLE):
+        with TTSTransaction.begin(4096) as transaction:
+            transaction.add_sealed(stage, sealed)
+            permit = transaction.decide()
+    _assert_scrubbed(stage)
+    with pytest.raises(TTSTransactionError, match="^tts_generation_failed$"):
+        permit._consume_for_publication(_consume_and_scrub)
+
+
+@pytest.mark.parametrize("mode", ["return-open", "error", "cancel", "late-policy"])
+def test_consumer_noncompletion_scrubs_and_fails_closed(
+    tmp_path: Path, mode: str
+):
+    class Cancelled(BaseException):
+        pass
+
+    stage, sealed = _sealed_stage(tmp_path)
+    with bind_persistence_policy(PersistencePolicy.DURABLE):
+        if mode == "cancel":
+            expected = pytest.raises(Cancelled)
+        else:
+            expected = pytest.raises(
+                TTSTransactionError, match="^tts_generation_failed$"
+            )
+        with expected:
+            with TTSTransaction.begin(4096) as transaction:
+                transaction.add_sealed(stage, sealed)
+                permit = transaction.decide()
+                if mode == "late-policy":
+                    with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
+                        permit._consume_for_publication(_consume_and_scrub)
+                elif mode == "return-open":
+                    permit._consume_for_publication(lambda *_args: "unfinished")
+                elif mode == "error":
+                    permit._consume_for_publication(
+                        lambda *_args: (_ for _ in ()).throw(
+                            RuntimeError("private publisher detail")
+                        )
+                    )
+                else:
+                    permit._consume_for_publication(
+                        lambda *_args: (_ for _ in ()).throw(Cancelled())
+                    )
+    _assert_scrubbed(stage)
+
+
+@pytest.mark.parametrize("mutation", ["bytes", "mode"])
+def test_decide_revalidates_stage_after_add_and_scrubs(
+    tmp_path: Path, mutation: str
+):
+    stage, sealed = _sealed_stage(tmp_path)
+    with bind_persistence_policy(PersistencePolicy.DURABLE):
+        with TTSTransaction.begin(4096) as transaction:
+            transaction.add_sealed(stage, sealed)
+            fd = int(Path(stage.sink.path).name)
+            if mutation == "bytes":
+                os.pwrite(fd, b"X", len(VALID_MP3) - 1)
+            else:
+                os.fchmod(fd, 0o640)
+            with pytest.raises(TTSTransactionError, match="^tts_generation_failed$"):
+                transaction.decide()
+    _assert_scrubbed(stage)
+
+
+def test_consume_revalidates_stage_and_rejects_mutation_before_consumer(
+    tmp_path: Path
+):
+    stage, sealed = _sealed_stage(tmp_path)
+    called = False
+    with bind_persistence_policy(PersistencePolicy.DURABLE):
+        with TTSTransaction.begin(4096) as transaction:
+            transaction.add_sealed(stage, sealed)
+            permit = transaction.decide()
+            os.pwrite(int(Path(stage.sink.path).name), b"X", len(VALID_MP3) - 1)
+
+            def forbidden_consumer(*_args):
+                nonlocal called
+                called = True
+
+            with pytest.raises(
+                TTSTransactionError, match="^tts_generation_failed$"
+            ):
+                permit._consume_for_publication(forbidden_consumer)
+    assert called is False
+    _assert_scrubbed(stage)
 
 
 def test_decide_without_a_sealed_stage_fails_closed():
