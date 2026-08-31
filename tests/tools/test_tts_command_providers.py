@@ -37,12 +37,20 @@ from tools.tts_tool import (
     _is_command_tts_voice_compatible,
     _iter_command_providers,
     _render_command_tts_template,
+    _render_command_tts_sink_template,
     _resolve_command_provider_config,
     _resolve_max_text_length,
     _run_command_tts,
     _shell_quote_context,
     check_tts_requirements,
     text_to_speech_tool,
+)
+from tools.tts_adapters import (
+    AnonymousSinkUnsupported,
+    ProviderLifecycleError,
+    ProviderRequest,
+    command_adapter,
+    generate_and_seal,
 )
 
 
@@ -323,6 +331,165 @@ class TestRenderCommandTtsTemplate:
 # ---------------------------------------------------------------------------
 
 class TestRunCommandTts:
+    @pytest.mark.macos_only
+    def test_command_passes_only_sink_fd(self, monkeypatch):
+        captured = {}
+
+        class Stream:
+            def read(self, size):
+                return ""
+
+            def close(self):
+                pass
+
+        class Proc:
+            pid = 12345
+            returncode = 0
+            stdin = Stream()
+            stdout = Stream()
+            stderr = Stream()
+
+            def wait(self, timeout=None):
+                return 0
+
+            def poll(self):
+                return self.returncode
+
+        def fake_popen(command, **kwargs):
+            captured.update(kwargs)
+            return Proc()
+
+        monkeypatch.setattr("tools.tts_tool.subprocess.Popen", fake_popen)
+        monkeypatch.setattr("tools.tts_tool._stop_command_tts_process_group", lambda *a, **k: None)
+        _run_command_tts("writer", 1, inherited_sink_fd=17, input_text="hello")
+        assert captured["pass_fds"] == (17,)
+        assert captured["close_fds"] is True
+
+    @pytest.mark.linux_only
+    def test_command_passes_only_sink_fd_linux(self, monkeypatch):
+        self.test_command_passes_only_sink_fd(monkeypatch)
+
+    def test_command_text_streams_only_through_stdin(self):
+        secret = "transcript-only-via-stdin-6af3"
+        command = _shell_command(
+            sys.executable,
+            "-c",
+            "import sys; data=sys.stdin.read(); sys.stdout.write(str(len(data)))",
+        )
+        result = _run_command_tts(command, 2, input_text=secret)
+        assert result.stdout == str(len(secret))
+        assert secret not in str(result.args)
+
+    @pytest.mark.macos_only
+    def test_command_input_placeholders_are_fd_zero_path(self, tmp_path):
+        from tools.tts_staging import _create_anonymous_audio_stage_for_test
+
+        stage = _create_anonymous_audio_stage_for_test("mp3", 4096, tmp_path)
+        try:
+            rendered = _render_command_tts_sink_template(
+                "writer {input_path} {text_path} {output_path}",
+                sink=stage.sink,
+                voice="",
+                model="",
+                speed="1",
+            )
+            expected = "/dev/fd/0" if sys.platform == "darwin" else "/proc/self/fd/0"
+            assert rendered.count(expected) == 2
+        finally:
+            stage.scrub_and_close()
+
+    @pytest.mark.linux_only
+    def test_command_input_placeholders_are_fd_zero_path_linux(self, tmp_path):
+        self.test_command_input_placeholders_are_fd_zero_path(tmp_path)
+
+    def test_command_stdout_stderr_capture_is_bounded_while_fully_drained(self):
+        command = _shell_command(
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.write('o'*200000); sys.stderr.write('e'*200000)",
+        )
+        result = _run_command_tts(command, 3, input_text="")
+        assert len(result.stdout) == 65536
+        assert len(result.stderr) == 65536
+
+    @pytest.mark.macos_only
+    def test_command_sink_path_creates_no_named_text_file(self, tmp_path, monkeypatch):
+        from tools.tts_staging import _create_anonymous_audio_stage_for_test
+
+        stage = _create_anonymous_audio_stage_for_test("mp3", 4096, tmp_path)
+        command = _shell_command(
+            sys.executable,
+            "-c",
+            "import sys; open(sys.argv[1],'wb').write(b'ID3\\x04\\0\\0\\0\\0\\0\\0')",
+        ) + " {output_path}"
+        monkeypatch.setattr(
+            "tools.tts_tool.tempfile.TemporaryDirectory",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("named text file")),
+        )
+        adapter = command_adapter(
+            "writer",
+            {"type": "command", "command": command, "timeout": 2},
+            {},
+        )
+        sealed = generate_and_seal(
+            adapter,
+            ProviderRequest("private transcript", None, None, None, None),
+            stage,
+        )
+        assert sealed is not None
+        stage.scrub_and_close()
+
+    @pytest.mark.linux_only
+    def test_command_sink_path_creates_no_named_text_file_linux(self, tmp_path, monkeypatch):
+        self.test_command_sink_path_creates_no_named_text_file(tmp_path, monkeypatch)
+
+    @pytest.mark.macos_only
+    def test_command_argv_env_and_fixed_errors_exclude_text(self, tmp_path, monkeypatch):
+        from tools import tts_tool
+        from tools.tts_staging import _create_anonymous_audio_stage_for_test
+
+        secret = "private-transcript-51cd"
+        captured = {}
+        real_popen = subprocess.Popen
+
+        def recording_popen(command, **kwargs):
+            captured["command"] = command
+            captured["env"] = dict(kwargs["env"])
+            return real_popen(command, **kwargs)
+
+        monkeypatch.setattr(tts_tool.subprocess, "Popen", recording_popen)
+        stage = _create_anonymous_audio_stage_for_test("mp3", 4096, tmp_path)
+        adapter = command_adapter(
+            "failed-writer",
+            {
+                "type": "command",
+                "command": _shell_command(sys.executable, "-c", "import sys; sys.exit(9)"),
+                "timeout": 2,
+            },
+            {},
+        )
+        with pytest.raises(ProviderLifecycleError) as excinfo:
+            generate_and_seal(
+                adapter,
+                ProviderRequest(secret, None, None, None, None),
+                stage,
+            )
+        assert str(excinfo.value) == "tts_provider_lifecycle_failed"
+        assert secret not in captured["command"]
+        assert all(secret not in str(value) for value in captured["env"].values())
+
+    @pytest.mark.linux_only
+    def test_command_argv_env_and_fixed_errors_exclude_text_linux(self, tmp_path, monkeypatch):
+        self.test_command_argv_env_and_fixed_errors_exclude_text(tmp_path, monkeypatch)
+
+    def test_command_background_claim_rejects_before_launch(self):
+        with pytest.raises(AnonymousSinkUnsupported):
+            command_adapter(
+                "background-writer",
+                {"type": "command", "command": "writer", "background": True},
+                {},
+            )
+
     def test_reads_process_output_in_large_chunks(self):
         read_sizes: dict[str, list[int]] = {"stdout": [], "stderr": []}
 
