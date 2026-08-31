@@ -524,6 +524,7 @@ class AIAgent:
         pass_session_id: bool = False,
         requested_provider: str = None,
         capabilities: Dict[str, bool] | None = None,
+        persistence_policy: object = "durable",
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         if tool_delay is not None:
@@ -615,6 +616,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            persistence_policy=persistence_policy,
         )
 
     def _get_session_db_for_recall(self):
@@ -2047,6 +2049,8 @@ class AIAgent:
         never mutating the live message list used by the API call (#48677 is
         thus closed for every persist caller, not just this one).
         """
+        if getattr(self, "_persist_disabled", False):
+            return None
         # Scaffolding removal mutates the live list (desired — ephemeral
         # retry/failure sentinels must not survive into the real transcript).
         # Close and turn-start persistence can run on separate CLI threads; the
@@ -2572,7 +2576,7 @@ class AIAgent:
             user_query (str): Original user query
             completed (bool): Whether the conversation completed successfully
         """
-        if not self.save_trajectories:
+        if getattr(self, "_persist_disabled", False) or not self.save_trajectories:
             return
         
         trajectory = self._convert_to_trajectory_format(messages, user_query, completed)
@@ -3217,6 +3221,8 @@ class AIAgent:
         fewer messages") is preserved so resume + branch don't clobber a
         fuller existing snapshot.
         """
+        if getattr(self, "_persist_disabled", False):
+            return
         if not getattr(self, "_session_json_enabled", False):
             return
         messages = messages or self._session_messages
@@ -4144,6 +4150,8 @@ class AIAgent:
         path via ``touch_session_activity``. Fail-open: a failed heartbeat
         write must NEVER raise into the agent loop (swallow + debug-log).
         """
+        if getattr(self, "_persist_disabled", False):
+            return
         session_id = getattr(self, "session_id", None)
         session_db = getattr(self, "_session_db", None)
         if not session_id or session_db is None:
@@ -4452,6 +4460,9 @@ class AIAgent:
         Idempotent: gateway cleanup and AIAgent.close() may share this
         ownership boundary.
         """
+        if getattr(self, "_persist_disabled", False):
+            self._memory_provider_shutdown = True
+            return
         if getattr(self, "_memory_provider_shutdown", False):
             return
         self._memory_provider_shutdown = True
@@ -4479,6 +4490,8 @@ class AIAgent:
         Called when session_id rotates (e.g. /new, context compression);
         providers keep their state and continue running under the old
         session_id — they just flush pending extraction now."""
+        if getattr(self, "_persist_disabled", False):
+            return
         if self._memory_manager:
             try:
                 self._memory_manager.on_session_end(messages or [])
@@ -4533,6 +4546,8 @@ class AIAgent:
         providers are strictly best-effort — a misconfigured or offline
         backend must not block the user from seeing their response.
         """
+        if getattr(self, "_persist_disabled", False):
+            return
         if interrupted:
             return
         if not (self._memory_manager and final_response and original_user_message):
@@ -4764,7 +4779,10 @@ class AIAgent:
         # 'cron_complete' / 'cli_close' reason set by an earlier terminal path.
         session_db = getattr(self, "_session_db", None)
         try:
-            if getattr(self, "_end_session_on_close", True):
+            if (
+                not getattr(self, "_persist_disabled", False)
+                and getattr(self, "_end_session_on_close", True)
+            ):
                 session_id = getattr(self, "session_id", None)
                 if session_db and session_id:
                     session_db.end_session(session_id, "agent_close")
@@ -4783,7 +4801,11 @@ class AIAgent:
         # unregisters — so it survives for the life of the process.
         # Cleared first so the documented idempotency of close() holds.
         try:
-            if getattr(self, "_owns_session_db", False) and session_db is not None:
+            if (
+                not getattr(self, "_persist_disabled", False)
+                and getattr(self, "_owns_session_db", False)
+                and session_db is not None
+            ):
                 self._owns_session_db = False
                 session_db.close()
         except Exception:

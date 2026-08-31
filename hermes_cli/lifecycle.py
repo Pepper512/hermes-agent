@@ -8,8 +8,16 @@ from typing import Any, List
 logger = logging.getLogger(__name__)
 
 
+def _ephemeral_hooks_suppressed() -> bool:
+    from hermes_cli.persistence import PersistencePolicy, current_persistence_policy
+
+    return current_persistence_policy() is PersistencePolicy.EPHEMERAL
+
+
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     """Notify first-party observers, then invoke compatibility plugin hooks."""
+    if _ephemeral_hooks_suppressed():
+        return []
     try:
         from hermes_cli.observability import observe_lifecycle
 
@@ -24,6 +32,8 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
 
 def has_hook(hook_name: str) -> bool:
     """Return whether a first-party observer or plugin consumes a hook."""
+    if _ephemeral_hooks_suppressed():
+        return False
     try:
         from hermes_cli.observability import handles_hook
 
@@ -39,6 +49,8 @@ def has_hook(hook_name: str) -> bool:
 
 def finalize_session(**kwargs: Any) -> List[Any]:
     """Notify observers and hard-close one core-owned Relay conversation."""
+    if _ephemeral_hooks_suppressed():
+        return []
     try:
         from hermes_cli.observability import observe_lifecycle
 

@@ -1973,9 +1973,15 @@ def _build_child_agent(
     # the child's transcript into the launch profile's db, breaking
     # parent_session_id lineage and session_search. AsyncSessionDB wrappers
     # (gateway) forward .db_path via __getattr__, so this works through them.
+    from hermes_cli.persistence import PersistencePolicy, coerce_persistence_policy
+
+    child_persistence_policy = coerce_persistence_policy(
+        vars(parent_agent).get("persistence_policy", PersistencePolicy.DURABLE)
+    )
+    child_ephemeral = child_persistence_policy is PersistencePolicy.EPHEMERAL
     child_session_db = None
     parent_session_db = getattr(parent_agent, "_session_db", None)
-    if parent_session_db is not None:
+    if not child_ephemeral and parent_session_db is not None:
         try:
             from hermes_state import SessionDB
 
@@ -2021,6 +2027,7 @@ def _build_child_agent(
                 clarify_callback=None,
                 thinking_callback=child_thinking_cb,
                 session_db=child_session_db,
+                persistence_policy=child_persistence_policy,
                 parent_session_id=getattr(parent_agent, "session_id", None),
                 providers_allowed=child_providers_allowed,
                 providers_ignored=child_providers_ignored,
@@ -2857,8 +2864,14 @@ def _run_single_child(
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
+            from hermes_cli.persistence import bind_persistence_policy
 
-            with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+            with (
+                delegated_child_context(str(getattr(child, "session_id", "") or "")),
+                bind_persistence_policy(
+                    vars(child).get("persistence_policy", "durable")
+                ),
+            ):
                 return child.run_conversation(
                     user_message=goal,
                     task_id=child_task_id,
@@ -3024,11 +3037,16 @@ def _run_single_child(
                 _schema_retries = 1
                 _retry_result = None
                 try:
-                    _retry_result = child.run_conversation(
-                        user_message=build_retry_message(_schema_errors),
-                        task_id=child_task_id,
-                        stream_callback=_relay_child_text,
-                    )
+                    from hermes_cli.persistence import bind_persistence_policy
+
+                    with bind_persistence_policy(
+                        vars(child).get("persistence_policy", "durable")
+                    ):
+                        _retry_result = child.run_conversation(
+                            user_message=build_retry_message(_schema_errors),
+                            task_id=child_task_id,
+                            stream_callback=_relay_child_text,
+                        )
                 except Exception as _retry_exc:
                     logger.warning(
                         "Subagent %d schema-retry turn failed: %s",

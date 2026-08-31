@@ -182,6 +182,7 @@ def _run_and_exit_oneshot(
     toolsets: object = None,
     skills: object = None,
     usage_file: object = None,
+    persistence_policy: object = "durable",
 ) -> None:
     try:
         from hermes_cli.oneshot import run_oneshot
@@ -193,6 +194,7 @@ def _run_and_exit_oneshot(
             toolsets=toolsets,
             skills=skills,
             usage_file=usage_file,
+            persistence_policy=persistence_policy,
         )
     except KeyboardInterrupt:
         rc = 130
@@ -209,11 +211,17 @@ def _run_and_exit_oneshot(
         # ``run_oneshot`` itself malfunctioned — surface it on stderr but never
         # fall through to normal interpreter teardown, which is the exact path
         # that aborts with SIGABRT on AL2023 (the bug this routine fixes).
-        import traceback
-        try:
-            traceback.print_exc()
-        except Exception:
-            pass
+        from hermes_cli.persistence import PersistencePolicy, coerce_persistence_policy
+
+        if coerce_persistence_policy(persistence_policy) is PersistencePolicy.EPHEMERAL:
+            print("hermes -z: agent failed", file=sys.stderr)
+        else:
+            import traceback
+
+            try:
+                traceback.print_exc()
+            except Exception:
+                pass
         rc = 1
     try:
         _cleanup_oneshot_runtime()
@@ -3124,6 +3132,38 @@ def _resolve_use_tui(args) -> bool:
 
 def cmd_chat(args):
     """Run interactive chat CLI."""
+    from hermes_cli.persistence import PersistencePolicy, validate_invocation_policy
+
+    persistence_policy = validate_invocation_policy(args)
+    if persistence_policy is PersistencePolicy.EPHEMERAL:
+        # Ephemeral chat is deliberately routed through the narrow one-shot
+        # runtime. This branch precedes provider/config checks and the cli.py
+        # import, so HermesCLI and its eager SessionDB cannot be constructed.
+        query = getattr(args, "query", None)
+        query_file = getattr(args, "query_file", None)
+        if query_file:
+            try:
+                if query_file == "-":
+                    query = sys.stdin.read()
+                else:
+                    with open(query_file, "r", encoding="utf-8", errors="replace") as handle:
+                        query = handle.read()
+            except OSError:
+                print("Error: ephemeral query source could not be read", file=sys.stderr)
+                raise SystemExit(2)
+        if not (query or "").strip():
+            print("Error: ephemeral query source is empty", file=sys.stderr)
+            raise SystemExit(2)
+        _run_and_exit_oneshot(
+            query,
+            model=getattr(args, "model", None),
+            provider=getattr(args, "provider", None),
+            toolsets=getattr(args, "toolsets", None),
+            skills=getattr(args, "skills", None),
+            persistence_policy=persistence_policy,
+        )
+        return
+
     use_tui = _resolve_use_tui(args)
 
     _apply_safe_mode(args)
@@ -12498,6 +12538,12 @@ def _should_background_mcp_startup(args) -> bool:
 
 def _prepare_agent_startup(args) -> None:
     """Discover plugins/MCP/hooks for commands that can run an agent turn."""
+    # Fail closed before plugin discovery, hook registration, model access, or
+    # persistence construction. Parser callers surface ValueError via
+    # argparse; direct callers receive the same side-effect-free failure.
+    from hermes_cli.persistence import validate_invocation_policy
+
+    validate_invocation_policy(args)
     # --yolo: chokepoint guarantee that HERMES_YOLO_MODE is set before ANY
     # plugin/tool discovery below imports tools.approval, which freezes
     # _YOLO_MODE_FROZEN at import time (PR #7994 security design).  main()'s
@@ -12666,6 +12712,13 @@ def _try_fast_chat_launch() -> bool:
     if getattr(args, "command", None) not in {None, "chat"}:
         return False
 
+    from hermes_cli.persistence import validate_invocation_policy
+
+    try:
+        validate_invocation_policy(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
     _prepare_agent_startup(args)
@@ -12679,6 +12732,7 @@ def _try_fast_chat_launch() -> bool:
             toolsets=getattr(args, "toolsets", None),
             skills=getattr(args, "skills", None),
             usage_file=getattr(args, "usage_file", None),
+            persistence_policy=getattr(args, "persistence_policy", None),
         )
 
     if (args.resume or args.continue_last) and args.command is None:
@@ -12723,6 +12777,13 @@ def _try_termux_fast_cli_launch() -> bool:
     chat_parser.set_defaults(func=cmd_chat)
     args = parser.parse_args(_coalesce_session_name_args(argv))
 
+    from hermes_cli.persistence import validate_invocation_policy
+
+    try:
+        validate_invocation_policy(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     if getattr(args, "version", False):
         _print_version_info(check_updates=True)
         return True
@@ -12737,6 +12798,7 @@ def _try_termux_fast_cli_launch() -> bool:
             toolsets=getattr(args, "toolsets", None),
             skills=getattr(args, "skills", None),
             usage_file=getattr(args, "usage_file", None),
+            persistence_policy=getattr(args, "persistence_policy", None),
         )
 
     if (args.resume or args.continue_last) and args.command is None:
@@ -14702,6 +14764,13 @@ def main():
         subparsers.required = False
         args = parser.parse_args(_processed_argv)
 
+    from hermes_cli.persistence import validate_invocation_policy
+
+    try:
+        validate_invocation_policy(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     # Handle --version flag
     if args.version:
         cmd_version(args)
@@ -14734,6 +14803,7 @@ def main():
             toolsets=getattr(args, "toolsets", None),
             skills=getattr(args, "skills", None),
             usage_file=getattr(args, "usage_file", None),
+            persistence_policy=getattr(args, "persistence_policy", None),
         )
 
     # Handle top-level --resume / --continue as shortcut to chat

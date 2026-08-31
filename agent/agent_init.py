@@ -614,6 +614,7 @@ def init_agent(
     pass_session_id: bool = False,
     requested_provider: str = None,
     capabilities: Optional[Dict[str, bool]] = None,
+    persistence_policy: object = "durable",
 ):
     """
     Initialize the AI Agent.
@@ -665,6 +666,21 @@ def init_agent(
             remain skipped.
     """
     _install_safe_stdio()
+
+    from hermes_cli.persistence import PersistencePolicy, coerce_persistence_policy
+
+    agent.persistence_policy = coerce_persistence_policy(persistence_policy)
+    ephemeral_session = agent.persistence_policy is PersistencePolicy.EPHEMERAL
+    # Bind the persistence security boundary before logging, memory, context
+    # engines, SessionDB references, or any session-aware helper is built.
+    agent._persist_disabled = ephemeral_session
+    if ephemeral_session:
+        save_trajectories = False
+        verbose_logging = False
+        skip_memory = True
+        skip_background_review = True
+        session_db = None
+        checkpoints_enabled = False
 
     agent.model = model
     agent.max_iterations = max_iterations
@@ -1077,9 +1093,10 @@ def init_agent(
     # both live under ~/.hermes/logs/.  Idempotent, so gateway mode
     # (which creates a new AIAgent per message) won't duplicate handlers.
     from hermes_logging import setup_logging, setup_verbose_logging
-    setup_logging(hermes_home=_ra()._hermes_home)
+    if not ephemeral_session:
+        setup_logging(hermes_home=_ra()._hermes_home)
 
-    if agent.verbose_logging:
+    if not ephemeral_session and agent.verbose_logging:
         setup_verbose_logging()
         _ra().logger.info("Verbose logging enabled (third-party library logs suppressed)")
     elif agent.quiet_mode:
@@ -1703,7 +1720,8 @@ def init_agent(
     # Session logs go into ~/.hermes/sessions/ alongside gateway sessions
     hermes_home = get_hermes_home()
     agent.logs_dir = hermes_home / "sessions"
-    agent.logs_dir.mkdir(parents=True, exist_ok=True)
+    if not ephemeral_session:
+        agent.logs_dir.mkdir(parents=True, exist_ok=True)
     # Per-session JSON snapshot writer (~/.hermes/sessions/session_{sid}.json)
     # is opt-in via sessions.write_json_snapshots (default False).  state.db
     # is canonical — the snapshot is only useful for external tooling that
@@ -1712,7 +1730,10 @@ def init_agent(
     try:
         from hermes_cli.config import load_config_readonly as _load_sess_cfg
         _sess_cfg = (_load_sess_cfg().get("sessions") or {})
-        agent._session_json_enabled = bool(_sess_cfg.get("write_json_snapshots", False))
+        agent._session_json_enabled = (
+            not ephemeral_session
+            and bool(_sess_cfg.get("write_json_snapshots", False))
+        )
     except Exception:
         pass
     # logs_dir is retained unconditionally for request_dump_*.json (debug
@@ -1772,12 +1793,12 @@ def init_agent(
     # background-review forks) rotate or share the session forward to a
     # continuation row that must remain open after the helper is torn down;
     # those callers explicitly set this flag to False.
-    agent._end_session_on_close = True
+    agent._end_session_on_close = not ephemeral_session
     # When True, this agent NEVER persists to the canonical session store
     # (state.db) or the JSON snapshot, regardless of session_id. Set on the
     # background skill/memory review fork so its harness turn can't leak into
     # the user's real session and hijack the next live turn. Default False.
-    agent._persist_disabled = False
+    agent._persist_disabled = ephemeral_session
     agent._session_init_model_config = {
         "max_iterations": agent.max_iterations,
         "reasoning_config": reasoning_config,
@@ -1871,7 +1892,7 @@ def init_agent(
     _memory_toolset_requested = (
         "memory" in _enabled_toolsets and "memory" not in _disabled_toolsets
     )
-    if not skip_memory or _memory_toolset_requested:
+    if not ephemeral_session and (not skip_memory or _memory_toolset_requested):
         try:
             from tools.memory_tool import (
                 get_builtin_memory_config,
@@ -1900,7 +1921,7 @@ def init_agent(
     # Memory provider plugin (external — one at a time, alongside built-in)
     # Reads memory.provider from config to select which plugin to activate.
     agent._memory_manager = None
-    if not skip_memory:
+    if not ephemeral_session and not skip_memory:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
 
@@ -2693,6 +2714,9 @@ def init_agent(
     except Exception:
         pass
 
+    if ephemeral_session:
+        _engine_name = "compressor"
+
     if _engine_name != "compressor":
         # Try loading from plugins/context_engine/<name>/
         try:
@@ -2946,7 +2970,11 @@ def init_agent(
             _existing_tool_names.add(_tname)
 
     # Notify context engine of session start
-    if hasattr(agent, "context_compressor") and agent.context_compressor:
+    if (
+        not ephemeral_session
+        and hasattr(agent, "context_compressor")
+        and agent.context_compressor
+    ):
         try:
             agent.context_compressor.on_session_start(
                 agent.session_id,
