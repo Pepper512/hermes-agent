@@ -40,6 +40,7 @@ import datetime
 import importlib.util
 import json
 import logging
+import math
 import os
 import queue
 import platform
@@ -64,6 +65,14 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_constants import display_hermes_home
 
 logger = logging.getLogger(__name__)
+
+_COMMAND_SINK_LIFECYCLE_ERROR = "tts_command_sink_lifecycle_failed"
+
+
+class CommandSinkLifecycleError(RuntimeError):
+    """Fixed, command/transcript/output-free sink lifecycle failure."""
+
+
 def get_env_value(name, default=None):
     """Read env values through the live config module.
 
@@ -1223,16 +1232,16 @@ def _stop_command_tts_process_group(
         return
 
     if owned_pgid is None:
-        try:
-            proc.wait(timeout=1)
-        except BaseException:
-            pass
-        return
+        raise RuntimeError(_COMMAND_SINK_LIFECYCLE_ERROR)
     try:
         os.killpg(owned_pgid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError):
         pass
-    deadline = time.monotonic() + 0.5
+    try:
+        proc.wait(timeout=0.1)
+    except BaseException:
+        pass
+    deadline = time.monotonic() + 0.1
     while _posix_process_group_exists(owned_pgid) and time.monotonic() < deadline:
         time.sleep(0.01)
     if _posix_process_group_exists(owned_pgid):
@@ -1240,25 +1249,86 @@ def _stop_command_tts_process_group(
             os.killpg(owned_pgid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
-        deadline = time.monotonic() + 0.5
+        deadline = time.monotonic() + 0.1
         while _posix_process_group_exists(owned_pgid) and time.monotonic() < deadline:
             time.sleep(0.01)
     try:
-        proc.wait(timeout=1)
+        proc.wait(timeout=0.2)
     except BaseException:
         try:
             proc.kill()
         except BaseException:
             pass
         try:
-            proc.wait(timeout=1)
+            proc.wait(timeout=0.2)
         except BaseException:
             pass
-    deadline = time.monotonic() + 0.25
+    deadline = time.monotonic() + 0.1
     while _posix_process_group_exists(owned_pgid) and time.monotonic() < deadline:
         time.sleep(0.01)
     if _posix_process_group_exists(owned_pgid):
         raise RuntimeError("tts_provider_lifecycle_failed")
+
+
+def _fallback_stop_command_tts_process_group(
+    proc: subprocess.Popen,
+    owned_pgid: int | None,
+) -> None:
+    """Independent stdlib fallback when the primary group stop fails."""
+    failures = 0
+
+    def group_exists() -> bool | None:
+        nonlocal failures
+        if owned_pgid is None:
+            return False
+        try:
+            return _posix_process_group_exists(owned_pgid)
+        except BaseException:
+            failures += 1
+            return None
+
+    if os.name == "posix" and owned_pgid is not None:
+        try:
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(owned_pgid, sig)
+                except ProcessLookupError:
+                    break
+                except BaseException:
+                    failures += 1
+                deadline = time.monotonic() + 0.25
+                state = group_exists()
+                while state is True and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                    state = group_exists()
+                if state is False:
+                    break
+        except BaseException:
+            failures += 1
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+    except BaseException:
+        failures += 1
+    try:
+        proc.wait(timeout=0.5)
+    except BaseException:
+        failures += 1
+    final_group_state = (
+        group_exists() if os.name == "posix" and owned_pgid is not None else False
+    )
+    try:
+        child_alive = proc.poll() is None
+    except BaseException:
+        failures += 1
+        child_alive = True
+    if (
+        failures
+        or final_group_state is not False
+        or child_alive
+    ):
+        raise RuntimeError(_COMMAND_SINK_LIFECYCLE_ERROR)
 
 
 def _terminate_command_tts_process_tree(proc: subprocess.Popen) -> None:
@@ -1334,7 +1404,7 @@ def _run_command_tts(
     *,
     inherited_sink_fd: int | None = None,
     input_text: str | None = None,
-) -> subprocess.CompletedProcess:
+) -> subprocess.CompletedProcess | None:
     """Run either the unchanged named path or parallel anonymous-sink path."""
     if inherited_sink_fd is not None or input_text is not None:
         return _run_command_tts_sink_process(
@@ -1457,6 +1527,61 @@ def _run_command_tts_named_legacy(
     return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
 
 
+def _emergency_cleanup_spawned_command_tts_process(proc: subprocess.Popen) -> None:
+    """Best-effort fixed-boundary cleanup for failures before lifecycle setup."""
+    try:
+        candidate_pid = getattr(proc, "pid", None)
+        owned_pgid = (
+            candidate_pid
+            if os.name == "posix" and isinstance(candidate_pid, int)
+            else None
+        )
+    except BaseException:
+        owned_pgid = None
+    try:
+        _stop_command_tts_process_group(proc, owned_pgid)
+    except BaseException:
+        try:
+            _fallback_stop_command_tts_process_group(proc, owned_pgid)
+        except BaseException:
+            pass
+    for name in ("stdin", "stdout", "stderr"):
+        try:
+            stream = getattr(proc, name, None)
+        except BaseException:
+            continue
+        if stream is not None:
+            try:
+                stream.close()
+            except BaseException:
+                pass
+
+
+def _spawned_command_tts_process_needs_cleanup(proc: subprocess.Popen) -> bool:
+    """Fail closed when either the direct child or its owned group may live."""
+    for name in ("stdin", "stdout", "stderr"):
+        try:
+            stream = getattr(proc, name, None)
+            if stream is not None and not stream.closed:
+                return True
+        except BaseException:
+            return True
+    try:
+        child_alive = proc.poll() is None
+    except BaseException:
+        return True
+    if os.name != "posix":
+        return child_alive
+    try:
+        candidate_pid = getattr(proc, "pid", None)
+        if not isinstance(candidate_pid, int):
+            return True
+        group_alive = _posix_process_group_exists(candidate_pid)
+    except BaseException:
+        return True
+    return child_alive or group_alive
+
+
 def _run_command_tts_sink_process(
     command: str,
     timeout: float,
@@ -1464,75 +1589,134 @@ def _run_command_tts_sink_process(
     *,
     inherited_sink_fd: int | None,
     input_text: str | None,
-) -> subprocess.CompletedProcess:
-    """Run a command-provider shell command with process-tree idle cleanup.
+) -> None:
+    """Fixed boundary which owns a spawned child before Python setup resumes."""
+    spawned: subprocess.Popen | None = None
+
+    def owned_popen(*args: Any, **kwargs: Any) -> subprocess.Popen:
+        nonlocal spawned
+        spawned = subprocess.Popen(*args, **kwargs)
+        return spawned
+
+    try:
+        return _run_command_tts_sink_process_impl(
+            command,
+            timeout,
+            env_passthrough,
+            inherited_sink_fd=inherited_sink_fd,
+            input_text=input_text,
+            popen=owned_popen,
+        )
+    except CommandSinkLifecycleError:
+        if spawned is not None and _spawned_command_tts_process_needs_cleanup(
+            spawned
+        ):
+            _emergency_cleanup_spawned_command_tts_process(spawned)
+        raise
+    except BaseException:
+        if spawned is not None:
+            _emergency_cleanup_spawned_command_tts_process(spawned)
+        raise CommandSinkLifecycleError(_COMMAND_SINK_LIFECYCLE_ERROR) from None
+
+
+def _run_command_tts_sink_process_impl(
+    command: str,
+    timeout: float,
+    env_passthrough: Optional[list] = None,
+    *,
+    inherited_sink_fd: int | None,
+    input_text: str | None,
+    popen: Callable[..., subprocess.Popen],
+) -> None:
+    """Run one sink command within an absolute bounded lifecycle.
 
     Child env is scrubbed of Hermes secrets (salvage of #56332) while still
     propagating delegated-child lineage markers when applicable.
     """
-    from agent.delegation_context import delegated_child_subprocess_env
-    from tools.environments.local import hermes_subprocess_env
+    try:
+        if (
+            not isinstance(timeout, (int, float))
+            or isinstance(timeout, bool)
+            or not math.isfinite(float(timeout))
+            or timeout <= 0
+            or inherited_sink_fd is not None
+            and (
+                not isinstance(inherited_sink_fd, int)
+                or isinstance(inherited_sink_fd, bool)
+                or inherited_sink_fd < 0
+                or os.name != "posix"
+            )
+            or input_text is not None
+            and not isinstance(input_text, str)
+        ):
+            raise ValueError
+        absolute_deadline = time.monotonic() + float(timeout)
+        from agent.delegation_context import delegated_child_subprocess_env
+        from tools.environments.local import hermes_subprocess_env
 
-    scrubbed = hermes_subprocess_env(inherit_credentials=False)
-    for key in env_passthrough or []:
-        value = os.environ.get(key)
-        if value is not None:
-            scrubbed[key] = value
-    if inherited_sink_fd is not None and (
-        not isinstance(inherited_sink_fd, int)
-        or isinstance(inherited_sink_fd, bool)
-        or inherited_sink_fd < 0
-        or os.name != "posix"
-    ):
-        raise ValueError("tts_anonymous_sink_unsupported")
-    if input_text is not None and not isinstance(input_text, str):
-        raise ValueError("tts_provider_lifecycle_failed")
+        scrubbed = hermes_subprocess_env(inherit_credentials=False)
+        for key in env_passthrough or []:
+            value = os.environ.get(key)
+            if value is not None:
+                scrubbed[key] = value
+        if time.monotonic() >= absolute_deadline:
+            raise TimeoutError
+        popen_kwargs: Dict[str, Any] = {
+            "shell": True,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "env": delegated_child_subprocess_env(scrubbed),
+            "close_fds": True,
+            "stdin": subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = getattr(
+                subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+            )
+        else:
+            popen_kwargs["start_new_session"] = True
+            popen_kwargs["pass_fds"] = (
+                (inherited_sink_fd,) if inherited_sink_fd is not None else ()
+            )
+        retained_sizes = {"stdout": 0, "stderr": 0}
+        lifecycle_lock = threading.Lock()
+        worker_failed = [False]
+        readers: list[threading.Thread] = []
+        writer: threading.Thread | None = None
+        started_threads: list[threading.Thread] = []
+        cleanup_failures = 0
+        proc = popen(command, **popen_kwargs)
+    except BaseException:
+        raise CommandSinkLifecycleError(_COMMAND_SINK_LIFECYCLE_ERROR) from None
 
-    popen_kwargs: Dict[str, Any] = {
-        "shell": True,
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.PIPE,
-        "text": True,
-        # Lossy UTF-8 decode — locale-mismatched bytes from the TTS command
-        # must not raise in the reader threads on non-UTF-8 Windows (#45099).
-        "encoding": "utf-8",
-        "errors": "replace",
-        "env": delegated_child_subprocess_env(scrubbed),
-        "close_fds": True,
-        "stdin": subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
-    }
-    if os.name == "nt":
-        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    else:
-        popen_kwargs["start_new_session"] = True
-        popen_kwargs["pass_fds"] = (
-            (inherited_sink_fd,) if inherited_sink_fd is not None else ()
+    initialization_error: BaseException | None = None
+    try:
+        candidate_pid = getattr(proc, "pid", None)
+        owned_pgid = (
+            candidate_pid
+            if os.name == "posix" and isinstance(candidate_pid, int)
+            else None
         )
-
-    proc = subprocess.Popen(command, **popen_kwargs)
-    candidate_pid = getattr(proc, "pid", None)
-    owned_pgid = candidate_pid if os.name == "posix" and isinstance(candidate_pid, int) else None
-    chunks: Dict[str, list[str]] = {"stdout": [], "stderr": []}
-    retained_sizes = {"stdout": 0, "stderr": 0}
-    activity_lock = threading.Lock()
-    last_activity = [time.monotonic()]
-    worker_failed = [False]
-
+        if os.name == "posix" and owned_pgid is None:
+            raise RuntimeError(_COMMAND_SINK_LIFECYCLE_ERROR)
+    except BaseException as exc:
+        initialization_error = exc
+        owned_pgid = None
     def retain(name: str, chunk: str) -> None:
-        with activity_lock:
-            last_activity[0] = time.monotonic()
+        with lifecycle_lock:
             remaining = 65536 - retained_sizes[name]
             if remaining <= 0:
                 return
             encoded = chunk.encode("utf-8", errors="replace")[:remaining]
-            kept = encoded.decode("utf-8", errors="replace")
-            chunks[name].append(kept)
-            retained_sizes[name] += len(kept.encode("utf-8"))
+            retained_sizes[name] += len(encoded)
 
     def read_stream(name: str, stream: Any) -> None:
-        encoding = getattr(stream, "encoding", None) or "utf-8"
-        read1 = getattr(getattr(stream, "buffer", None), "read1", None)
         try:
+            encoding = getattr(stream, "encoding", None) or "utf-8"
+            read1 = getattr(getattr(stream, "buffer", None), "read1", None)
             while True:
                 if read1 is None:
                     chunk = stream.read(65536)
@@ -1545,33 +1729,41 @@ def _run_command_tts_sink_process(
         except (OSError, ValueError):
             pass
         except BaseException:
-            with activity_lock:
+            with lifecycle_lock:
                 worker_failed[0] = True
 
     def write_input() -> None:
-        stream = proc.stdin
-        if stream is None:
-            return
         try:
+            stream = proc.stdin
+            if stream is None:
+                return
             stream.write(input_text or "")
             stream.flush()
         except (AttributeError, BrokenPipeError, OSError, ValueError):
             pass
         except BaseException:
-            with activity_lock:
+            with lifecycle_lock:
                 worker_failed[0] = True
         finally:
             try:
-                stream.close()
-            except (OSError, ValueError):
-                pass
+                if "stream" in locals() and stream is not None:
+                    stream.close()
+            except BaseException:
+                with lifecycle_lock:
+                    worker_failed[0] = True
 
-    readers: list[threading.Thread] = []
-    writer: threading.Thread | None = None
-    started_threads: list[threading.Thread] = []
-    timed_out = False
-    pending_error: BaseException | None = None
+    def get_process_stream(name: str) -> Any:
+        nonlocal cleanup_failures
+        try:
+            return getattr(proc, name, None)
+        except BaseException:
+            cleanup_failures += 1
+            return None
+
+    pending_error: BaseException | None = initialization_error
     try:
+        if pending_error is not None:
+            raise pending_error
         readers = [
             threading.Thread(
                 target=read_stream,
@@ -1591,77 +1783,87 @@ def _run_command_tts_sink_process(
             writer = threading.Thread(target=write_input, daemon=True)
             writer.start()
             started_threads.append(writer)
-        while (
-            proc.poll() if callable(getattr(proc, "poll", None)) else proc.returncode
-        ) is None:
-            with activity_lock:
-                idle_for = time.monotonic() - last_activity[0]
-            if idle_for >= timeout:
-                timed_out = True
+        while True:
+            remaining = absolute_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            status = (
+                proc.poll()
+                if callable(getattr(proc, "poll", None))
+                else proc.returncode
+            )
+            if status is not None:
                 break
-            time.sleep(min(0.01, max(0.001, timeout - idle_for)))
+            time.sleep(min(0.01, max(0.001, remaining)))
     except BaseException as exc:
         pending_error = exc
     finally:
-        _stop_command_tts_process_group(proc, owned_pgid)
-        stdin_stream = getattr(proc, "stdin", None)
+        try:
+            _stop_command_tts_process_group(proc, owned_pgid)
+        except BaseException:
+            cleanup_failures += 1
+            try:
+                _fallback_stop_command_tts_process_group(proc, owned_pgid)
+            except BaseException:
+                cleanup_failures += 1
+        stdin_stream = get_process_stream("stdin")
         if stdin_stream is not None:
             try:
                 stdin_stream.close()
-            except (OSError, ValueError):
-                pass
+            except BaseException:
+                cleanup_failures += 1
         if writer is not None:
             if writer in started_threads:
-                writer.join(timeout=2)
+                try:
+                    writer.join(timeout=2)
+                except BaseException:
+                    cleanup_failures += 1
         for reader in readers:
             if reader in started_threads:
-                reader.join(timeout=2)
+                try:
+                    reader.join(timeout=2)
+                except BaseException:
+                    cleanup_failures += 1
         for stream in (
-            getattr(proc, "stdin", None),
-            getattr(proc, "stdout", None),
-            getattr(proc, "stderr", None),
+            get_process_stream("stdout"),
+            get_process_stream("stderr"),
         ):
             if stream is not None:
                 try:
                     close = getattr(stream, "close", None)
                     if close is not None:
                         close()
-                except (OSError, ValueError):
-                    pass
+                except BaseException:
+                    cleanup_failures += 1
         for thread in started_threads:
-            if thread.is_alive():
-                thread.join(timeout=1)
-            if thread.is_alive() and pending_error is None:
-                pending_error = RuntimeError("tts_provider_lifecycle_failed")
-        if worker_failed[0] and pending_error is None:
-            pending_error = RuntimeError("tts_provider_lifecycle_failed")
+            try:
+                alive = thread.is_alive()
+            except BaseException:
+                cleanup_failures += 1
+                alive = True
+            if alive:
+                try:
+                    thread.join(timeout=1)
+                except BaseException:
+                    cleanup_failures += 1
+            try:
+                alive = thread.is_alive()
+            except BaseException:
+                cleanup_failures += 1
+                alive = True
+            if alive:
+                cleanup_failures += 1
+        if worker_failed[0]:
+            cleanup_failures += 1
 
-    if pending_error is not None:
-        raise pending_error
-    if timed_out:
-        stdout = "".join(chunks["stdout"])
-        stderr = "".join(chunks["stderr"])
-        try:
-            raise subprocess.TimeoutExpired(command, timeout)
-        except subprocess.TimeoutExpired as exc:
-            raise subprocess.TimeoutExpired(
-                command,
-                timeout,
-                output=stdout,
-                stderr=stderr,
-            ) from exc
-
-    stdout = "".join(chunks["stdout"])
-    stderr = "".join(chunks["stderr"])
-
-    if proc.returncode:
-        raise subprocess.CalledProcessError(
-            proc.returncode,
-            command,
-            output=stdout,
-            stderr=stderr,
-        )
-    return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+    try:
+        process_failed = bool(proc.returncode)
+    except BaseException:
+        process_failed = True
+    deadline_expired = time.monotonic() >= absolute_deadline
+    if pending_error is not None or cleanup_failures or process_failed or deadline_expired:
+        raise CommandSinkLifecycleError(_COMMAND_SINK_LIFECYCLE_ERROR) from None
+    return None
 
 
 def _run_command_tts_to_sink(
@@ -1674,7 +1876,7 @@ def _run_command_tts_to_sink(
     voice: str | None,
     model: str | None,
     speed: float | None,
-) -> str:
+) -> None:
     """Run the parallel descriptor-only command adapter.
 
     This remains unreachable from public TTS until Task 7.  The transcript is
@@ -1683,32 +1885,39 @@ def _run_command_tts_to_sink(
     from tools.tts_staging import _validate_provider_audio_sink
 
     sink_path, output_format, _ = _validate_provider_audio_sink(sink)
-    if (
-        not isinstance(text, str)
-        or not isinstance(provider_name, str)
-        or not _is_command_provider_config(config)
-        or _get_command_tts_output_format(config) != output_format
-    ):
-        raise RuntimeError("tts_provider_lifecycle_failed")
-    command_template = config.get("command")
-    if type(command_template) is not str or not command_template.strip():
-        raise RuntimeError("tts_provider_lifecycle_failed")
-    sink_fd = _descriptor_number_from_sink_path(sink_path)
-    rendered = _render_command_tts_sink_template(
-        command_template,
-        sink=sink,
-        voice=str(voice if voice is not None else config.get("voice", "")),
-        model=str(model if model is not None else config.get("model", "")),
-        speed=str(speed if speed is not None else config.get("speed", tts_config.get("speed", ""))),
-    )
-    _run_command_tts(
-        rendered,
-        _get_command_tts_timeout(config),
-        env_passthrough=_command_provider_env_passthrough(config),
-        inherited_sink_fd=sink_fd,
-        input_text=text,
-    )
-    return sink_path
+    try:
+        if (
+            not isinstance(text, str)
+            or not isinstance(provider_name, str)
+            or not _is_command_provider_config(config)
+            or _get_command_tts_output_format(config) != output_format
+        ):
+            raise ValueError
+        command_template = config.get("command")
+        if type(command_template) is not str or not command_template.strip():
+            raise ValueError
+        sink_fd = _descriptor_number_from_sink_path(sink_path)
+        rendered = _render_command_tts_sink_template(
+            command_template,
+            sink=sink,
+            voice=str(voice if voice is not None else config.get("voice", "")),
+            model=str(model if model is not None else config.get("model", "")),
+            speed=str(
+                speed
+                if speed is not None
+                else config.get("speed", tts_config.get("speed", ""))
+            ),
+        )
+        _run_command_tts(
+            rendered,
+            _get_command_tts_timeout(config),
+            env_passthrough=_command_provider_env_passthrough(config),
+            inherited_sink_fd=sink_fd,
+            input_text=text,
+        )
+    except BaseException:
+        raise CommandSinkLifecycleError(_COMMAND_SINK_LIFECYCLE_ERROR) from None
+    return None
 
 
 def _configured_command_tts_output_path(path: Path, config: Dict[str, Any]) -> Path:
@@ -1795,7 +2004,7 @@ def _generate_command_tts_to_sink(
     provider_name: str,
     config: Dict[str, Any],
     tts_config: Dict[str, Any],
-) -> str:
+) -> None:
     """Compatibility entry for the descriptor-only command lifecycle."""
     return _run_command_tts_to_sink(
         text,

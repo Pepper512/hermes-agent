@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import threading
@@ -279,7 +280,7 @@ def _assert_command_success_reaps_tree(tmp_path: Path) -> None:
             inherited_sink_fd=sink_fd,
             input_text="hello",
         )
-        assert result.returncode == 0
+        assert result is None
         _assert_pids_gone(pid_file)
     finally:
         stage.scrub_and_close()
@@ -302,7 +303,9 @@ def _assert_command_nonzero_reaps_tree(tmp_path: Path) -> None:
     stage = _create_anonymous_audio_stage_for_test("mp3", 4096, tmp_path)
     sink_fd = int(Path(stage.sink.path).name)
     try:
-        with pytest.raises(subprocess.CalledProcessError):
+        from tools.tts_tool import CommandSinkLifecycleError
+
+        with pytest.raises(CommandSinkLifecycleError):
             _run_command_tts(
                 _tree_command(pid_file, sink_fd, exit_code=7),
                 timeout=3,
@@ -331,7 +334,9 @@ def _assert_command_timeout_reaps_tree(tmp_path: Path) -> None:
     stage = _create_anonymous_audio_stage_for_test("mp3", 4096, tmp_path)
     sink_fd = int(Path(stage.sink.path).name)
     try:
-        with pytest.raises(subprocess.TimeoutExpired):
+        from tools.tts_tool import CommandSinkLifecycleError
+
+        with pytest.raises(CommandSinkLifecycleError):
             _run_command_tts(
                 _tree_command(pid_file, sink_fd, sleep=30),
                 timeout=0.2,
@@ -355,6 +360,7 @@ def test_command_timeout_reaps_tree_before_error_linux(tmp_path: Path):
 
 def _assert_command_cancel_reaps_tree(tmp_path: Path, monkeypatch) -> None:
     from tools import tts_tool
+    from tools.tts_tool import CommandSinkLifecycleError
 
     pid_file = tmp_path / "pids"
     stage = _create_anonymous_audio_stage_for_test("mp3", 4096, tmp_path)
@@ -390,13 +396,14 @@ def _assert_command_cancel_reaps_tree(tmp_path: Path, monkeypatch) -> None:
 
     monkeypatch.setattr(tts_tool.subprocess, "Popen", spawn)
     try:
-        with pytest.raises(KeyboardInterrupt):
+        with pytest.raises(CommandSinkLifecycleError) as excinfo:
             tts_tool._run_command_tts(
                 _tree_command(pid_file, sink_fd, sleep=30),
                 timeout=3,
                 inherited_sink_fd=sink_fd,
                 input_text="x",
             )
+        assert str(excinfo.value) == "tts_command_sink_lifecycle_failed"
         _assert_pids_gone(pid_file)
     finally:
         stage.scrub_and_close()
@@ -410,3 +417,166 @@ def test_command_cancel_reaps_tree_before_reraising(tmp_path: Path, monkeypatch)
 @pytest.mark.linux_only
 def test_command_cancel_reaps_tree_before_reraising_linux(tmp_path: Path, monkeypatch):
     _assert_command_cancel_reaps_tree(tmp_path, monkeypatch)
+
+
+def _assert_forced_stop_failure_runs_all_cleanup(tmp_path: Path, monkeypatch) -> None:
+    from tools import tts_tool
+    from tools.tts_tool import CommandSinkLifecycleError
+
+    pid_file = tmp_path / "pids"
+    stage = _create_anonymous_audio_stage_for_test("mp3", 4096, tmp_path)
+    sink_fd = int(Path(stage.sink.path).name)
+    real_popen = subprocess.Popen
+    captured = {}
+    fallback_calls = []
+    before_threads = {thread.ident for thread in threading.enumerate()}
+
+    def recording_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        captured["proc"] = proc
+        return proc
+
+    real_fallback = tts_tool._fallback_stop_command_tts_process_group
+
+    def recording_fallback(proc, pgid):
+        fallback_calls.append(pgid)
+        return real_fallback(proc, pgid)
+
+    monkeypatch.setattr(tts_tool.subprocess, "Popen", recording_popen)
+    monkeypatch.setattr(
+        tts_tool,
+        "_stop_command_tts_process_group",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("forced high-level stop")),
+    )
+    monkeypatch.setattr(tts_tool, "_fallback_stop_command_tts_process_group", recording_fallback)
+    try:
+        with pytest.raises(CommandSinkLifecycleError):
+            tts_tool._run_command_tts(
+                _tree_command(pid_file, sink_fd, sleep=30),
+                timeout=0.1,
+                inherited_sink_fd=sink_fd,
+                input_text="x",
+            )
+        _assert_pids_gone(pid_file)
+        proc = captured["proc"]
+        assert fallback_calls == [proc.pid]
+        assert proc.poll() is not None
+        assert proc.stdin.closed and proc.stdout.closed and proc.stderr.closed
+        assert {thread.ident for thread in threading.enumerate()} == before_threads
+    finally:
+        stage.scrub_and_close()
+
+
+@pytest.mark.macos_only
+def test_forced_stop_failure_runs_all_cleanup(tmp_path: Path, monkeypatch):
+    _assert_forced_stop_failure_runs_all_cleanup(tmp_path, monkeypatch)
+
+
+@pytest.mark.linux_only
+def test_forced_stop_failure_runs_all_cleanup_linux(tmp_path: Path, monkeypatch):
+    _assert_forced_stop_failure_runs_all_cleanup(tmp_path, monkeypatch)
+
+
+@pytest.mark.macos_only
+def test_fallback_probe_failure_still_attempts_kill_and_wait(monkeypatch):
+    from tools import tts_tool
+
+    events = []
+
+    class Proc:
+        def poll(self):
+            events.append("poll")
+            return None
+
+        def kill(self):
+            events.append("kill")
+
+        def wait(self, timeout):
+            events.append(("wait", timeout))
+            return 0
+
+    monkeypatch.setattr(
+        tts_tool,
+        "_posix_process_group_exists",
+        lambda _pgid: (_ for _ in ()).throw(OSError("forced probe failure")),
+    )
+    monkeypatch.setattr(
+        tts_tool.os,
+        "killpg",
+        lambda _pgid, sig: events.append(("killpg", sig)),
+    )
+    with pytest.raises(RuntimeError):
+        tts_tool._fallback_stop_command_tts_process_group(Proc(), 1234)
+    assert ("killpg", signal.SIGTERM) in events
+    assert ("killpg", signal.SIGKILL) in events
+    assert "poll" in events
+    assert "kill" in events
+    assert any(isinstance(event, tuple) and event[0] == "wait" for event in events)
+
+
+@pytest.mark.linux_only
+def test_fallback_probe_failure_still_attempts_kill_and_wait_linux(monkeypatch):
+    test_fallback_probe_failure_still_attempts_kill_and_wait(monkeypatch)
+
+
+@pytest.mark.macos_only
+def test_fallback_poll_failure_still_attempts_kill_and_wait(monkeypatch):
+    from tools import tts_tool
+
+    events = []
+
+    class Proc:
+        def poll(self):
+            events.append("poll")
+            raise KeyboardInterrupt
+
+        def kill(self):
+            events.append("kill")
+
+        def wait(self, timeout):
+            events.append(("wait", timeout))
+            raise subprocess.TimeoutExpired("fixed", timeout)
+
+    with pytest.raises(RuntimeError):
+        tts_tool._fallback_stop_command_tts_process_group(Proc(), None)
+    assert "kill" in events
+    assert any(isinstance(event, tuple) and event[0] == "wait" for event in events)
+
+
+@pytest.mark.linux_only
+def test_fallback_poll_failure_still_attempts_kill_and_wait_linux(monkeypatch):
+    test_fallback_poll_failure_still_attempts_kill_and_wait(monkeypatch)
+
+
+@pytest.mark.macos_only
+def test_fallback_clock_failure_still_attempts_direct_kill_and_wait(monkeypatch):
+    from tools import tts_tool
+
+    events = []
+
+    class Proc:
+        def poll(self):
+            return None
+
+        def kill(self):
+            events.append("kill")
+
+        def wait(self, timeout):
+            events.append(("wait", timeout))
+            return 0
+
+    monkeypatch.setattr(tts_tool.os, "killpg", lambda _pgid, _sig: None)
+    monkeypatch.setattr(
+        tts_tool.time,
+        "monotonic",
+        lambda: (_ for _ in ()).throw(KeyboardInterrupt),
+    )
+    with pytest.raises(RuntimeError):
+        tts_tool._fallback_stop_command_tts_process_group(Proc(), 1234)
+    assert "kill" in events
+    assert any(isinstance(event, tuple) and event[0] == "wait" for event in events)
+
+
+@pytest.mark.linux_only
+def test_fallback_clock_failure_still_attempts_direct_kill_and_wait_linux(monkeypatch):
+    test_fallback_clock_failure_still_attempts_direct_kill_and_wait(monkeypatch)

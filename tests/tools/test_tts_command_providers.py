@@ -17,6 +17,8 @@ import os
 import shlex
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -331,6 +333,250 @@ class TestRenderCommandTtsTemplate:
 # ---------------------------------------------------------------------------
 
 class TestRunCommandTts:
+    def test_sink_command_uses_absolute_total_deadline_despite_continuous_output(self):
+        from tools.tts_tool import CommandSinkLifecycleError
+
+        command = _shell_command(
+            sys.executable,
+            "-u",
+            "-c",
+            (
+                "import sys,time; end=time.monotonic()+.9; "
+                "exec(\"while time.monotonic()<end:\\n "
+                " sys.stdout.write('x'); sys.stdout.flush(); time.sleep(.02)\")"
+            ),
+        )
+        started = time.monotonic()
+        with pytest.raises(CommandSinkLifecycleError) as excinfo:
+            _run_command_tts(command, 0.1, input_text="deadline transcript")
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.8
+        assert str(excinfo.value) == "tts_command_sink_lifecycle_failed"
+
+    def test_sink_command_deadline_starts_before_spawn(self, monkeypatch):
+        from tools import tts_tool
+        from tools.tts_tool import CommandSinkLifecycleError
+
+        real_popen = subprocess.Popen
+
+        def delayed_popen(*args, **kwargs):
+            time.sleep(0.08)
+            return real_popen(*args, **kwargs)
+
+        monkeypatch.setattr(tts_tool.subprocess, "Popen", delayed_popen)
+        command = _shell_command(
+            sys.executable,
+            "-c",
+            "import sys,time; sys.stdin.read(); time.sleep(.08)",
+        )
+        started = time.monotonic()
+        with pytest.raises(CommandSinkLifecycleError):
+            tts_tool._run_command_tts(command, 0.1, input_text="x")
+        assert time.monotonic() - started < 0.17
+
+    def test_sink_command_deadline_includes_reader_drain(self, monkeypatch):
+        from tools import tts_tool
+        from tools.tts_tool import CommandSinkLifecycleError
+
+        real_popen = subprocess.Popen
+
+        class SlowReader:
+            def __init__(self, stream):
+                self._stream = stream
+                self.buffer = self
+                self.encoding = stream.encoding
+
+            def read1(self, size):
+                time.sleep(0.12)
+                return self._stream.buffer.read1(size)
+
+            def close(self):
+                self._stream.close()
+
+            @property
+            def closed(self):
+                return self._stream.closed
+
+        def delayed_reader_popen(*args, **kwargs):
+            proc = real_popen(*args, **kwargs)
+            proc.stdout = SlowReader(proc.stdout)
+            return proc
+
+        monkeypatch.setattr(tts_tool.subprocess, "Popen", delayed_reader_popen)
+        command = _shell_command(sys.executable, "-c", "print('drain me')")
+        with pytest.raises(CommandSinkLifecycleError):
+            tts_tool._run_command_tts(command, 0.1, input_text="x")
+
+    def test_sink_command_pid_access_failure_still_reaps_spawned_child(self, monkeypatch):
+        from tools import tts_tool
+        from tools.tts_tool import CommandSinkLifecycleError
+
+        real_popen = subprocess.Popen
+        captured = {}
+
+        class PidFailsOnce:
+            def __init__(self, proc):
+                object.__setattr__(self, "_proc", proc)
+                object.__setattr__(self, "_failed", False)
+
+            def __getattr__(self, name):
+                if name == "pid" and not object.__getattribute__(self, "_failed"):
+                    object.__setattr__(self, "_failed", True)
+                    raise KeyboardInterrupt
+                return getattr(object.__getattribute__(self, "_proc"), name)
+
+        def failing_pid_popen(*args, **kwargs):
+            proc = real_popen(*args, **kwargs)
+            captured["proc"] = proc
+            return PidFailsOnce(proc)
+
+        monkeypatch.setattr(tts_tool.subprocess, "Popen", failing_pid_popen)
+        command = "exec " + _shell_command(
+            sys.executable,
+            "-c",
+            "import time; time.sleep(30)",
+        )
+        with pytest.raises(CommandSinkLifecycleError):
+            tts_tool._run_command_tts(command, 1, input_text="x")
+        assert captured["proc"].poll() is not None
+
+    def test_sink_command_lock_failure_never_leaks_spawned_child(self, monkeypatch):
+        from tools import tts_tool
+        from tools.tts_tool import CommandSinkLifecycleError
+
+        real_popen = subprocess.Popen
+        captured = {}
+
+        def recording_popen(*args, **kwargs):
+            proc = real_popen(*args, **kwargs)
+            captured["proc"] = proc
+            return proc
+
+        monkeypatch.setattr(tts_tool.subprocess, "Popen", recording_popen)
+        class FailingThreading:
+            Thread = threading.Thread
+
+            @staticmethod
+            def Lock():
+                raise KeyboardInterrupt
+
+        monkeypatch.setattr(tts_tool, "threading", FailingThreading)
+        command = "exec " + _shell_command(
+            sys.executable,
+            "-c",
+            "import time; time.sleep(30)",
+        )
+        with pytest.raises(CommandSinkLifecycleError):
+            tts_tool._run_command_tts(command, 1, input_text="x")
+        if "proc" in captured:
+            assert captured["proc"].poll() is not None
+
+    def test_sink_command_fixed_error_reaps_live_captured_child(self, monkeypatch):
+        from tools import tts_tool
+        from tools.tts_tool import CommandSinkLifecycleError
+
+        captured = {}
+
+        def fixed_error_after_spawn(command, timeout, env_passthrough, **kwargs):
+            del timeout, env_passthrough
+            proc = kwargs["popen"](
+                command,
+                shell=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            captured["proc"] = proc
+            raise CommandSinkLifecycleError("tts_command_sink_lifecycle_failed")
+
+        monkeypatch.setattr(
+            tts_tool,
+            "_run_command_tts_sink_process_impl",
+            fixed_error_after_spawn,
+        )
+        command = "exec " + _shell_command(
+            sys.executable,
+            "-c",
+            "import time; time.sleep(30)",
+        )
+        with pytest.raises(CommandSinkLifecycleError):
+            tts_tool._run_command_tts(command, 1, input_text="x")
+        assert captured["proc"].poll() is not None
+
+    def test_sink_command_fixed_error_closes_exited_child_streams(self, monkeypatch):
+        from tools import tts_tool
+        from tools.tts_tool import CommandSinkLifecycleError
+
+        captured = {}
+
+        def fixed_error_after_exit(command, timeout, env_passthrough, **kwargs):
+            del timeout, env_passthrough
+            proc = kwargs["popen"](
+                command,
+                shell=True,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            proc.wait(timeout=1)
+            captured["proc"] = proc
+            raise CommandSinkLifecycleError("tts_command_sink_lifecycle_failed")
+
+        monkeypatch.setattr(
+            tts_tool,
+            "_run_command_tts_sink_process_impl",
+            fixed_error_after_exit,
+        )
+        with pytest.raises(CommandSinkLifecycleError):
+            tts_tool._run_command_tts("/usr/bin/true", 1, input_text="x")
+        proc = captured["proc"]
+        assert proc.stdin.closed and proc.stdout.closed and proc.stderr.closed
+
+    def test_sink_command_boundary_discards_secret_command_and_output(self):
+        from tools.tts_tool import (
+            CommandSinkLifecycleError,
+            _run_command_tts_sink_process,
+        )
+
+        secret = "sink-secret-f26c"
+        command = _shell_command(
+            sys.executable,
+            "-c",
+            f"import sys; print({secret!r}); print({secret!r}, file=sys.stderr); sys.exit(7)",
+        )
+        with pytest.raises(CommandSinkLifecycleError) as excinfo:
+            _run_command_tts_sink_process(
+                command,
+                1,
+                inherited_sink_fd=None,
+                input_text="private transcript",
+            )
+        exc = excinfo.value
+        exposed = " ".join((str(exc), repr(exc), repr(exc.args), repr(vars(exc))))
+        assert secret not in exposed
+        assert "private transcript" not in exposed
+        assert not any(hasattr(exc, name) for name in ("cmd", "command", "output", "stdout", "stderr"))
+
+    def test_sink_command_success_returns_no_diagnostic_payload(self):
+        from tools.tts_tool import _run_command_tts_sink_process
+
+        command = _shell_command(
+            sys.executable,
+            "-c",
+            "import sys; sys.stdin.read(); print('provider diagnostic')",
+        )
+        assert (
+            _run_command_tts_sink_process(
+                command,
+                1,
+                inherited_sink_fd=None,
+                input_text="private transcript",
+            )
+            is None
+        )
+
     @pytest.mark.macos_only
     def test_command_passes_only_sink_fd(self, monkeypatch):
         captured = {}
@@ -369,16 +615,18 @@ class TestRunCommandTts:
     def test_command_passes_only_sink_fd_linux(self, monkeypatch):
         self.test_command_passes_only_sink_fd(monkeypatch)
 
-    def test_command_text_streams_only_through_stdin(self):
+    def test_command_text_streams_only_through_stdin(self, tmp_path):
         secret = "transcript-only-via-stdin-6af3"
+        observed = tmp_path / "stdin-length"
         command = _shell_command(
             sys.executable,
             "-c",
-            "import sys; data=sys.stdin.read(); sys.stdout.write(str(len(data)))",
+            f"import sys; data=sys.stdin.read(); open({str(observed)!r},'w').write(str(len(data)))",
         )
         result = _run_command_tts(command, 2, input_text=secret)
-        assert result.stdout == str(len(secret))
-        assert secret not in str(result.args)
+        assert result is None
+        assert observed.read_text() == str(len(secret))
+        assert secret not in command
 
     @pytest.mark.macos_only
     def test_command_input_placeholders_are_fd_zero_path(self, tmp_path):
@@ -409,8 +657,7 @@ class TestRunCommandTts:
             "import sys; sys.stdout.write('o'*200000); sys.stderr.write('e'*200000)",
         )
         result = _run_command_tts(command, 3, input_text="")
-        assert len(result.stdout) == 65536
-        assert len(result.stderr) == 65536
+        assert result is None
 
     @pytest.mark.macos_only
     def test_command_sink_path_creates_no_named_text_file(self, tmp_path, monkeypatch):
@@ -477,6 +724,81 @@ class TestRunCommandTts:
         assert str(excinfo.value) == "tts_provider_lifecycle_failed"
         assert secret not in captured["command"]
         assert all(secret not in str(value) for value in captured["env"].values())
+
+    @pytest.mark.macos_only
+    def test_direct_sink_adapter_boundary_is_fixed_and_payload_free(self, tmp_path):
+        from tools.tts_staging import _create_anonymous_audio_stage_for_test
+        from tools.tts_tool import CommandSinkLifecycleError, _run_command_tts_to_sink
+
+        secret = "direct-sink-secret-0a91"
+        stage = _create_anonymous_audio_stage_for_test("mp3", 4096, tmp_path)
+        try:
+            failing = {
+                "type": "command",
+                "command": _shell_command(
+                    sys.executable,
+                    "-c",
+                    f"import sys; print({secret!r}); sys.exit(4)",
+                ),
+                "output_format": "mp3",
+            }
+            with pytest.raises(CommandSinkLifecycleError) as excinfo:
+                _run_command_tts_to_sink(
+                    "private transcript",
+                    stage.sink,
+                    "writer",
+                    failing,
+                    {},
+                    voice=None,
+                    model=None,
+                    speed=None,
+                )
+            exposed = " ".join(
+                (str(excinfo.value), repr(excinfo.value), repr(excinfo.value.args), repr(vars(excinfo.value)))
+            )
+            assert secret not in exposed
+            assert "private transcript" not in exposed
+            assert not any(
+                hasattr(excinfo.value, name)
+                for name in ("cmd", "command", "output", "stdout", "stderr")
+            )
+        finally:
+            stage.scrub_and_close()
+
+    @pytest.mark.linux_only
+    def test_direct_sink_adapter_boundary_is_fixed_and_payload_free_linux(self, tmp_path):
+        self.test_direct_sink_adapter_boundary_is_fixed_and_payload_free(tmp_path)
+
+    @pytest.mark.macos_only
+    def test_direct_sink_adapter_success_returns_none(self, tmp_path):
+        from tools.tts_staging import _create_anonymous_audio_stage_for_test
+        from tools.tts_tool import _run_command_tts_to_sink
+
+        stage = _create_anonymous_audio_stage_for_test("mp3", 4096, tmp_path)
+        command = _shell_command(
+            sys.executable,
+            "-c",
+            "import sys; sys.stdin.read(); open(sys.argv[1],'wb').write(b'ID3\\x04\\0\\0\\0\\0\\0\\0')",
+        ) + " {output_path}"
+        try:
+            result = _run_command_tts_to_sink(
+                "private transcript",
+                stage.sink,
+                "writer",
+                {"type": "command", "command": command, "output_format": "mp3"},
+                {},
+                voice=None,
+                model=None,
+                speed=None,
+            )
+            assert result is None
+            assert stage.seal(result) is not None
+        finally:
+            stage.scrub_and_close()
+
+    @pytest.mark.linux_only
+    def test_direct_sink_adapter_success_returns_none_linux(self, tmp_path):
+        self.test_direct_sink_adapter_success_returns_none(tmp_path)
 
     @pytest.mark.linux_only
     def test_command_argv_env_and_fixed_errors_exclude_text_linux(self, tmp_path, monkeypatch):
