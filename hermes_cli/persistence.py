@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Iterator
 
@@ -19,6 +20,56 @@ _CURRENT_POLICY: ContextVar[PersistencePolicy] = ContextVar(
     "hermes_persistence_policy",
     default=PersistencePolicy.DURABLE,
 )
+
+
+@dataclass(frozen=True)
+class _ObservationState:
+    observation_id: object
+    ever_ephemeral: bool
+
+
+_OBSERVERS: ContextVar[tuple[_ObservationState, ...]] = ContextVar(
+    "hermes_persistence_observers",
+    default=(),
+)
+
+
+def _state_for(observation_id: object) -> _ObservationState:
+    for state in _OBSERVERS.get():
+        if state.observation_id is observation_id:
+            return state
+    raise RuntimeError("inactive persistence observation")
+
+
+class PersistenceObservation:
+    """Read-only view of one live persistence transaction."""
+
+    __slots__ = ("__observation_id",)
+
+    def __init__(self, observation_id: object) -> None:
+        self.__observation_id = observation_id
+
+    @property
+    def current_policy(self) -> PersistencePolicy:
+        _state_for(self.__observation_id)
+        return current_persistence_policy()
+
+    @property
+    def ever_ephemeral(self) -> bool:
+        return _state_for(self.__observation_id).ever_ephemeral
+
+
+def _record_transition(policy: PersistencePolicy) -> None:
+    if policy is not PersistencePolicy.EPHEMERAL:
+        return
+    _OBSERVERS.set(
+        tuple(
+            replace(state, ever_ephemeral=True)
+            if not state.ever_ephemeral
+            else state
+            for state in _OBSERVERS.get()
+        )
+    )
 
 
 def coerce_persistence_policy(value: object) -> PersistencePolicy:
@@ -41,7 +92,9 @@ def activate_invocation_persistence_policy(policy: object) -> object:
     is intentionally opaque; one-shot processes terminate after teardown, so
     callers must not reset it mid-invocation.
     """
-    return _CURRENT_POLICY.set(coerce_persistence_policy(policy))
+    normalized = coerce_persistence_policy(policy)
+    _record_transition(normalized)
+    return _CURRENT_POLICY.set(normalized)
 
 
 def persistence_disabled(owner: object | None = None) -> bool:
@@ -75,11 +128,36 @@ def persistence_disabled(owner: object | None = None) -> bool:
 def bind_persistence_policy(policy: object) -> Iterator[PersistencePolicy]:
     """Bind one policy for construction, execution, and teardown."""
     normalized = coerce_persistence_policy(policy)
+    prior = current_persistence_policy()
+    _record_transition(normalized)
     token = _CURRENT_POLICY.set(normalized)
     try:
         yield normalized
     finally:
+        _record_transition(prior)
         _CURRENT_POLICY.reset(token)
+
+
+@contextmanager
+def observe_persistence_transaction() -> Iterator[PersistenceObservation]:
+    """Observe policy transitions for one lexical transaction."""
+    observation_id = object()
+    state = _ObservationState(
+        observation_id=observation_id,
+        ever_ephemeral=current_persistence_policy() is PersistencePolicy.EPHEMERAL,
+    )
+    _OBSERVERS.set((*_OBSERVERS.get(), state))
+    observation = PersistenceObservation(observation_id)
+    try:
+        yield observation
+    finally:
+        _OBSERVERS.set(
+            tuple(
+                current
+                for current in _OBSERVERS.get()
+                if current.observation_id is not observation_id
+            )
+        )
 
 
 def validate_invocation_policy(args: object) -> PersistencePolicy:
@@ -120,10 +198,12 @@ def validate_invocation_policy(args: object) -> PersistencePolicy:
 
 __all__ = [
     "PersistencePolicy",
+    "PersistenceObservation",
     "activate_invocation_persistence_policy",
     "bind_persistence_policy",
     "coerce_persistence_policy",
     "current_persistence_policy",
+    "observe_persistence_transaction",
     "persistence_disabled",
     "validate_invocation_policy",
 ]
