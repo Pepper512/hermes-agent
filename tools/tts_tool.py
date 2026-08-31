@@ -1157,16 +1157,15 @@ def _render_command_tts_sink_template(
     lifecycle ownership remain fail-closed until the Task 4 launcher supplies
     ``pass_fds`` and full process-tree reaping.
     """
-    from tools.tts_staging import ProviderAudioSink
+    from tools.tts_staging import _validate_provider_audio_sink
 
-    if not isinstance(sink, ProviderAudioSink):
-        raise ValueError("invalid anonymous TTS sink")
+    path, output_format, maximum_bytes = _validate_provider_audio_sink(sink)
     placeholders = {
         "input_path": input_path,
         "text_path": input_path,
-        "output_path": sink.path,
-        "format": sink.output_format,
-        "maximum_bytes": str(sink.maximum_bytes),
+        "output_path": path,
+        "format": output_format,
+        "maximum_bytes": str(maximum_bytes),
         "voice": voice,
         "model": model,
         "speed": speed,
@@ -1460,17 +1459,16 @@ def _generate_command_tts_to_sink(
     but execution cannot be enabled until Task 4 makes the child inherit only
     the sink fd and proves the entire owned process tree has stopped.
     """
-    from tools.tts_staging import ProviderAudioSink
+    from tools.tts_staging import _validate_provider_audio_sink
 
-    if not isinstance(sink, ProviderAudioSink):
-        raise ValueError("invalid anonymous TTS sink")
+    path, output_format, _maximum_bytes = _validate_provider_audio_sink(sink)
     if not isinstance(text, str) or not isinstance(provider_name, str):
         raise ValueError("invalid anonymous TTS command request")
     if not _is_command_provider_config(config):
         raise ValueError("invalid anonymous TTS command provider")
-    if _get_command_tts_output_format(config) != sink.output_format:
+    if _get_command_tts_output_format(config) != output_format:
         raise ValueError("anonymous TTS command format mismatch")
-    _descriptor_number_from_sink_path(sink.path)
+    _descriptor_number_from_sink_path(path)
     raise NotImplementedError("tts_anonymous_command_lifecycle_unavailable")
 
 
@@ -1876,9 +1874,18 @@ async def _generate_edge_tts_to_sink(
         pct = round((selected_speed - 1.0) * 100)
         kwargs["rate"] = f"{pct:+d}%"
     communicate = _edge_tts.Communicate(text, **kwargs)
-    await communicate.save(sink_path)
-    if os.path.getsize(sink_path) > maximum_bytes:
-        raise ValueError("anonymous TTS output exceeds configured limit")
+    total = 0
+    with open(sink_path, "wb") as output:
+        async for event in communicate.stream():
+            if not isinstance(event, dict) or event.get("type") != "audio":
+                continue
+            chunk = event.get("data")
+            if type(chunk) is not bytes:
+                raise ValueError("tts_anonymous_provider_failed")
+            if total + len(chunk) > maximum_bytes:
+                raise ValueError("tts_anonymous_provider_failed")
+            output.write(chunk)
+            total += len(chunk)
     return sink_path
 
 

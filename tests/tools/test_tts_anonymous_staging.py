@@ -102,7 +102,10 @@ def test_provider_sink_exposes_only_descriptor_path_format_and_cap(tmp_path: Pat
     try:
         sink = stage.sink
         assert isinstance(sink, ProviderAudioSink)
-        assert set(vars(sink)) == {"path", "output_format", "maximum_bytes"}
+        with pytest.raises(TypeError):
+            vars(sink)
+        with pytest.raises(TypeError):
+            sink.path = "/dev/fd/999"  # type: ignore[misc]
         assert sink.output_format == "mp3"
         assert sink.maximum_bytes == 1024
         assert not any(

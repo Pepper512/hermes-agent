@@ -72,13 +72,122 @@ class AnonymousAudioScrubError(AnonymousAudioStageError):
     """Held-descriptor destruction did not complete cleanly."""
 
 
-@dataclass(frozen=True)
-class ProviderAudioSink:
-    """The complete immutable authority exposed to a TTS provider."""
+def _create_provider_audio_sink_boundary():
+    """Create the stage-only sink issuer and read-only validation boundary."""
 
-    path: str
-    output_format: str
-    maximum_bytes: int
+    issuer_identity = object()
+
+    class ProviderAudioSink:
+        """Immutable provider view issued only by ``AnonymousAudioStage``."""
+
+        __slots__ = (
+            "__issuer_identity",
+            "__maximum_bytes",
+            "__output_format",
+            "__path",
+        )
+
+        def __new__(cls, *args: object, **kwargs: object):
+            raise TypeError("ProviderAudioSink is issued only by AnonymousAudioStage")
+
+        def __init_subclass__(cls, **kwargs: object) -> None:
+            raise TypeError("ProviderAudioSink cannot be subclassed")
+
+        def __setattr__(self, name: str, value: object) -> None:
+            raise TypeError("ProviderAudioSink is immutable")
+
+        def __reduce__(self):
+            raise TypeError("ProviderAudioSink cannot be reconstructed")
+
+        def __reduce_ex__(self, protocol: int):
+            raise TypeError("ProviderAudioSink cannot be reconstructed")
+
+        def __copy__(self):
+            raise TypeError("ProviderAudioSink cannot be copied")
+
+        def __deepcopy__(self, memo: object):
+            raise TypeError("ProviderAudioSink cannot be copied")
+
+        @property
+        def path(self) -> str:
+            return object.__getattribute__(self, "_ProviderAudioSink__path")
+
+        @property
+        def output_format(self) -> str:
+            return object.__getattribute__(
+                self, "_ProviderAudioSink__output_format"
+            )
+
+        @property
+        def maximum_bytes(self) -> int:
+            return object.__getattribute__(
+                self, "_ProviderAudioSink__maximum_bytes"
+            )
+
+    def issue(path: str, output_format: str, maximum_bytes: int) -> ProviderAudioSink:
+        _validate_request(output_format, maximum_bytes)
+        if type(path) is not str or not path:
+            raise AnonymousAudioStageError(_STAGE_ERROR)
+        sink = object.__new__(ProviderAudioSink)
+        object.__setattr__(
+            sink,
+            "_ProviderAudioSink__issuer_identity",
+            issuer_identity,
+        )
+        object.__setattr__(sink, "_ProviderAudioSink__path", path)
+        object.__setattr__(
+            sink,
+            "_ProviderAudioSink__output_format",
+            output_format,
+        )
+        object.__setattr__(
+            sink,
+            "_ProviderAudioSink__maximum_bytes",
+            maximum_bytes,
+        )
+        return sink
+
+    def validate(sink: object) -> tuple[str, str, int]:
+        if type(sink) is not ProviderAudioSink:
+            raise AnonymousAudioStageError(_STAGE_ERROR)
+        try:
+            identity = object.__getattribute__(
+                sink, "_ProviderAudioSink__issuer_identity"
+            )
+            path = object.__getattribute__(sink, "_ProviderAudioSink__path")
+            output_format = object.__getattribute__(
+                sink, "_ProviderAudioSink__output_format"
+            )
+            maximum_bytes = object.__getattribute__(
+                sink, "_ProviderAudioSink__maximum_bytes"
+            )
+        except (AttributeError, TypeError):
+            raise AnonymousAudioStageError(_STAGE_ERROR) from None
+        if identity is not issuer_identity or type(path) is not str or not path:
+            raise AnonymousAudioStageError(_STAGE_ERROR)
+        _validate_request(output_format, maximum_bytes)
+        return path, output_format, maximum_bytes
+
+    return ProviderAudioSink, issue, validate
+
+
+(
+    ProviderAudioSink,
+    _temporary_issue_provider_audio_sink,
+    _validate_provider_audio_sink,
+) = _create_provider_audio_sink_boundary()
+
+
+def _capture_provider_audio_sink_issuer(issuer):
+    """Bind the issuer into the stage factory without a durable module name."""
+
+    def decorate(function):
+        def wrapped(cls, *args, **kwargs):
+            return function(cls, *args, _sink_issuer=issuer, **kwargs)
+
+        return wrapped
+
+    return decorate
 
 
 @dataclass(frozen=True)
@@ -324,6 +433,7 @@ class AnonymousAudioStage:
         )
 
     @classmethod
+    @_capture_provider_audio_sink_issuer(_temporary_issue_provider_audio_sink)
     def _create_unlinked(
         cls,
         *,
@@ -331,6 +441,7 @@ class AnonymousAudioStage:
         maximum_bytes: int,
         parent: Path | None,
         platform: str,
+        _sink_issuer,
     ) -> "AnonymousAudioStage":
         _validate_request(output_format, maximum_bytes)
         _require_host_capabilities(platform)
@@ -385,10 +496,10 @@ class AnonymousAudioStage:
                 raise AnonymousAudioStageError(_STAGE_ERROR)
             os.lseek(audio_fd, 0, os.SEEK_SET)
 
-            sink = ProviderAudioSink(
-                path=_descriptor_path_for_platform(audio_fd, platform),
-                output_format=output_format,
-                maximum_bytes=maximum_bytes,
+            sink = _sink_issuer(
+                _descriptor_path_for_platform(audio_fd, platform),
+                output_format,
+                maximum_bytes,
             )
             return cls(
                 _CONSTRUCTION_TOKEN,
@@ -652,6 +763,11 @@ class AnonymousAudioStage:
             except OSError:
                 pass
             self._parent_fd = -1
+
+
+del _temporary_issue_provider_audio_sink
+del _capture_provider_audio_sink_issuer
+del _create_provider_audio_sink_boundary
 
 
 def _create_anonymous_audio_stage_for_test(

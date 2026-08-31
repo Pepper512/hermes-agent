@@ -14,7 +14,7 @@ from types import MappingProxyType
 from typing import Any, Mapping, Protocol
 
 from agent.tts_provider import TTSProvider
-from tools.tts_staging import ProviderAudioSink
+from tools.tts_staging import ProviderAudioSink, _validate_provider_audio_sink
 
 
 _UNSUPPORTED = "tts_anonymous_sink_unsupported"
@@ -83,9 +83,9 @@ BUILTIN_SINK_DISPOSITIONS: Mapping[str, SinkDisposition] = MappingProxyType({
 })
 
 
-def _validate_acknowledgement(acknowledgement: object, sink: ProviderAudioSink) -> object:
+def _validate_acknowledgement(acknowledgement: object, trusted_path: str) -> object:
     if acknowledgement is None or (
-        isinstance(acknowledgement, str) and acknowledgement == sink.path
+        type(acknowledgement) is str and acknowledgement == trusted_path
     ):
         return acknowledgement
     raise ProviderAcknowledgementError(_PROTOCOL_ERROR)
@@ -96,19 +96,20 @@ class _PluginAdapter:
     provider: TTSProvider
 
     def generate(self, request: ProviderRequest, sink: ProviderAudioSink) -> object:
+        path, output_format, maximum_bytes = _validate_provider_audio_sink(sink)
         if type(self.provider).synthesize_to_sink is TTSProvider.synthesize_to_sink:
             raise AnonymousSinkUnsupported(_UNSUPPORTED)
         acknowledgement = self.provider.synthesize_to_sink(
             request.text,
-            sink.path,
+            path,
             voice=request.voice,
             model=request.model,
             speed=request.speed,
-            format=sink.output_format,
-            maximum_bytes=sink.maximum_bytes,
+            format=output_format,
+            maximum_bytes=maximum_bytes,
             instructions=request.instructions,
         )
-        return _validate_acknowledgement(acknowledgement, sink)
+        return _validate_acknowledgement(acknowledgement, path)
 
 
 def plugin_adapter(provider: TTSProvider) -> TTSProviderAdapter:
@@ -122,6 +123,7 @@ class _RejectedBuiltInAdapter:
     provider_name: str
 
     def generate(self, request: ProviderRequest, sink: ProviderAudioSink) -> object:
+        _validate_provider_audio_sink(sink)
         raise AnonymousSinkUnsupported(_UNSUPPORTED)
 
 
@@ -130,6 +132,7 @@ class _DeferredBuiltInAdapter:
     provider_name: str
 
     def generate(self, request: ProviderRequest, sink: ProviderAudioSink) -> object:
+        _validate_provider_audio_sink(sink)
         # Task 7 supplies the remaining audited built-in writers.  Until then,
         # this parallel boundary is deliberately fail-closed and unreachable.
         raise AnonymousSinkUnsupported(_UNSUPPORTED)
@@ -142,18 +145,19 @@ class _EdgeAdapter:
     def generate(self, request: ProviderRequest, sink: ProviderAudioSink) -> object:
         from tools.tts_tool import _generate_edge_tts_to_sink
 
+        path, output_format, maximum_bytes = _validate_provider_audio_sink(sink)
         acknowledgement = asyncio.run(
             _generate_edge_tts_to_sink(
                 request.text,
-                sink.path,
+                path,
                 dict(self.tts_config),
-                output_format=sink.output_format,
-                maximum_bytes=sink.maximum_bytes,
+                output_format=output_format,
+                maximum_bytes=maximum_bytes,
                 voice=request.voice,
                 speed=request.speed,
             )
         )
-        return _validate_acknowledgement(acknowledgement, sink)
+        return _validate_acknowledgement(acknowledgement, path)
 
 
 @dataclass(frozen=True)
@@ -163,16 +167,17 @@ class _ElevenLabsAdapter:
     def generate(self, request: ProviderRequest, sink: ProviderAudioSink) -> object:
         from tools.tts_tool import _generate_elevenlabs_to_sink
 
+        path, output_format, maximum_bytes = _validate_provider_audio_sink(sink)
         acknowledgement = _generate_elevenlabs_to_sink(
             request.text,
-            sink.path,
+            path,
             dict(self.tts_config),
-            output_format=sink.output_format,
-            maximum_bytes=sink.maximum_bytes,
+            output_format=output_format,
+            maximum_bytes=maximum_bytes,
             voice=request.voice,
             model=request.model,
         )
-        return _validate_acknowledgement(acknowledgement, sink)
+        return _validate_acknowledgement(acknowledgement, path)
 
 
 @dataclass(frozen=True)
@@ -182,6 +187,7 @@ class _CommandAdapter:
     tts_config: Mapping[str, Any]
 
     def generate(self, request: ProviderRequest, sink: ProviderAudioSink) -> object:
+        _validate_provider_audio_sink(sink)
         # Task 4 owns fd inheritance and process-tree lifetime.  Keeping the
         # adapter categorical here prevents accidental pre-cutover execution.
         raise AnonymousSinkUnsupported(_UNSUPPORTED)
