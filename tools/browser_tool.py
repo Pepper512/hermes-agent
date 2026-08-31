@@ -2642,8 +2642,11 @@ def _start_browser_cleanup_thread():
     with _cleanup_lock:
         if _cleanup_thread is None or not _cleanup_thread.is_alive():
             _cleanup_running = True
+            import contextvars
+
             _cleanup_thread = threading.Thread(
-                target=_browser_cleanup_thread_worker,
+                target=contextvars.copy_context().run,
+                args=(_browser_cleanup_thread_worker,),
                 daemon=True,
                 name="browser-cleanup"
             )
@@ -5147,6 +5150,10 @@ def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
 
 def _maybe_start_recording(task_id: str):
     """Start recording if browser.record_sessions is enabled in config."""
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return
     with _cleanup_lock:
         if task_id in _recording_sessions:
             return
@@ -5179,6 +5186,12 @@ def _maybe_start_recording(task_id: str):
 
 def _maybe_stop_recording(task_id: str):
     """Stop recording if one is active for this session."""
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        with _cleanup_lock:
+            _recording_sessions.discard(task_id)
+        return
     with _cleanup_lock:
         if task_id not in _recording_sessions:
             return

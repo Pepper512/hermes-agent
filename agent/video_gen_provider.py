@@ -52,7 +52,7 @@ import datetime
 import logging
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -217,6 +217,10 @@ class VideoGenProvider(abc.ABC):
 
 def _videos_cache_dir() -> Path:
     """Return ``$HERMES_HOME/cache/videos/``, creating parents as needed."""
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        raise RuntimeError("video cache unavailable in ephemeral mode")
     from hermes_constants import get_hermes_home
 
     path = get_hermes_home() / "cache" / "videos"
@@ -229,7 +233,7 @@ def save_b64_video(
     *,
     prefix: str = "video",
     extension: str = "mp4",
-) -> Path:
+) -> Union[Path, str]:
     """Decode base64 video data and write under ``$HERMES_HOME/cache/videos/``.
 
     Returns the absolute :class:`Path` to the saved file.
@@ -237,6 +241,13 @@ def save_b64_video(
     Filename format: ``<prefix>_<YYYYMMDD_HHMMSS>_<short-uuid>.<ext>``.
     """
     raw = base64.b64decode(b64_data)
+    if len(raw) > 200 * 1024 * 1024:
+        raise ValueError("Generated video exceeds 200MB in-memory cap")
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        encoded = base64.b64encode(raw).decode("ascii")
+        return f"data:video/{extension.lower()};base64,{encoded}"
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     short = uuid.uuid4().hex[:8]
     path = _videos_cache_dir() / f"{prefix}_{ts}_{short}.{extension}"
@@ -249,8 +260,15 @@ def save_bytes_video(
     *,
     prefix: str = "video",
     extension: str = "mp4",
-) -> Path:
+) -> Union[Path, str]:
     """Write raw video bytes (e.g. an HTTP download body) to the cache."""
+    if len(raw) > 200 * 1024 * 1024:
+        raise ValueError("Generated video exceeds 200MB in-memory cap")
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        encoded = base64.b64encode(raw).decode("ascii")
+        return f"data:video/{extension.lower()};base64,{encoded}"
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     short = uuid.uuid4().hex[:8]
     path = _videos_cache_dir() / f"{prefix}_{ts}_{short}.{extension}"
@@ -272,7 +290,7 @@ def save_url_video(
     prefix: str = "video",
     timeout: float = 180.0,
     max_bytes: int = 200 * 1024 * 1024,
-) -> Path:
+) -> Union[Path, str]:
     """Download a video URL and write it under ``$HERMES_HOME/cache/videos/``.
 
     The video twin of :func:`agent.image_gen_provider.save_url_image`: several
@@ -298,6 +316,21 @@ def save_url_video(
                 break
     if extension is None:
         extension = "mp4"
+
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        payload = bytearray()
+        for chunk in response.iter_content(chunk_size=256 * 1024):
+            if not chunk:
+                continue
+            payload.extend(chunk)
+            if len(payload) > max_bytes:
+                raise ValueError("Generated video exceeds in-memory cap")
+        if not payload:
+            raise ValueError("Generated video was empty")
+        encoded = base64.b64encode(bytes(payload)).decode("ascii")
+        return f"data:video/{extension};base64,{encoded}"
 
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     short = uuid.uuid4().hex[:8]

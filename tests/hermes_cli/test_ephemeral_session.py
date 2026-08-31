@@ -150,6 +150,73 @@ def fake_run_conversation(self, prompt):
         browser_result = browser_tool.browser_vision("private question", task_id="private")
         assert "screenshot_path" not in str(browser_result)
         assert __import__("os").environ["HERMES_HOME"] not in str(browser_result)
+
+        # Configured browser recording must be rejected before a WebM path or
+        # browser-side recording call exists.
+        browser_tool._maybe_start_recording("private-recording-task")
+        assert "private-recording-task" not in browser_tool._recording_sessions
+
+        from tools import browser_use_cli
+        browser_use_cli._find_cli = lambda: ["browser-use"]
+        browser_use_cli._base_subprocess_env = lambda: {}
+        browser_use_cli._resolve_real_profile_cdp = lambda *_a, **_k: None
+        browser_use_cli._resolve_backend_cdp = lambda *_a, **_k: None
+        browser_use_cli._read_browser_cfg = lambda: {}
+        browser_use_cli.is_legacy_browser_use_cloud_config = lambda _cfg: False
+        original_run = browser_use_cli.subprocess.run
+        def fake_browser_exec(*_args, **kwargs):
+            workspace = Path(kwargs["env"]["BH_AGENT_WORKSPACE"])
+            workspace.mkdir(parents=True, exist_ok=True)
+            (workspace / "private-page.json").write_text(prompt)
+            return __import__("types").SimpleNamespace(
+                returncode=0,
+                stdout=f"private browser output {workspace}/private-page.json",
+                stderr="",
+            )
+        browser_use_cli.subprocess.run = fake_browser_exec
+        try:
+            exec_result = json.loads(browser_use_cli.browser_exec(
+                "print('private browser exec')", task_id="private-browser-exec"
+            ))
+        finally:
+            browser_use_cli.subprocess.run = original_run
+        assert "workspace" not in exec_result
+        assert __import__("os").environ["HERMES_HOME"] not in json.dumps(exec_result)
+
+        from tools.debug_helpers import DebugSession
+        __import__("os").environ["VISION_TOOLS_DEBUG"] = "true"
+        debug = DebugSession("vision_tools", env_var="VISION_TOOLS_DEBUG")
+        debug.log_call("vision", {"prompt": prompt})
+        debug.save()
+        assert debug.get_session_info()["log_path"] is None
+
+        from agent.image_gen_provider import save_b64_image
+        from agent.video_gen_provider import save_b64_video, save_bytes_video
+        image_ref = str(save_b64_image(base64.b64encode(b"private-image").decode()))
+        video_ref = str(save_b64_video(base64.b64encode(b"private-video").decode()))
+        raw_video_ref = str(save_bytes_video(b"private-raw-video"))
+        assert image_ref.startswith("data:image/")
+        assert video_ref.startswith("data:video/")
+        assert raw_video_ref.startswith("data:video/")
+
+        from tools import tts_tool
+        tts_tool._load_tts_config = lambda: {"provider": "edge"}
+        tts_tool._get_provider = lambda _cfg: "edge"
+        tts_tool._resolve_max_text_length = lambda *_a: 10000
+        def fake_tts(text, output_path=None, **_kwargs):
+            path = Path(output_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"private-audio")
+            return json.dumps({
+                "success": True, "file_path": str(path),
+                "provider": "edge", "voice_compatible": False,
+            })
+        tts_tool._text_to_speech_single = fake_tts
+        tts_tool._build_audio_delivery_files = lambda paths, *_a, **_k: (list(paths), False)
+        speech = json.loads(tts_tool.text_to_speech_tool(prompt))
+        assert speech["audio"].startswith("data:audio/")
+        assert "file_path" not in speech
+        assert "MEDIA:" not in json.dumps(speech)
     self._persist_session(messages)
     return {
         "final_response": "subprocess-ok",
@@ -226,7 +293,9 @@ def _prepare_subprocess_home(home: Path) -> None:
         "moa:\n"
         "  save_traces: true\n"
         "skills:\n"
-        "  write_approval: true\n",
+        "  write_approval: true\n"
+        "browser:\n"
+        "  record_sessions: true\n",
         encoding="utf-8",
     )
 

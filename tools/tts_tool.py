@@ -3147,6 +3147,7 @@ def _text_to_speech_single(
     instructions: Optional[str] = None,
     provider: Optional[str] = None,
     tts_config_override: Optional[Dict[str, Any]] = None,
+    _ephemeral_transport: bool = False,
 ) -> str:
     """Synthesize one provider-safe text chunk and return one final-encoded file.
 
@@ -3155,6 +3156,45 @@ def _text_to_speech_single(
     """
     if not text or not text.strip():
         return tool_error("Text is required", success=False)
+
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled() and not _ephemeral_transport:
+        suffix = Path(output_path).suffix if output_path else ".mp3"
+        with tempfile.TemporaryDirectory(prefix="hermes-tts-materialize-") as temp_dir:
+            temp_path = Path(temp_dir) / f"audio{suffix or '.mp3'}"
+            raw_result = _text_to_speech_single(
+                text=text,
+                output_path=str(temp_path),
+                speed=speed,
+                instructions=instructions,
+                provider=provider,
+                tts_config_override=tts_config_override,
+                _ephemeral_transport=True,
+            )
+            try:
+                parsed = json.loads(raw_result)
+            except (json.JSONDecodeError, TypeError):
+                return tool_error("TTS generation failed", success=False)
+            if not parsed.get("success"):
+                return tool_error("TTS generation failed", success=False)
+            actual_path = Path(parsed.get("file_path") or temp_path)
+            if not actual_path.is_file():
+                return tool_error("TTS generation failed", success=False)
+            raw = actual_path.read_bytes()
+            if len(raw) > 25 * 1024 * 1024:
+                return tool_error("TTS audio exceeds in-memory cap", success=False)
+            mime = {
+                ".ogg": "audio/ogg",
+                ".wav": "audio/wav",
+                ".m4a": "audio/mp4",
+            }.get(actual_path.suffix.lower(), "audio/mpeg")
+            return json.dumps({
+                "success": True,
+                "audio": f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}",
+                "provider": parsed.get("provider", provider),
+                "voice_compatible": bool(parsed.get("voice_compatible")),
+            }, ensure_ascii=False)
 
     # The wrapper already normalizes text via prepare_spoken_text; the inner
     # function should not re-normalize or truncate.
@@ -3499,6 +3539,8 @@ def text_to_speech_tool(
     speed: Optional[float] = None,
     instructions: Optional[str] = None,
     provider: Optional[str] = None,
+    *,
+    _ephemeral_dir: Optional[Path] = None,
 ) -> str:
     """Convert text to speech audio with long-form chunking.
 
@@ -3528,6 +3570,19 @@ def text_to_speech_tool(
     """
     if not text or not text.strip():
         return tool_error("Text is required", success=False)
+
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled() and _ephemeral_dir is None:
+        with tempfile.TemporaryDirectory(prefix="hermes-tts-") as temp_dir:
+            return text_to_speech_tool(
+                text=text,
+                output_path=None,
+                speed=speed,
+                instructions=instructions,
+                provider=provider,
+                _ephemeral_dir=Path(temp_dir),
+            )
 
     # Normalize text via the shared cleaner: markdown, emoji, think blocks,
     # verifier footer, units, newline flattening.
@@ -3574,7 +3629,10 @@ def text_to_speech_tool(
     delivery_profile = _resolve_audio_delivery_profile(platform, tts_config)
 
     # Determine output path (single-chunk short-circuit uses the final path).
-    if output_path:
+    if _ephemeral_dir is not None:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        base_path = _ephemeral_dir / f"tts_{timestamp}.mp3"
+    elif output_path:
         from tools.path_security import has_traversal_component
         if has_traversal_component(output_path):
             return json.dumps({
@@ -3625,14 +3683,17 @@ def text_to_speech_tool(
                     f"{base_path.stem}.chunk{index:03d}{base_path.suffix}"
                 )
             generated_artifacts.add(str(chunk_path))
-            raw_result = _text_to_speech_single(
-                text=chunk,
-                output_path=str(chunk_path),
-                speed=speed,
-                instructions=instructions,
-                provider=provider,
-                tts_config_override=tts_config,
-            )
+            single_kwargs = {
+                "text": chunk,
+                "output_path": str(chunk_path),
+                "speed": speed,
+                "instructions": instructions,
+                "provider": provider,
+                "tts_config_override": tts_config,
+            }
+            if _ephemeral_dir is not None:
+                single_kwargs["_ephemeral_transport"] = True
+            raw_result = _text_to_speech_single(**single_kwargs)
             try:
                 chunk_result = json.loads(raw_result)
             except (json.JSONDecodeError, TypeError):
@@ -3640,6 +3701,8 @@ def text_to_speech_tool(
                     f"TTS chunk {index} returned invalid JSON: {str(raw_result)[:200]}"
                 )
             if not chunk_result.get("success"):
+                if _ephemeral_dir is not None:
+                    return tool_error("TTS generation failed", success=False)
                 error_msg = chunk_result.get("error", "unknown error")
                 return tool_error(
                     f"TTS chunk {index} failed ({provider}): {error_msg}",
@@ -3672,6 +3735,34 @@ def text_to_speech_tool(
                 f"{os.path.getsize(path):,}",
                 provider,
             )
+        if _ephemeral_dir is not None:
+            audio_data = []
+            total_bytes = 0
+            for path in final_paths:
+                raw = Path(path).read_bytes()
+                total_bytes += len(raw)
+                if total_bytes > delivery_profile.max_file_bytes:
+                    raise ValueError("ephemeral audio exceeds delivery cap")
+                suffix = Path(path).suffix.lower()
+                mime = {
+                    ".ogg": "audio/ogg",
+                    ".wav": "audio/wav",
+                    ".m4a": "audio/mp4",
+                }.get(suffix, "audio/mpeg")
+                audio_data.append(
+                    f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+                )
+            return json.dumps({
+                "success": True,
+                "audio": audio_data[0],
+                "audio_parts": audio_data,
+                "provider": chunk_results[0].get("provider", provider),
+                "voice_compatible": voice_compatible,
+                "chunk_count": len(chunks),
+                "delivery_file_count": len(final_paths),
+                "combined_chunks": bool(combined_chunks),
+            }, ensure_ascii=False)
+
         media_tag = "\n".join(f"MEDIA:{path}" for path in final_paths)
         if voice_compatible:
             media_tag = f"[[audio_as_voice]]\n{media_tag}"
@@ -3693,10 +3784,14 @@ def text_to_speech_tool(
             },
         }, ensure_ascii=False)
     except ValueError as exc:
+        if _ephemeral_dir is not None:
+            return tool_error("TTS delivery failed", success=False)
         error_msg = f"TTS delivery error ({provider}): {exc}"
         logger.error("%s", error_msg)
         return tool_error(error_msg, success=False)
     except Exception as exc:
+        if _ephemeral_dir is not None:
+            return tool_error("TTS generation failed", success=False)
         error_msg = f"TTS long-form generation failed ({provider}): {exc}"
         logger.error("%s", error_msg, exc_info=True)
         return tool_error(error_msg, success=False)
