@@ -20,6 +20,7 @@ from hermes_cli.persistence import (
 from tools.tts_staging import (
     MAX_ANONYMOUS_AUDIO_BYTES,
     AnonymousAudioStage,
+    AnonymousAudioScrubError,
     SealedAudio,
 )
 
@@ -170,6 +171,7 @@ def _create_transaction_boundary():
             "__lock",
             "__observation",
             "__permit",
+            "__scrub_failed_ever",
             "__stages",
             "__state",
         )
@@ -212,6 +214,9 @@ def _create_transaction_boundary():
                     transaction, "_TTSTransaction__permit", None
                 )
                 object.__setattr__(
+                    transaction, "_TTSTransaction__scrub_failed_ever", False
+                )
+                object.__setattr__(
                     transaction, "_TTSTransaction__stages", []
                 )
                 object.__setattr__(
@@ -224,10 +229,15 @@ def _create_transaction_boundary():
                     try:
                         yield transaction
                     except TTSTransactionStop as exc:
+                        transaction.__remember_scrub_failure()
                         transaction.__abort_if_unconsumed()
                         if str(exc) == _SCRUB_ERROR:
                             raise
                         raise TTSTransactionError(_TRANSACTION_ERROR) from None
+                    except AnonymousAudioScrubError:
+                        transaction.__remember_scrub_failure()
+                        transaction.__abort_if_unconsumed()
+                        raise TTSTransactionStop(_SCRUB_ERROR) from None
                     except Exception:
                         transaction.__abort_if_unconsumed()
                         raise TTSTransactionError(_TRANSACTION_ERROR) from None
@@ -380,8 +390,13 @@ def _create_transaction_boundary():
                     )
                     result = consumer(tuple(self.__stages), self.__observation)
                 except TTSTransactionStop:
+                    self.__remember_scrub_failure()
                     self.__scrub_all()
                     raise
+                except AnonymousAudioScrubError:
+                    self.__remember_scrub_failure()
+                    self.__scrub_all()
+                    raise TTSTransactionStop(_SCRUB_ERROR) from None
                 except Exception:
                     self.__scrub_all()
                     raise TTSTransactionError(_TRANSACTION_ERROR) from None
@@ -410,6 +425,7 @@ def _create_transaction_boundary():
             try:
                 stage.scrub_and_close()
             except BaseException:
+                self.__remember_scrub_failure()
                 if stage._closed:
                     self.__release_claim(stage)
                 raise TTSTransactionStop(_SCRUB_ERROR) from None
@@ -440,23 +456,31 @@ def _create_transaction_boundary():
                 if stage._closed:
                     self.__release_claim(stage)
 
+        def __remember_scrub_failure(self) -> None:
+            self.__scrub_failed_ever = True
+
         def __scrub_all(self) -> None:
             unregister_permit(self.__permit, self)
             self.__permit = None
-            failed = False
+            failed = self.__scrub_failed_ever
             remaining: list[tuple[AnonymousAudioStage, SealedAudio]] = []
             for stage, sealed in self.__stages:
                 try:
                     stage.scrub_and_close()
                 except BaseException:
                     failed = True
+                    self.__remember_scrub_failure()
                 if stage._closed:
                     self.__release_claim(stage)
                 else:
                     remaining.append((stage, sealed))
             self.__stages = remaining
-            self.__state = "scrub_failed" if remaining else "scrubbed"
-            if failed or remaining:
+            self.__state = (
+                "scrub_failed"
+                if self.__scrub_failed_ever or remaining
+                else "scrubbed"
+            )
+            if failed or self.__scrub_failed_ever or remaining:
                 raise TTSTransactionStop(_SCRUB_ERROR) from None
 
         def __abort_if_unconsumed(self) -> None:

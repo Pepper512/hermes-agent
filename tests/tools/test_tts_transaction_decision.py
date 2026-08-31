@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,7 +9,10 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli.persistence import PersistencePolicy, bind_persistence_policy
-from tools.tts_staging import _create_anonymous_audio_stage_for_test
+from tools.tts_staging import (
+    AnonymousAudioScrubError,
+    _create_anonymous_audio_stage_for_test,
+)
 from tools.tts_transaction import (
     DurablePublicationPermit,
     EphemeralDelivery,
@@ -532,6 +536,91 @@ def test_consumer_noncompletion_scrubs_and_fails_closed(
                         lambda *_args: (_ for _ in ()).throw(Cancelled())
                     )
     _assert_scrubbed(stage)
+
+
+@pytest.mark.parametrize("syscall", ["ftruncate", "fsync"])
+def test_durable_consume_preserves_syscall_scrub_failure_after_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, syscall: str
+):
+    stage, sealed = _sealed_stage(tmp_path)
+    held_fd = int(Path(stage.sink.path).name)
+    real_call = getattr(os, syscall)
+
+    def fail_target(fd, *args):
+        if fd == held_fd:
+            raise OSError("private injected syscall detail")
+        return real_call(fd, *args)
+
+    monkeypatch.setattr(os, syscall, fail_target)
+    with bind_persistence_policy(PersistencePolicy.DURABLE):
+        with pytest.raises(TTSTransactionStop) as exc_info:
+            with TTSTransaction.begin(4096) as transaction:
+                transaction.add_sealed(stage, sealed)
+                permit = transaction.decide()
+                permit._consume_for_publication(_consume_and_scrub)
+    assert str(exc_info.value) == "tts_anonymous_scrub_failed"
+    assert "private" not in str(exc_info.value)
+    _assert_scrubbed(stage)
+
+
+@pytest.mark.parametrize("lifecycle", ["consume", "decision", "add", "context"])
+def test_closed_stage_scrub_failure_remains_sticky_across_lifecycle_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lifecycle: str
+):
+    stage, sealed = _sealed_stage(tmp_path / "owned")
+    rejected = rejected_seal = None
+    real_scrub = type(stage).scrub_and_close
+
+    def close_then_fail(self):
+        real_scrub(self)
+        if self is stage:
+            raise AnonymousAudioScrubError("private scrub detail")
+
+    monkeypatch.setattr(type(stage), "scrub_and_close", close_then_fail)
+    try:
+        with bind_persistence_policy(
+            PersistencePolicy.DURABLE
+            if lifecycle in ("consume", "add", "context")
+            else PersistencePolicy.EPHEMERAL
+        ):
+            with pytest.raises(TTSTransactionStop) as exc_info:
+                with TTSTransaction.begin(4096) as transaction:
+                    transaction.add_sealed(stage, sealed)
+                    if lifecycle == "consume":
+                        permit = transaction.decide()
+                        permit._consume_for_publication(_consume_and_scrub)
+                    elif lifecycle == "decision":
+                        transaction.decide()
+                    elif lifecycle == "add":
+                        rejected, rejected_seal = _sealed_stage(
+                            tmp_path / "rejected"
+                        )
+                        transaction.add_sealed(rejected, rejected_seal)
+                        transaction.add_sealed(stage, sealed)
+            assert str(exc_info.value) == "tts_anonymous_scrub_failed"
+            assert "private" not in str(exc_info.value)
+    finally:
+        if rejected is not None and not rejected._closed:
+            rejected.scrub_and_close()
+    _assert_scrubbed(stage)
+
+
+def test_twenty_consumed_transactions_leave_no_descriptor_or_stage_root_leak(
+    tmp_path: Path,
+):
+    descriptor_root = Path("/dev/fd" if sys.platform == "darwin" else "/proc/self/fd")
+    before_fds = set(os.listdir(descriptor_root))
+    for index in range(20):
+        parent = tmp_path / str(index)
+        stage, sealed = _sealed_stage(parent)
+        with bind_persistence_policy(PersistencePolicy.DURABLE):
+            with TTSTransaction.begin(4096) as transaction:
+                transaction.add_sealed(stage, sealed)
+                permit = transaction.decide()
+                permit._consume_for_publication(_consume_and_scrub)
+        _assert_scrubbed(stage)
+        assert not any(parent.glob("hermes-tts-*"))
+    assert set(os.listdir(descriptor_root)) == before_fds
 
 
 @pytest.mark.parametrize("mutation", ["bytes", "mode"])
