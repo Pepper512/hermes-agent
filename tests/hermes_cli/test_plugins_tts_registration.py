@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 import yaml
+import pytest
 
 
 def _write_plugin(
@@ -87,6 +88,15 @@ class TestRegisterTTSProvider:
             f"Plugin failed to load: {mgr._plugins['my-tts-plugin'].error}"
         )
         assert tts_registry.get_provider("fake-tts") is not None
+
+        provider = tts_registry.get_provider("fake-tts")
+        with pytest.raises(NotImplementedError, match="anonymous sink"):
+            provider.synthesize_to_sink(
+                "hello",
+                "/dev/fd/23",
+                format="mp3",
+                maximum_bytes=4096,
+            )
 
         tts_registry._reset_for_tests()
 

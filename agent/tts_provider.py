@@ -216,6 +216,29 @@ class TTSProvider(abc.ABC):
                 may expose. Implementations should ignore unknown keys.
         """
 
+    def synthesize_to_sink(
+        self,
+        text: str,
+        sink_path: str,
+        *,
+        voice: Optional[str] = None,
+        model: Optional[str] = None,
+        speed: Optional[float] = None,
+        format: str = DEFAULT_OUTPUT_FORMAT,
+        maximum_bytes: int,
+        **extra: Any,
+    ) -> Optional[str]:
+        """Write audio to an already-open anonymous descriptor path.
+
+        This additive method is deliberately non-abstract so existing plugins
+        remain loadable.  Named-path-only plugins fail closed until they
+        explicitly implement the restricted sink contract.
+        """
+        raise NotImplementedError(
+            f"TTS provider {self.name!r} does not implement anonymous sink "
+            "synthesis. Implement synthesize_to_sink() to opt in."
+        )
+
     def stream(
         self,
         text: str,

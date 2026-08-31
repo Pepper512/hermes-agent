@@ -1120,6 +1120,60 @@ def _render_command_tts_template(
     return rendered
 
 
+def _descriptor_number_from_sink_path(sink_path: str) -> int:
+    """Return the fd encoded by a canonical anonymous-sink descriptor path.
+
+    This helper is part of the trusted command-launch boundary.  It accepts
+    only the two reviewed Darwin/Linux descriptor namespaces and never accepts
+    a caller destination or another filesystem path.
+    """
+    if not isinstance(sink_path, str):
+        raise ValueError("invalid anonymous TTS sink")
+    prefixes = ("/dev/fd/", "/proc/self/fd/")
+    prefix = next((item for item in prefixes if sink_path.startswith(item)), None)
+    if prefix is None:
+        raise ValueError("invalid anonymous TTS sink")
+    encoded = sink_path[len(prefix):]
+    if not encoded.isascii() or not encoded.isdecimal():
+        raise ValueError("invalid anonymous TTS sink")
+    descriptor = int(encoded)
+    if descriptor < 0 or str(descriptor) != encoded:
+        raise ValueError("invalid anonymous TTS sink")
+    return descriptor
+
+
+def _render_command_tts_sink_template(
+    command_template: str,
+    *,
+    input_path: str,
+    sink: "ProviderAudioSink",
+    voice: str,
+    model: str,
+    speed: str,
+) -> str:
+    """Render a command against the restricted sink contract.
+
+    This prepares the parallel Task 3 boundary only.  Process inheritance and
+    lifecycle ownership remain fail-closed until the Task 4 launcher supplies
+    ``pass_fds`` and full process-tree reaping.
+    """
+    from tools.tts_staging import ProviderAudioSink
+
+    if not isinstance(sink, ProviderAudioSink):
+        raise ValueError("invalid anonymous TTS sink")
+    placeholders = {
+        "input_path": input_path,
+        "text_path": input_path,
+        "output_path": sink.path,
+        "format": sink.output_format,
+        "maximum_bytes": str(sink.maximum_bytes),
+        "voice": voice,
+        "model": model,
+        "speed": speed,
+    }
+    return _render_command_tts_template(command_template, placeholders)
+
+
 def _terminate_command_tts_process_tree(proc: subprocess.Popen) -> None:
     """Best-effort termination of a shell process and all of its children."""
     if proc.poll() is not None:
@@ -1391,6 +1445,33 @@ def _generate_command_tts(
             f"TTS provider '{provider_name}' produced no output at {output}"
         )
     return str(output)
+
+
+def _generate_command_tts_to_sink(
+    text: str,
+    sink: "ProviderAudioSink",
+    provider_name: str,
+    config: Dict[str, Any],
+    tts_config: Dict[str, Any],
+) -> str:
+    """Fail-closed Task 3 command-sink entry pending lifecycle ownership.
+
+    Rendering is available through :func:`_render_command_tts_sink_template`,
+    but execution cannot be enabled until Task 4 makes the child inherit only
+    the sink fd and proves the entire owned process tree has stopped.
+    """
+    from tools.tts_staging import ProviderAudioSink
+
+    if not isinstance(sink, ProviderAudioSink):
+        raise ValueError("invalid anonymous TTS sink")
+    if not isinstance(text, str) or not isinstance(provider_name, str):
+        raise ValueError("invalid anonymous TTS command request")
+    if not _is_command_provider_config(config):
+        raise ValueError("invalid anonymous TTS command provider")
+    if _get_command_tts_output_format(config) != sink.output_format:
+        raise ValueError("anonymous TTS command format mismatch")
+    _descriptor_number_from_sink_path(sink.path)
+    raise NotImplementedError("tts_anonymous_command_lifecycle_unavailable")
 
 
 def _has_any_command_tts_provider(tts_config: Optional[Dict[str, Any]] = None) -> bool:
@@ -1766,6 +1847,41 @@ async def _generate_edge_tts(text: str, output_path: str, tts_config: Dict[str, 
     return output_path
 
 
+async def _generate_edge_tts_to_sink(
+    text: str,
+    sink_path: str,
+    tts_config: Dict[str, Any],
+    *,
+    output_format: str,
+    maximum_bytes: int,
+    voice: Optional[str] = None,
+    speed: Optional[float] = None,
+) -> str:
+    """Generate Edge MP3 directly into a descriptor path.
+
+    The legacy named helper above is intentionally unchanged until Task 7.
+    """
+    if output_format != "mp3" or maximum_bytes <= 0:
+        raise ValueError("unsupported anonymous Edge TTS sink")
+    _edge_tts = _import_edge_tts()
+    edge_config = tts_config.get("edge") or {}
+    selected_voice = voice or edge_config.get("voice", DEFAULT_EDGE_VOICE)
+    selected_speed = (
+        float(speed)
+        if speed is not None
+        else float(edge_config.get("speed", tts_config.get("speed", 1.0)))
+    )
+    kwargs: Dict[str, Any] = {"voice": selected_voice}
+    if selected_speed != 1.0:
+        pct = round((selected_speed - 1.0) * 100)
+        kwargs["rate"] = f"{pct:+d}%"
+    communicate = _edge_tts.Communicate(text, **kwargs)
+    await communicate.save(sink_path)
+    if os.path.getsize(sink_path) > maximum_bytes:
+        raise ValueError("anonymous TTS output exceeds configured limit")
+    return sink_path
+
+
 # ===========================================================================
 # Provider: ElevenLabs (premium)
 # ===========================================================================
@@ -1810,6 +1926,49 @@ def _generate_elevenlabs(text: str, output_path: str, tts_config: Dict[str, Any]
             f.write(chunk)
 
     return output_path
+
+
+def _generate_elevenlabs_to_sink(
+    text: str,
+    sink_path: str,
+    tts_config: Dict[str, Any],
+    *,
+    output_format: str,
+    maximum_bytes: int,
+    voice: Optional[str] = None,
+    model: Optional[str] = None,
+) -> str:
+    """Stream ElevenLabs bytes to a descriptor path using explicit format."""
+    format_map = {
+        "mp3": "mp3_44100_128",
+        "ogg": "opus_48000_64",
+        "opus": "opus_48000_64",
+    }
+    provider_format = format_map.get(output_format)
+    if provider_format is None or maximum_bytes <= 0:
+        raise ValueError("unsupported anonymous ElevenLabs TTS sink")
+    api_key = (_resolve_provider_key("ELEVENLABS_API_KEY", "elevenlabs") or "")
+    if not api_key:
+        raise ValueError("ELEVENLABS_API_KEY not set. Get one at https://elevenlabs.io/")
+    el_config = tts_config.get("elevenlabs") or {}
+    voice_id = voice or el_config.get("voice_id", DEFAULT_ELEVENLABS_VOICE_ID)
+    model_id = model or el_config.get("model_id", DEFAULT_ELEVENLABS_MODEL_ID)
+    ElevenLabs = _import_elevenlabs()
+    client = ElevenLabs(api_key=api_key, **_elevenlabs_environment_kwargs(el_config))
+    audio_generator = client.text_to_speech.convert(
+        text=text,
+        voice_id=voice_id,
+        model_id=model_id,
+        output_format=provider_format,
+    )
+    total = 0
+    with open(sink_path, "wb") as output:
+        for chunk in audio_generator:
+            total += len(chunk)
+            if total > maximum_bytes:
+                raise ValueError("anonymous TTS output exceeds configured limit")
+            output.write(chunk)
+    return sink_path
 
 
 def _tts_response_format_from_path(output_path: str) -> str:
