@@ -1,0 +1,534 @@
+"""Anonymous descriptor staging for TTS provider output.
+
+Provider code receives only an already-unlinked descriptor path and bounded
+format metadata.  The trusted transaction retains descriptor ownership and is
+the only code allowed to seal, read, scrub, or close the staged audio.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import hashlib
+import os
+from pathlib import Path
+import secrets
+import stat
+import sys
+import tempfile
+from typing import Final
+
+
+_ALLOWED_FORMATS: Final[frozenset[str]] = frozenset({"mp3", "wav", "ogg", "flac"})
+_STAGE_ERROR: Final[str] = "tts_anonymous_stage_failed"
+_UNSUPPORTED_ERROR: Final[str] = "tts_anonymous_stage_unsupported"
+_SCRUB_ERROR: Final[str] = "tts_anonymous_scrub_failed"
+_CONSTRUCTION_TOKEN = object()
+_SEALED_TOKEN = object()
+
+
+class AnonymousAudioStageError(RuntimeError):
+    """Fixed, path-free anonymous-stage failure."""
+
+
+class AnonymousAudioStageUnsupported(AnonymousAudioStageError):
+    """The current host cannot provide the required anonymous sink contract."""
+
+
+class AnonymousAudioScrubError(AnonymousAudioStageError):
+    """Held-descriptor destruction did not complete cleanly."""
+
+
+@dataclass(frozen=True)
+class ProviderAudioSink:
+    """The complete immutable authority exposed to a TTS provider."""
+
+    path: str
+    output_format: str
+    maximum_bytes: int
+
+
+@dataclass(frozen=True)
+class SealedAudio:
+    """Opaque proof that one stage passed its held-descriptor checks."""
+
+    _token: object
+    _authority: object
+    _fd: int
+    _device: int
+    _digest: bytes
+    _inode: int
+    _size: int
+    _output_format: str
+
+    def __post_init__(self) -> None:
+        if self._token is not _SEALED_TOKEN:
+            raise AnonymousAudioStageError(_STAGE_ERROR)
+
+
+def _descriptor_path_for_platform(fd: int, platform: str) -> str:
+    """Resolve the native descriptor namespace without mutating host globals."""
+
+    if not isinstance(fd, int) or isinstance(fd, bool) or fd < 0:
+        raise AnonymousAudioStageError(_STAGE_ERROR)
+    if platform == "darwin":
+        return f"/dev/fd/{fd}"
+    if platform.startswith("linux"):
+        return f"/proc/self/fd/{fd}"
+    raise AnonymousAudioStageUnsupported(_UNSUPPORTED_ERROR)
+
+
+def _validate_request(output_format: str, maximum_bytes: int) -> None:
+    if type(output_format) is not str or output_format not in _ALLOWED_FORMATS:
+        raise AnonymousAudioStageError(_STAGE_ERROR)
+    if (
+        not isinstance(maximum_bytes, int)
+        or isinstance(maximum_bytes, bool)
+        or maximum_bytes <= 0
+    ):
+        raise AnonymousAudioStageError(_STAGE_ERROR)
+
+
+def _require_host_capabilities(platform: str) -> None:
+    _descriptor_path_for_platform(0, platform)
+    required_flags = ("O_DIRECTORY", "O_NOFOLLOW")
+    if os.name != "posix" or any(not hasattr(os, name) for name in required_flags):
+        raise AnonymousAudioStageUnsupported(_UNSUPPORTED_ERROR)
+    if os.open not in os.supports_dir_fd or os.unlink not in os.supports_dir_fd:
+        raise AnonymousAudioStageUnsupported(_UNSUPPORTED_ERROR)
+
+
+def _valid_format_signature(output_format: str, header: bytes) -> bool:
+    if output_format == "mp3":
+        if header.startswith(b"ID3"):
+            return (
+                len(header) >= 10
+                and header[3] in (2, 3, 4)
+                and header[4] != 0xFF
+                and all(size_byte & 0x80 == 0 for size_byte in header[6:10])
+            )
+        if len(header) < 4 or header[0] != 0xFF or header[1] & 0xE0 != 0xE0:
+            return False
+        version = (header[1] >> 3) & 0x03
+        layer = (header[1] >> 1) & 0x03
+        bitrate_index = (header[2] >> 4) & 0x0F
+        sample_rate_index = (header[2] >> 2) & 0x03
+        return (
+            version != 0x01
+            and layer != 0x00
+            and bitrate_index not in (0x00, 0x0F)
+            and sample_rate_index != 0x03
+        )
+    if output_format == "wav":
+        return len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WAVE"
+    if output_format == "ogg":
+        return header.startswith(b"OggS")
+    if output_format == "flac":
+        return header.startswith(b"fLaC")
+    return False
+
+
+class AnonymousAudioStage:
+    """Trusted owner of one already-unlinked TTS output descriptor."""
+
+    __slots__ = (
+        "_authority",
+        "_closed",
+        "_fd",
+        "_initial_device",
+        "_initial_inode",
+        "_parent_fd",
+        "_root_basename",
+        "_root_device",
+        "_root_fd",
+        "_root_gid",
+        "_root_inode",
+        "_root_uid",
+        "_sealed",
+        "_sink",
+    )
+
+    def __init__(
+        self,
+        token: object,
+        *,
+        fd: int,
+        sink: ProviderAudioSink,
+        parent_fd: int,
+        root_fd: int,
+        root_basename: str,
+        root_stat: os.stat_result,
+        file_stat: os.stat_result,
+    ) -> None:
+        if token is not _CONSTRUCTION_TOKEN:
+            raise AnonymousAudioStageError(_STAGE_ERROR)
+        self._authority = object()
+        self._closed = False
+        self._fd = fd
+        self._initial_device = file_stat.st_dev
+        self._initial_inode = file_stat.st_ino
+        self._parent_fd = parent_fd
+        self._root_basename = root_basename
+        self._root_device = root_stat.st_dev
+        self._root_gid = root_stat.st_gid
+        self._root_inode = root_stat.st_ino
+        self._root_uid = root_stat.st_uid
+        self._root_fd = root_fd
+        self._sealed = False
+        self._sink = sink
+
+    @classmethod
+    def create(cls, output_format: str, maximum_bytes: int) -> "AnonymousAudioStage":
+        """Create a production stage under the host temporary directory."""
+
+        return cls._create_unlinked(
+            output_format=output_format,
+            maximum_bytes=maximum_bytes,
+            parent=None,
+            platform=sys.platform,
+        )
+
+    @classmethod
+    def _create_unlinked(
+        cls,
+        *,
+        output_format: str,
+        maximum_bytes: int,
+        parent: Path | None,
+        platform: str,
+    ) -> "AnonymousAudioStage":
+        _validate_request(output_format, maximum_bytes)
+        _require_host_capabilities(platform)
+
+        try:
+            parent_path = Path(tempfile.gettempdir()) if parent is None else Path(parent)
+        except (OSError, TypeError, ValueError):
+            raise AnonymousAudioStageError(_STAGE_ERROR) from None
+        parent_fd = -1
+        root_fd = -1
+        audio_fd = -1
+        root_basename: str | None = None
+        audio_basename: str | None = None
+        audio_unlinked = False
+        try:
+            parent_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            parent_fd = os.open(parent_path, parent_flags)
+            parent_stat = os.fstat(parent_fd)
+            if not stat.S_ISDIR(parent_stat.st_mode):
+                raise AnonymousAudioStageError(_STAGE_ERROR)
+
+            root_basename = Path(
+                tempfile.mkdtemp(prefix="hermes-tts-", dir=parent_path)
+            ).name
+            root_fd = os.open(root_basename, parent_flags, dir_fd=parent_fd)
+            os.fchown(root_fd, os.getuid(), os.getgid())
+            os.fchmod(root_fd, 0o700)
+            root_stat = os.fstat(root_fd)
+            named_root = os.stat(
+                root_basename,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            if not cls._valid_root_identity(root_stat, named_root):
+                raise AnonymousAudioStageError(_STAGE_ERROR)
+
+            audio_basename = f"audio-{secrets.token_hex(16)}"
+            audio_flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW
+            audio_fd = os.open(audio_basename, audio_flags, 0o600, dir_fd=root_fd)
+            os.fchown(audio_fd, os.getuid(), os.getgid())
+            os.fchmod(audio_fd, 0o600)
+            file_stat = os.fstat(audio_fd)
+            if not cls._valid_held_file(file_stat, require_unlinked=False):
+                raise AnonymousAudioStageError(_STAGE_ERROR)
+
+            os.unlink(audio_basename, dir_fd=root_fd)
+            audio_unlinked = True
+            file_stat = os.fstat(audio_fd)
+            if not cls._valid_held_file(file_stat, require_unlinked=True):
+                raise AnonymousAudioStageError(_STAGE_ERROR)
+            if os.listdir(root_fd):
+                raise AnonymousAudioStageError(_STAGE_ERROR)
+            os.lseek(audio_fd, 0, os.SEEK_SET)
+
+            sink = ProviderAudioSink(
+                path=_descriptor_path_for_platform(audio_fd, platform),
+                output_format=output_format,
+                maximum_bytes=maximum_bytes,
+            )
+            return cls(
+                _CONSTRUCTION_TOKEN,
+                fd=audio_fd,
+                sink=sink,
+                parent_fd=parent_fd,
+                root_fd=root_fd,
+                root_basename=root_basename,
+                root_stat=root_stat,
+                file_stat=file_stat,
+            )
+        except AnonymousAudioStageError:
+            cls._close_failed_creation(
+                audio_fd=audio_fd,
+                audio_basename=audio_basename,
+                audio_unlinked=audio_unlinked,
+                root_fd=root_fd,
+                parent_fd=parent_fd,
+            )
+            raise
+        except (OSError, ValueError, TypeError):
+            cls._close_failed_creation(
+                audio_fd=audio_fd,
+                audio_basename=audio_basename,
+                audio_unlinked=audio_unlinked,
+                root_fd=root_fd,
+                parent_fd=parent_fd,
+            )
+            raise AnonymousAudioStageError(_STAGE_ERROR) from None
+
+    @staticmethod
+    def _valid_root_identity(held: os.stat_result, named: os.stat_result) -> bool:
+        return (
+            stat.S_ISDIR(held.st_mode)
+            and stat.S_IMODE(held.st_mode) == 0o700
+            and held.st_uid == os.getuid()
+            and held.st_gid == os.getgid()
+            and held.st_dev == named.st_dev
+            and held.st_ino == named.st_ino
+        )
+
+    @staticmethod
+    def _valid_held_file(held: os.stat_result, *, require_unlinked: bool) -> bool:
+        return (
+            stat.S_ISREG(held.st_mode)
+            and stat.S_IMODE(held.st_mode) == 0o600
+            and held.st_uid == os.getuid()
+            and held.st_gid == os.getgid()
+            and (held.st_nlink == 0 if require_unlinked else held.st_nlink == 1)
+        )
+
+    @staticmethod
+    def _close_failed_creation(
+        *,
+        audio_fd: int,
+        audio_basename: str | None,
+        audio_unlinked: bool,
+        root_fd: int,
+        parent_fd: int,
+    ) -> None:
+        if audio_fd >= 0:
+            try:
+                os.ftruncate(audio_fd, 0)
+            except OSError:
+                pass
+            try:
+                os.close(audio_fd)
+            except OSError:
+                pass
+        if not audio_unlinked and audio_basename is not None and root_fd >= 0:
+            try:
+                os.unlink(audio_basename, dir_fd=root_fd)
+            except OSError:
+                pass
+        if root_fd >= 0:
+            try:
+                os.close(root_fd)
+            except OSError:
+                pass
+        if parent_fd >= 0:
+            try:
+                os.close(parent_fd)
+            except OSError:
+                pass
+
+    @property
+    def sink(self) -> ProviderAudioSink:
+        return self._sink
+
+    def seal(self, provider_acknowledgement: object) -> SealedAudio:
+        if self._closed or self._sealed:
+            raise AnonymousAudioStageError(_STAGE_ERROR)
+        if provider_acknowledgement is not None and (
+            type(provider_acknowledgement) is not str
+            or provider_acknowledgement != self._sink.path
+        ):
+            raise AnonymousAudioStageError(_STAGE_ERROR)
+        try:
+            os.fsync(self._fd)
+            held = os.fstat(self._fd)
+            if not self._valid_final_stat(held):
+                raise AnonymousAudioStageError(_STAGE_ERROR)
+            os.lseek(self._fd, 0, os.SEEK_SET)
+            header = os.read(self._fd, min(held.st_size, 12))
+            os.lseek(self._fd, 0, os.SEEK_SET)
+            if not _valid_format_signature(self._sink.output_format, header):
+                raise AnonymousAudioStageError(_STAGE_ERROR)
+            digest = self._digest_held_bytes(held.st_size)
+            after_digest = os.fstat(self._fd)
+            if (
+                not self._valid_final_stat(after_digest)
+                or after_digest.st_dev != held.st_dev
+                or after_digest.st_ino != held.st_ino
+                or after_digest.st_size != held.st_size
+            ):
+                raise AnonymousAudioStageError(_STAGE_ERROR)
+        except AnonymousAudioStageError:
+            raise
+        except (OSError, ValueError, TypeError):
+            raise AnonymousAudioStageError(_STAGE_ERROR) from None
+
+        self._sealed = True
+        return SealedAudio(
+            _SEALED_TOKEN,
+            self._authority,
+            self._fd,
+            held.st_dev,
+            digest,
+            held.st_ino,
+            held.st_size,
+            self._sink.output_format,
+        )
+
+    def _valid_final_stat(self, held: os.stat_result) -> bool:
+        return (
+            self._valid_held_file(held, require_unlinked=True)
+            and held.st_dev == self._initial_device
+            and held.st_ino == self._initial_inode
+            and 0 < held.st_size <= self._sink.maximum_bytes
+        )
+
+    def read_bounded(self, sealed: SealedAudio) -> bytes:
+        if (
+            self._closed
+            or not self._sealed
+            or not isinstance(sealed, SealedAudio)
+            or sealed._authority is not self._authority
+            or sealed._fd != self._fd
+            or sealed._output_format != self._sink.output_format
+        ):
+            raise AnonymousAudioStageError(_STAGE_ERROR)
+        try:
+            before = os.fstat(self._fd)
+            if not self._matches_seal(before, sealed):
+                raise AnonymousAudioStageError(_STAGE_ERROR)
+            os.lseek(self._fd, 0, os.SEEK_SET)
+            chunks: list[bytes] = []
+            remaining = sealed._size
+            while remaining:
+                chunk = os.read(self._fd, min(remaining, 64 * 1024))
+                if not chunk:
+                    raise AnonymousAudioStageError(_STAGE_ERROR)
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            after = os.fstat(self._fd)
+            if not self._matches_seal(after, sealed):
+                raise AnonymousAudioStageError(_STAGE_ERROR)
+            data = b"".join(chunks)
+            if hashlib.sha256(data).digest() != sealed._digest:
+                raise AnonymousAudioStageError(_STAGE_ERROR)
+            if not _valid_format_signature(sealed._output_format, data[:12]):
+                raise AnonymousAudioStageError(_STAGE_ERROR)
+            return data
+        except AnonymousAudioStageError:
+            raise
+        except (OSError, ValueError, TypeError):
+            raise AnonymousAudioStageError(_STAGE_ERROR) from None
+
+    def _digest_held_bytes(self, size: int) -> bytes:
+        digest = hashlib.sha256()
+        os.lseek(self._fd, 0, os.SEEK_SET)
+        remaining = size
+        while remaining:
+            chunk = os.read(self._fd, min(remaining, 64 * 1024))
+            if not chunk:
+                raise AnonymousAudioStageError(_STAGE_ERROR)
+            digest.update(chunk)
+            remaining -= len(chunk)
+        os.lseek(self._fd, 0, os.SEEK_SET)
+        return digest.digest()
+
+    def _matches_seal(self, held: os.stat_result, sealed: SealedAudio) -> bool:
+        return (
+            self._valid_final_stat(held)
+            and held.st_dev == sealed._device
+            and held.st_ino == sealed._inode
+            and held.st_size == sealed._size
+            and held.st_size <= self._sink.maximum_bytes
+        )
+
+    def scrub_and_close(self) -> None:
+        if self._closed:
+            return
+        failed = False
+        try:
+            os.ftruncate(self._fd, 0)
+        except OSError:
+            failed = True
+        try:
+            os.fsync(self._fd)
+        except OSError:
+            failed = True
+        try:
+            os.close(self._fd)
+        except OSError:
+            failed = True
+        else:
+            self._closed = True
+            self._fd = -1
+
+        if failed:
+            self._close_root_descriptors()
+            raise AnonymousAudioScrubError(_SCRUB_ERROR)
+
+        self._teardown_exact_empty_root()
+
+    def _teardown_exact_empty_root(self) -> None:
+        try:
+            held = os.fstat(self._root_fd)
+            named = os.stat(
+                self._root_basename,
+                dir_fd=self._parent_fd,
+                follow_symlinks=False,
+            )
+            exact = (
+                self._valid_root_identity(held, named)
+                and held.st_dev == self._root_device
+                and held.st_ino == self._root_inode
+                and held.st_uid == self._root_uid
+                and held.st_gid == self._root_gid
+                and os.listdir(self._root_fd) == []
+            )
+            if exact:
+                os.rmdir(self._root_basename, dir_fd=self._parent_fd)
+        except OSError:
+            pass
+        finally:
+            self._close_root_descriptors()
+
+    def _close_root_descriptors(self) -> None:
+        if self._root_fd >= 0:
+            try:
+                os.close(self._root_fd)
+            except OSError:
+                pass
+            self._root_fd = -1
+        if self._parent_fd >= 0:
+            try:
+                os.close(self._parent_fd)
+            except OSError:
+                pass
+            self._parent_fd = -1
+
+
+def _create_anonymous_audio_stage_for_test(
+    output_format: str,
+    maximum_bytes: int,
+    parent: Path,
+    *,
+    platform: str | None = None,
+) -> AnonymousAudioStage:
+    """Inject only the temporary parent for hermetic filesystem tests."""
+
+    return AnonymousAudioStage._create_unlinked(
+        output_format=output_format,
+        maximum_bytes=maximum_bytes,
+        parent=parent,
+        platform=sys.platform if platform is None else platform,
+    )
