@@ -24,6 +24,9 @@ import importlib.machinery
 import sys
 from unittest.mock import MagicMock
 import asyncio
+import base64
+import json
+from pathlib import Path
 
 def fake_run_conversation(self, prompt):
     if "model-failure" in prompt:
@@ -53,6 +56,100 @@ def fake_run_conversation(self, prompt):
             {"messages": messages},
             reason="private-request-dump",
         ) is None
+        # Exercise configured/tool-adjacent writer paths through the real
+        # public subprocess while the invocation policy is bound.
+        from tools.process_registry import ProcessSession, process_registry
+        process_registry._running["private-process"] = ProcessSession(
+            id="private-process",
+            command="printf private-process-command",
+            task_id="private-task",
+            session_key="private-session",
+            pid=12345,
+        )
+        process_registry._write_checkpoint()
+        process_registry._running.pop("private-process", None)
+
+        from agent.verification_evidence import record_terminal_result
+        assert record_terminal_result(
+            command="pytest -k private-verification",
+            cwd=Path.cwd(),
+            session_id="private-verification-session",
+            exit_code=1,
+            output="private-verification-output",
+        ) is None
+
+        from tools.skill_manager_tool import skill_manage
+        staged = json.loads(skill_manage(
+            action="create",
+            name="private-staged-skill",
+            content=(
+                "---\nname: private-staged-skill\n"
+                "description: private staged skill\n---\n\n# Private\n"
+            ),
+            task_id="private-task",
+            session_id="private-session",
+        ))
+        assert staged["staged"] is True
+        assert staged["pending_id"]
+
+        from agent.moa_trace import save_moa_turn
+        save_moa_turn(
+            session_id="private-moa-session",
+            preset_name="private-preset",
+            reference_outputs=[],
+            aggregator_label="private-aggregator",
+            aggregator_model="private-model",
+            aggregator_provider="private-provider",
+            aggregator_temperature=0,
+            aggregator_input_messages=[{"role": "user", "content": prompt}],
+            aggregator_output="private-moa-output",
+            aggregator_streamed=False,
+        )
+
+        from agent.prompt_builder import (
+            build_skills_system_prompt,
+            clear_skills_system_prompt_cache,
+        )
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+        build_skills_system_prompt(
+            available_tools={"skill_view"},
+            skills_dir_override=Path(__import__("os").environ["HERMES_HOME"]) / "skills",
+        )
+
+        from tools.computer_use.backend import CaptureResult, UIElement
+        from tools.computer_use import tool as computer_tool
+        png_b64 = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAYAAADED76L"
+            "AAAADUlEQVR4nGNgGAUgAAABCAABgukLHQAAAABJRU5ErkJggg=="
+        )
+        computer_tool._image_dimensions_from_b64 = lambda _value: None
+        computer_tool._should_route_through_aux_vision = lambda: False
+        capture = CaptureResult(
+            mode="vision", width=800, height=600, png_b64=png_b64,
+            image_mime_type="image/png", png_bytes_len=len(base64.b64decode(png_b64)),
+            elements=[UIElement(index=0, role="Text", label="private-element-" + "x" * 300,
+                                bounds=(0, 0, 20, 20), app="private-app")],
+        )
+        computer_result = computer_tool._capture_response(capture, max_elements=0)
+        assert "screenshot_path" not in str(computer_result)
+        assert "elements_file" not in str(computer_result)
+
+        from tools import browser_tool, vision_tools
+        browser_tool._is_camofox_mode = lambda: False
+        browser_tool._is_local_backend = lambda: True
+        browser_tool._get_browser_engine = lambda: "chrome"
+        browser_tool._get_cloud_provider = lambda: None
+        def fake_browser(_task_id, _command, args, **_kwargs):
+            Path(args[-1]).write_bytes(base64.b64decode(png_b64))
+            return {"success": True, "data": {"path": args[-1]}}
+        browser_tool._run_browser_command = fake_browser
+        vision_tools._should_use_native_vision_fast_path = lambda: True
+        vision_tools._resize_image_for_vision = (
+            lambda *_args, **_kwargs: "data:image/png;base64,private-image"
+        )
+        browser_result = browser_tool.browser_vision("private question", task_id="private")
+        assert "screenshot_path" not in str(browser_result)
+        assert __import__("os").environ["HERMES_HOME"] not in str(browser_result)
     self._persist_session(messages)
     return {
         "final_response": "subprocess-ok",
@@ -125,7 +222,11 @@ def _prepare_subprocess_home(home: Path) -> None:
         "  default: local-model\n"
         "  provider: custom\n"
         "  base_url: http://127.0.0.1:1/v1\n"
-        "  api_key: test-only\n",
+        "  api_key: test-only\n"
+        "moa:\n"
+        "  save_traces: true\n"
+        "skills:\n"
+        "  write_approval: true\n",
         encoding="utf-8",
     )
 
@@ -137,6 +238,37 @@ def _prepare_subprocess_skill(home: Path, name: str) -> None:
         f"---\nname: {name}\ndescription: subprocess fixture\n---\n\n# Fixture\n",
         encoding="utf-8",
     )
+
+
+def _home_inventory(home: Path) -> dict[str, tuple[str, bytes | None]]:
+    inventory: dict[str, tuple[str, bytes | None]] = {}
+    for path in sorted(home.rglob("*")):
+        relative = path.relative_to(home).as_posix()
+        inventory[relative] = (
+            "dir" if path.is_dir() else "file",
+            None if path.is_dir() else path.read_bytes(),
+        )
+    return inventory
+
+
+def _assert_ephemeral_inventory(
+    before: dict[str, tuple[str, bytes | None]],
+    after: dict[str, tuple[str, bytes | None]],
+) -> None:
+    """Allow only empty operational scaffolding; no payload-bearing mutation."""
+    allowed_additions = {
+        "auth.lock": ("file", b""),
+        "sandboxes": ("dir", None),
+        "sandboxes/singularity": ("dir", None),
+    }
+    for name, expected in before.items():
+        assert after.get(name) == expected, name
+    additions = {name: value for name, value in after.items() if name not in before}
+    assert additions == {
+        name: allowed_additions[name]
+        for name in additions
+        if name in allowed_additions
+    }
 
 
 def _assert_no_transcript_sinks(home: Path, private_marker: str) -> None:
@@ -845,6 +977,7 @@ def test_both_real_cli_forms_leave_temp_home_sink_free(
     home = tmp_path / "ephemeral-home"
     _prepare_subprocess_home(home)
     _prepare_subprocess_skill(home, "private-preloaded-skill")
+    before_inventory = _home_inventory(home)
 
     result = _run_ephemeral_subprocess(home, injection, argv, stdin=stdin)
 
@@ -854,6 +987,7 @@ def test_both_real_cli_forms_leave_temp_home_sink_free(
     assert not (home / "skills" / ".usage.json").exists()
     assert not (home / "skills" / ".usage.json.lock").exists()
     _assert_no_transcript_sinks(home, private_marker)
+    _assert_ephemeral_inventory(before_inventory, _home_inventory(home))
 
 
 @pytest.mark.parametrize(

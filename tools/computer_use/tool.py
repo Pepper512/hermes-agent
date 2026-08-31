@@ -1278,7 +1278,9 @@ def _route_capture_through_aux_vision(
       A JSON-encoded text response on success.
       ``None`` on failure (caller falls back to the multimodal envelope).
     """
-    if not cap.png_b64:
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled() or not cap.png_b64:
         return None
     try:
         import base64 as _base64
@@ -1482,7 +1484,9 @@ def _persist_capture_image(cap: CaptureResult) -> Optional[str]:
     when the user explicitly asks for the screenshot. This is best-effort: an
     unwritable cache must never break computer control.
     """
-    if not cap.png_b64:
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled() or not cap.png_b64:
         return None
     try:
         import uuid as _uuid
@@ -1531,6 +1535,10 @@ def _spill_elements_to_file(cap: CaptureResult) -> Optional[str]:
     enhancement; a capture must never fail because the cache dir is
     unwritable).
     """
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return None
     try:
         import uuid as _uuid
 
