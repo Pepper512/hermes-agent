@@ -164,7 +164,9 @@ def fake_run_conversation(self, prompt):
         browser_use_cli._read_browser_cfg = lambda: {}
         browser_use_cli.is_legacy_browser_use_cloud_config = lambda _cfg: False
         original_run = browser_use_cli.subprocess.run
+        browser_exec_calls = []
         def fake_browser_exec(*_args, **kwargs):
+            browser_exec_calls.append(kwargs)
             workspace = Path(kwargs["env"]["BH_AGENT_WORKSPACE"])
             workspace.mkdir(parents=True, exist_ok=True)
             (workspace / "private-page.json").write_text(prompt)
@@ -180,7 +182,11 @@ def fake_run_conversation(self, prompt):
             ))
         finally:
             browser_use_cli.subprocess.run = original_run
-        assert "workspace" not in exec_result
+        assert exec_result == {
+            "error": "browser-use is unavailable in ephemeral mode",
+            "success": False,
+        }
+        assert browser_exec_calls == []
         assert __import__("os").environ["HERMES_HOME"] not in json.dumps(exec_result)
 
         from tools.debug_helpers import DebugSession
@@ -256,7 +262,10 @@ sys.meta_path.insert(0, RunAgentFinder())
 
 def _subprocess_env(home: Path, injection_dir: Path) -> dict[str, str]:
     env = os.environ.copy()
+    runtime = injection_dir.parent / "isolated-runtime"
+    runtime.mkdir(exist_ok=True)
     env["HERMES_HOME"] = str(home)
+    env["TMPDIR"] = str(runtime)
     env["PYTHONPATH"] = os.pathsep.join(
         [str(injection_dir), str(Path(__file__).resolve().parents[2])]
     )
@@ -1057,6 +1066,7 @@ def test_both_real_cli_forms_leave_temp_home_sink_free(
     assert not (home / "skills" / ".usage.json.lock").exists()
     _assert_no_transcript_sinks(home, private_marker)
     _assert_ephemeral_inventory(before_inventory, _home_inventory(home))
+    assert _home_inventory(tmp_path / "isolated-runtime") == {}
 
 
 @pytest.mark.parametrize(

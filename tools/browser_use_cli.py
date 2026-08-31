@@ -10,7 +10,6 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -76,7 +75,6 @@ del _hermes_ensure_own_tab
 _DEFAULT_TIMEOUT_S = 300
 _MIN_TIMEOUT_S = 5
 _MAX_TIMEOUT_S = 1800
-_STDOUT_CAP_CHARS = 12000
 _STDERR_CAP_CHARS = 4000
 
 # Filesystem-safe task ids for per-task workspace dirs.
@@ -689,6 +687,15 @@ def browser_exec(
 ):
     """Run Python code through the browser-use CLI, and return its output"""
     from tools.registry import tool_error, tool_result
+    from hermes_cli.persistence import persistence_disabled
+
+    # Browser Use owns daemon/session/runtime artifacts outside Hermes's
+    # process and workspace.  Hermes cannot prove exclusive ownership of
+    # those paths (especially named-session IPC and screenshot paths), so an
+    # ephemeral invocation must fail closed before discovery, configuration,
+    # backend resolution, or subprocess launch can create any of them.
+    if persistence_disabled():
+        return tool_error("browser-use is unavailable in ephemeral mode", success=False)
 
     if not code or not code.strip():
         return tool_error("No code provided. Pass Python that uses the pre-imported helpers, e.g. new_tab(\"https://example.com\") then print(page_info()).")
@@ -753,22 +760,9 @@ def browser_exec(
     if session and not private_browser:
         code = _OWN_TAB_PREAMBLE + code
 
-    from hermes_cli.persistence import persistence_disabled
-
-    ephemeral = persistence_disabled()
-    temp_workspace = (
-        tempfile.TemporaryDirectory(prefix="hermes-browser-exec-")
-        if ephemeral
-        else None
-    )
-    workspace = temp_workspace.name if temp_workspace is not None else _workspace_dir(task_id)
+    workspace = _workspace_dir(task_id)
     if workspace:
         env["BH_AGENT_WORKSPACE"] = workspace
-
-    def finish(value):
-        if temp_workspace is not None:
-            temp_workspace.cleanup()
-        return value
 
     # BU_AUTOSPAWN makes the CLI start a Browser Use cloud browser when no
     # local Chrome/CDP endpoint is reachable (their API key authenticates it)
@@ -805,66 +799,40 @@ def browser_exec(
             **popen_extra,
         )
     except subprocess.TimeoutExpired:
-        if ephemeral:
-            return finish(tool_error("browser-use exec timed out", success=False))
-        return finish(tool_error(
+        return tool_error(
             f"browser-use exec timed out after {timeout}s. The daemon may "
             "still be working; retry with a larger timeout_s (max "
             f"{_MAX_TIMEOUT_S}), or split the work into several calls that "
             "append to workspace files — anything already written to the "
             "workspace is preserved."
-        ))
+        )
     except OSError as e:
-        if ephemeral:
-            return finish(tool_error("Failed to launch browser-use CLI", success=False))
-        return finish(tool_error(f"Failed to launch browser-use CLI: {e}"))
-    except BaseException:
-        if temp_workspace is not None:
-            temp_workspace.cleanup()
-        raise
+        return tool_error(f"Failed to launch browser-use CLI: {e}")
 
     stdout = proc.stdout or ""
-    if ephemeral:
-        for private_path in (workspace, os.environ.get("HERMES_HOME")):
-            if private_path:
-                stdout = stdout.replace(str(private_path), "[ephemeral]")
-        if len(stdout) > _STDOUT_CAP_CHARS:
-            stdout = stdout[:_STDOUT_CAP_CHARS] + "\n… (output truncated)"
 
     result = {
         "success": proc.returncode == 0,
         "exit_code": proc.returncode,
         "output": stdout,
     }
-    if workspace and not ephemeral:
+    if workspace:
         result["workspace"] = workspace
     if session:
         result["session"] = session
     stderr = (proc.stderr or "").strip()
     if stderr:
-        if ephemeral:
-            for private_path in (workspace, os.environ.get("HERMES_HOME")):
-                if private_path:
-                    stderr = stderr.replace(str(private_path), "[ephemeral]")
         if len(stderr) > _STDERR_CAP_CHARS:
             stderr = stderr[:_STDERR_CAP_CHARS] + "\n… (stderr truncated)"
         result["stderr"] = stderr
 
     screenshot = _find_screenshot(proc.stdout, started)
-    if screenshot and not ephemeral:
+    if screenshot:
         result["screenshot_path"] = screenshot
         native = _native_screenshot_result(result, screenshot)
         if native is not None:
-            return finish(native)
-    try:
-        rendered = tool_result(result)
-    except Exception:
-        if ephemeral:
-            return finish(json.dumps({"success": False, "error": "browser-use result failed"}))
-        if temp_workspace is not None:
-            temp_workspace.cleanup()
-        raise
-    return finish(rendered)
+            return native
+    return tool_result(result)
 
 
 # The tool description is the CLI's skill, fetched from browser-use skill

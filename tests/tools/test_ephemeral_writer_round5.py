@@ -136,7 +136,7 @@ def _configure_browser_exec(monkeypatch, home: Path, outcome: str, observed: dic
     ("execution", "outcome"),
     [("direct", "success"), ("copied", "error"), ("async", "timeout"), ("direct", "cancel")],
 )
-def test_ephemeral_browser_exec_uses_cleaned_path_free_workspace(
+def test_ephemeral_browser_exec_rejects_before_workspace_or_process(
     tmp_path, monkeypatch, execution, outcome
 ):
     home = tmp_path / ".hermes"
@@ -147,19 +147,16 @@ def test_ephemeral_browser_exec_uses_cleaned_path_free_workspace(
         return browser_use_cli.browser_exec("print('private')", task_id="private-task")
 
     with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
-        if outcome == "cancel":
-            with pytest.raises(asyncio.CancelledError):
-                _invoke(execution, call)
-            rendered = ""
-        else:
-            rendered = _invoke(execution, call)
+        rendered = _invoke(execution, call)
 
-    workspace = observed["workspace"]
-    assert not workspace.exists()
+    assert json.loads(rendered) == {
+        "error": "browser-use is unavailable in ephemeral mode",
+        "success": False,
+    }
+    assert observed == {}
     assert not (home / "cache" / "browser-use").exists()
     assert str(home) not in rendered
-    assert str(workspace) not in rendered
-    assert "workspace" not in json.loads(rendered) if rendered else True
+    assert "workspace" not in json.loads(rendered)
 
 
 def test_ephemeral_browser_workspace_internal_helper_creates_nothing(tmp_path, monkeypatch):
@@ -172,7 +169,7 @@ def test_ephemeral_browser_workspace_internal_helper_creates_nothing(tmp_path, m
     assert not home.exists()
 
 
-def test_ephemeral_browser_exec_cleans_workspace_when_result_rendering_fails(
+def test_ephemeral_browser_exec_rejects_before_result_rendering(
     tmp_path, monkeypatch
 ):
     home = tmp_path / ".hermes"
@@ -186,7 +183,11 @@ def test_ephemeral_browser_exec_cleans_workspace_when_result_rendering_fails(
     with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
         rendered = browser_use_cli.browser_exec("print('private')", task_id="private-task")
 
-    assert not observed["workspace"].exists()
+    assert observed == {}
+    assert json.loads(rendered) == {
+        "error": "browser-use is unavailable in ephemeral mode",
+        "success": False,
+    }
     assert str(home) not in rendered
     assert "private renderer path" not in rendered
 
