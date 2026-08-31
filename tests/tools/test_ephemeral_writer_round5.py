@@ -305,25 +305,19 @@ def _configure_tts(monkeypatch, home: Path, outcome: str):
     monkeypatch.setattr(tts_tool, "_get_provider", lambda _cfg: "edge")
     monkeypatch.setattr(tts_tool, "_resolve_max_text_length", lambda *_a: 10000)
 
-    def synth(text, output_path=None, **_kwargs):
+    monkeypatch.setattr(tts_tool, "_import_edge_tts", lambda: object())
+
+    async def synth(text, output_path, _config):
         del text
         path = Path(output_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"private-audio-bytes")
         if outcome == "error":
-            return json.dumps({"success": False, "error": f"private failure {path}"})
+            raise RuntimeError(f"private failure {path}")
         if outcome == "cancel":
             raise asyncio.CancelledError()
-        return json.dumps(
-            {"success": True, "file_path": str(path), "provider": "edge", "voice_compatible": False}
-        )
+        return str(path)
 
-    monkeypatch.setattr(tts_tool, "_text_to_speech_single", synth)
-    monkeypatch.setattr(
-        tts_tool,
-        "_build_audio_delivery_files",
-        lambda paths, *_a, **_k: (list(paths), False),
-    )
+    monkeypatch.setattr(tts_tool, "_generate_edge_tts", synth)
     return tts_tool
 
 

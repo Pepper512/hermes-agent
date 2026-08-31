@@ -185,18 +185,20 @@ def _invoke_plugin_candidate(monkeypatch, tmp_path: Path, mode: str):
     def provider(_text, output_path, _provider, _config):
         requested = Path(output_path)
         observed["requested"] = requested
-        requested.parent.mkdir(parents=True, exist_ok=True)
         if mode == "in_root":
-            candidate = requested.parent / "provider-result.mp3"
-            candidate.write_bytes(b"private-in-root-audio")
-            return str(candidate)
+            requested.write_bytes(b"private-in-root-audio")
+            return str(requested)
         if mode == "out_of_root":
             return str(external)
         if mode == "symlink":
+            requested.unlink()
             requested.symlink_to(external)
+            observed["unowned"] = requested
             return str(requested)
         if mode == "hardlink":
+            requested.unlink()
             os.link(external, requested)
+            observed["unowned"] = requested
             return str(requested)
         if mode == "replacement":
             original_root = requested.parent
@@ -263,6 +265,8 @@ def test_ephemeral_tts_rejects_unproved_provider_path_without_deleting_target(
     assert str(tmp_path) not in caplog.text
     if mode == "replacement":
         assert observed["replacement"].read_bytes() == b"unowned-replacement"
+    if mode in {"symlink", "hardlink"}:
+        assert observed["unowned"].exists()
 
 
 def test_durable_browser_and_tts_internal_contracts_remain_available(tmp_path, monkeypatch):
@@ -340,7 +344,7 @@ def test_ephemeral_tts_reaps_trusted_root_on_failure_or_cancel(
         assert str(tmp_path) not in rendered
 
 
-def test_ephemeral_tts_rejects_unproved_final_publication_without_cleanup_authority(
+def test_ephemeral_tts_never_calls_path_based_final_publication(
     tmp_path, monkeypatch
 ):
     from tools import tts_tool
@@ -357,10 +361,11 @@ def test_ephemeral_tts_rejects_unproved_final_publication_without_cleanup_author
         return str(requested)
 
     monkeypatch.setattr(tts_tool, "_dispatch_to_plugin_provider", provider)
+    publication_calls = []
     monkeypatch.setattr(
         tts_tool,
         "_build_audio_delivery_files",
-        lambda *_a, **_k: ([str(external)], False),
+        lambda *_a, **_k: publication_calls.append(True) or ([str(external)], False),
     )
 
     with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
@@ -368,10 +373,10 @@ def test_ephemeral_tts_rejects_unproved_final_publication_without_cleanup_author
             "private speech", provider="private-plugin"
         )
 
-    assert json.loads(rendered) == {
-        "error": "TTS delivery failed",
-        "success": False,
-    }
+    parsed = json.loads(rendered)
+    assert parsed["success"] is True
+    assert parsed["audio"].startswith("data:audio/mpeg;base64,")
+    assert publication_calls == []
     assert external.read_bytes() == b"unowned-final-audio"
     assert not observed["root"].exists()
     assert str(tmp_path) not in rendered
@@ -397,25 +402,30 @@ def test_ephemeral_tts_delivery_cap_and_cleanup_failure_are_path_free(
         "_resolve_audio_delivery_profile",
         lambda *_a: tts_tool.AudioDeliveryProfile("test", 4, 1.0),
     )
-    original_cleanup = tts_tool._cleanup_ephemeral_tts_state
+    original_unlink = tts_tool.os.unlink
 
-    def cleanup_then_fail(state):
-        original_cleanup(state)
-        raise RuntimeError(f"private cleanup {state.root}")
+    def fail_owned_unlink(path, *args, **kwargs):
+        if kwargs.get("dir_fd") is not None and Path(path).name.startswith("tts_"):
+            raise OSError("private cleanup failure")
+        return original_unlink(path, *args, **kwargs)
 
-    monkeypatch.setattr(tts_tool, "_cleanup_ephemeral_tts_state", cleanup_then_fail)
+    monkeypatch.setattr(tts_tool.os, "unlink", fail_owned_unlink)
     with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
         rendered = tts_tool.text_to_speech_tool(
             "private speech", provider="private-plugin"
         )
 
     assert json.loads(rendered) == {
-        "error": "TTS delivery failed",
+        "error": "TTS generation failed",
         "success": False,
     }
-    assert not observed["root"].exists()
+    assert observed["root"].exists()
     assert str(observed["root"]) not in rendered
     assert str(observed["root"]) not in caplog.text
+    for child in observed["root"].iterdir():
+        original_unlink(child)
+    observed["root"].rmdir()
+    observed["root"].parent.rmdir()
 
 
 def test_ephemeral_tts_private_state_stays_restrictive_after_inner_durable_rebind(

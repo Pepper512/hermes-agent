@@ -36,7 +36,6 @@ Usage:
 
 import asyncio
 import base64
-import contextvars
 import datetime
 import importlib.util
 import json
@@ -54,7 +53,6 @@ import threading
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Any, Iterator, List, Optional, Tuple
@@ -3160,301 +3158,6 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
 _EPHEMERAL_TTS_MAX_BYTES = 25 * 1024 * 1024
 
 
-@dataclass(frozen=True)
-class _EphemeralTTSState:
-    """Private, restrictive capability for one ephemeral materialization.
-
-    The object is installed only by the trusted outer boundary.  Unlike the
-    former Boolean/path parameters, callers cannot use it to relax policy or
-    choose a cleanup root.
-    """
-
-    parent: Path
-    root: Path
-    parent_fd: Optional[int]
-    root_fd: Optional[int]
-    root_identity: tuple[int, int]
-    outputs: Dict[str, Path] = field(default_factory=dict, compare=False, repr=False)
-
-
-_EPHEMERAL_TTS_STATE: contextvars.ContextVar[Optional[_EphemeralTTSState]] = (
-    contextvars.ContextVar("hermes_ephemeral_tts_state", default=None)
-)
-
-
-def _directory_fd(path: Path) -> Optional[int]:
-    """Open a held, no-follow directory handle where the platform supports it."""
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        return os.open(path, flags)
-    except (OSError, TypeError):
-        return None
-
-
-def _same_identity(path: Path, identity: tuple[int, int]) -> bool:
-    try:
-        info = path.lstat()
-    except OSError:
-        return False
-    return stat.S_ISDIR(info.st_mode) and (info.st_dev, info.st_ino) == identity
-
-
-def _clean_owned_dir_fd(directory_fd: int) -> None:
-    """Remove children through a held directory handle without following links."""
-    try:
-        names = os.listdir(directory_fd)
-    except (OSError, TypeError):
-        return
-    for name in names:
-        try:
-            info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        except OSError:
-            continue
-        if stat.S_ISDIR(info.st_mode):
-            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-            try:
-                child_fd = os.open(name, flags, dir_fd=directory_fd)
-            except (OSError, TypeError):
-                continue
-            try:
-                opened = os.fstat(child_fd)
-                if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
-                    continue
-                _clean_owned_dir_fd(child_fd)
-            finally:
-                os.close(child_fd)
-            try:
-                current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-                if (current.st_dev, current.st_ino) == (info.st_dev, info.st_ino):
-                    os.rmdir(name, dir_fd=directory_fd)
-            except OSError:
-                pass
-            continue
-        try:
-            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            if (current.st_dev, current.st_ino) == (info.st_dev, info.st_ino):
-                os.unlink(name, dir_fd=directory_fd)
-        except OSError:
-            pass
-
-
-def _clean_owned_dir_path(directory: Path, identity: tuple[int, int]) -> None:
-    """No-follow fallback for platforms that cannot open directory handles."""
-    if not _same_identity(directory, identity):
-        return
-    try:
-        children = list(directory.iterdir())
-    except OSError:
-        return
-    for child in children:
-        try:
-            info = child.lstat()
-        except OSError:
-            continue
-        child_identity = (info.st_dev, info.st_ino)
-        if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
-            _clean_owned_dir_path(child, child_identity)
-            try:
-                current = child.lstat()
-                if (current.st_dev, current.st_ino) == child_identity:
-                    child.rmdir()
-            except OSError:
-                pass
-            continue
-        try:
-            current = child.lstat()
-            if (current.st_dev, current.st_ino) == child_identity:
-                child.unlink()
-        except OSError:
-            pass
-
-
-def _cleanup_ephemeral_tts_state(state: _EphemeralTTSState) -> None:
-    """Clean only the root whose identity this invocation retained."""
-    # Cleanup is capability-based and deliberately remains restrictive even
-    # if hostile inner code attempts to rebind the ambient policy late.
-    from hermes_cli.persistence import persistence_disabled
-
-    persistence_disabled()
-    owned_name: Optional[str] = None
-    if _same_identity(state.root, state.root_identity):
-        owned_name = state.root.name
-    else:
-        # A provider may have renamed/replaced the public root.  Search only
-        # inside our private parent, by inode identity; never clean the
-        # replacement merely because it occupies the old pathname.
-        try:
-            for child in state.parent.iterdir():
-                if _same_identity(child, state.root_identity):
-                    owned_name = child.name
-                    break
-        except OSError:
-            pass
-
-    if state.root_fd is not None:
-        _clean_owned_dir_fd(state.root_fd)
-    elif owned_name is not None:
-        _clean_owned_dir_path(state.parent / owned_name, state.root_identity)
-
-    if owned_name is not None and state.parent_fd is not None:
-        try:
-            info = os.stat(owned_name, dir_fd=state.parent_fd, follow_symlinks=False)
-            if (info.st_dev, info.st_ino) == state.root_identity:
-                os.rmdir(owned_name, dir_fd=state.parent_fd)
-        except OSError:
-            pass
-    elif owned_name is not None:
-        candidate = state.parent / owned_name
-        if _same_identity(candidate, state.root_identity):
-            try:
-                candidate.rmdir()
-            except OSError:
-                pass
-
-    if state.root_fd is not None:
-        try:
-            os.close(state.root_fd)
-        except OSError:
-            pass
-    if state.parent_fd is not None:
-        try:
-            os.close(state.parent_fd)
-        except OSError:
-            pass
-    try:
-        state.parent.rmdir()
-    except OSError:
-        # A replaced/unowned child is intentionally left untouched.
-        pass
-
-
-@contextmanager
-def _trusted_ephemeral_tts_scope() -> Iterator[_EphemeralTTSState]:
-    """Create one fixed private root and bind it as restrictive state."""
-    parent = Path(tempfile.mkdtemp(prefix="hermes-tts-owned-"))
-    root = parent / "audio"
-    root.mkdir(mode=0o700)
-    root_info = root.lstat()
-    state = _EphemeralTTSState(
-        parent=parent,
-        root=root,
-        parent_fd=_directory_fd(parent),
-        root_fd=_directory_fd(root),
-        root_identity=(root_info.st_dev, root_info.st_ino),
-    )
-    token = _EPHEMERAL_TTS_STATE.set(state)
-    try:
-        yield state
-    finally:
-        _EPHEMERAL_TTS_STATE.reset(token)
-        try:
-            _cleanup_ephemeral_tts_state(state)
-        except Exception:
-            # Cleanup errors must neither disclose the owned path nor replace
-            # the bounded tool result.  The cleanup helper itself uses held
-            # identities and best-effort operations at every child.
-            logger.warning("Ephemeral TTS cleanup was incomplete")
-
-
-def _read_proved_ephemeral_audio(path_value: object, *, limit: int) -> bytes:
-    """Read one direct child proved regular, single-link, and root-contained."""
-    from hermes_cli.persistence import persistence_disabled
-
-    state = _EPHEMERAL_TTS_STATE.get()
-    persistence_disabled()
-    if state is None:
-        raise ValueError("ephemeral TTS ownership unavailable")
-    candidate = Path(str(path_value))
-    if not candidate.is_absolute():
-        candidate = Path(os.path.abspath(candidate))
-    if candidate.parent != state.root or candidate.name in {"", ".", ".."}:
-        raise ValueError("unproved ephemeral TTS path")
-    if not _same_identity(state.root, state.root_identity):
-        raise ValueError("ephemeral TTS root was replaced")
-    try:
-        before = candidate.lstat()
-    except OSError as exc:
-        raise ValueError("ephemeral TTS output missing") from exc
-    if (
-        not stat.S_ISREG(before.st_mode)
-        or before.st_nlink != 1
-        or stat.S_ISLNK(before.st_mode)
-    ):
-        raise ValueError("unproved ephemeral TTS file")
-
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        if state.root_fd is not None:
-            fd = os.open(candidate.name, flags, dir_fd=state.root_fd)
-        else:
-            fd = os.open(candidate, flags)
-    except (OSError, TypeError) as exc:
-        raise ValueError("unproved ephemeral TTS file") from exc
-    try:
-        opened = os.fstat(fd)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or opened.st_nlink != 1
-            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
-        ):
-            raise ValueError("unproved ephemeral TTS file")
-        chunks: list[bytes] = []
-        total = 0
-        while True:
-            chunk = os.read(fd, min(65536, limit + 1 - total))
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > limit:
-                raise ValueError("ephemeral audio exceeds in-memory cap")
-            chunks.append(chunk)
-        after = os.fstat(fd)
-        if (after.st_dev, after.st_ino, after.st_nlink) != (
-            opened.st_dev,
-            opened.st_ino,
-            opened.st_nlink,
-        ):
-            raise ValueError("ephemeral TTS file changed during read")
-        return b"".join(chunks)
-    finally:
-        os.close(fd)
-
-
-def _ephemeral_audio_result(parsed: Dict[str, Any], fallback_path: Path) -> str:
-    """Construct the only allowed ephemeral single-file response."""
-    actual_path = _ephemeral_result_path(parsed, fallback_path)
-    raw = _read_proved_ephemeral_audio(actual_path, limit=_EPHEMERAL_TTS_MAX_BYTES)
-    mime = {
-        ".ogg": "audio/ogg",
-        ".wav": "audio/wav",
-        ".m4a": "audio/mp4",
-    }.get(actual_path.suffix.lower(), "audio/mpeg")
-    return json.dumps({
-        "success": True,
-        "audio": f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}",
-        "provider": parsed.get("provider"),
-        "voice_compatible": bool(parsed.get("voice_compatible")),
-    }, ensure_ascii=False)
-
-
-def _ephemeral_result_path(parsed: Dict[str, Any], fallback_path: Path) -> Path:
-    """Resolve a private result token without treating caller text as authority."""
-    state = _EPHEMERAL_TTS_STATE.get()
-    if state is None:
-        raise ValueError("ephemeral TTS ownership unavailable")
-    token = parsed.get("ephemeral_audio_id")
-    if token is not None:
-        if not isinstance(token, str):
-            raise ValueError("invalid ephemeral TTS result")
-        candidate = state.outputs.pop(token, None)
-        if candidate is None:
-            raise ValueError("unknown ephemeral TTS result")
-        return candidate
-    # Compatibility for an in-process test/provider adapter that returns its
-    # requested path.  Containment is still proved before any use.
-    return Path(str(parsed.get("file_path") or fallback_path))
-
-
 def _text_to_speech_single(
     text: str,
     output_path: Optional[str] = None,
@@ -3473,34 +3176,315 @@ def _text_to_speech_single(
         return tool_error("Text is required", success=False)
 
     from hermes_cli.persistence import persistence_disabled
+    ephemeral = persistence_disabled()
 
-    ephemeral_state = _EPHEMERAL_TTS_STATE.get()
-    if persistence_disabled() and ephemeral_state is None:
-        suffix = Path(output_path).suffix if output_path else ".mp3"
-        with _trusted_ephemeral_tts_scope() as state:
-            temp_path = state.root / f"audio{suffix or '.mp3'}"
-            raw_result = _text_to_speech_single(
-                text=text,
-                output_path=None,
-                speed=speed,
-                instructions=instructions,
-                provider=provider,
-                tts_config_override=tts_config_override,
+    # This class and its sole instance exist only in this invocation's lexical
+    # scope.  No module global, caller parameter, result token, or importable
+    # helper can manufacture or recover its cleanup authority.
+    class EphemeralOwner:
+        def __init__(self) -> None:
+            persistence_disabled()
+            if (
+                not getattr(os, "O_NOFOLLOW", 0)
+                or not getattr(os, "O_DIRECTORY", 0)
+                or os.open not in os.supports_dir_fd
+                or os.stat not in os.supports_dir_fd
+                or os.stat not in os.supports_follow_symlinks
+            ):
+                raise RuntimeError("ephemeral TTS ownership unavailable")
+            self.parent = Path(tempfile.mkdtemp(prefix="hermes-tts-owned-"))
+            self.root = self.parent / "audio"
+            self.basename = (
+                "tts_"
+                + datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                + ".mp3"
             )
+            self.path = self.root / self.basename
+            self.parent_fd = -1
+            self.root_fd = -1
+            self.file_fd = -1
+            self.closed = False
             try:
-                parsed = json.loads(raw_result)
-            except (json.JSONDecodeError, TypeError):
-                return tool_error("TTS generation failed", success=False)
-            if not parsed.get("success"):
-                return tool_error("TTS generation failed", success=False)
-            try:
-                return _ephemeral_audio_result(parsed, temp_path)
-            except (OSError, ValueError, TypeError):
-                return tool_error("TTS generation failed", success=False)
+                persistence_disabled()
+                self.root.mkdir(mode=0o700)
+                directory_flags = (
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                )
+                persistence_disabled()
+                self.parent_fd = os.open(self.parent, directory_flags)
+                os.fchmod(self.parent_fd, 0o700)
+                self.parent_identity = self._identity(os.fstat(self.parent_fd))
+                self.root_fd = os.open(
+                    self.root.name, directory_flags, dir_fd=self.parent_fd
+                )
+                os.fchmod(self.root_fd, 0o700)
+                persistence_disabled()
+                self.file_fd = os.open(
+                    self.basename,
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                    dir_fd=self.root_fd,
+                )
+                os.fchmod(self.file_fd, 0o600)
+                self.root_identity = self._identity(os.fstat(self.root_fd))
+                self.file_identity = self._identity(os.fstat(self.file_fd))
+                if not self._directories_valid() or not self._file_valid():
+                    raise ValueError("ephemeral TTS ownership unavailable")
+            except BaseException:
+                self.cleanup()
+                raise
 
-    # Once a trusted ephemeral scope exists it stays restrictive even if
-    # inner/provider code attempts a late durable rebind.
-    ephemeral_state = _EPHEMERAL_TTS_STATE.get()
+        @staticmethod
+        def _identity(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
+            return (
+                info.st_dev,
+                info.st_ino,
+                info.st_uid,
+                info.st_gid,
+                stat.S_IMODE(info.st_mode),
+                info.st_nlink,
+            )
+
+        @staticmethod
+        def _matches(
+            info: os.stat_result,
+            identity: tuple[int, int, int, int, int, int],
+            *,
+            directory: bool,
+        ) -> bool:
+            kind_ok = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+            expected_mode = 0o700 if directory else 0o600
+            return (
+                kind_ok
+                and not stat.S_ISLNK(info.st_mode)
+                and (info.st_dev, info.st_ino, info.st_uid, info.st_gid,
+                     stat.S_IMODE(info.st_mode), info.st_nlink) == identity
+                and stat.S_IMODE(info.st_mode) == expected_mode
+                and (directory or info.st_nlink == 1)
+            )
+
+        def _directories_valid(self) -> bool:
+            if self.parent_fd < 0 or self.root_fd < 0:
+                return False
+            try:
+                parent_fd_info = os.fstat(self.parent_fd)
+                root_fd_info = os.fstat(self.root_fd)
+                parent_path_info = self.parent.lstat()
+                root_path_info = os.stat(
+                    self.root.name,
+                    dir_fd=self.parent_fd,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                return False
+            return (
+                self._matches(parent_fd_info, self.parent_identity, directory=True)
+                and self._matches(parent_path_info, self.parent_identity, directory=True)
+                and self._matches(root_fd_info, self.root_identity, directory=True)
+                and self._matches(root_path_info, self.root_identity, directory=True)
+            )
+
+        def _file_valid(self) -> bool:
+            if self.file_fd < 0:
+                return False
+            try:
+                held = os.fstat(self.file_fd)
+                named = os.stat(
+                    self.basename, dir_fd=self.root_fd, follow_symlinks=False
+                )
+            except OSError:
+                return False
+            return (
+                self._matches(held, self.file_identity, directory=False)
+                and self._matches(named, self.file_identity, directory=False)
+            )
+
+        def _held_directories_owned(self) -> bool:
+            if self.parent_fd < 0 or self.root_fd < 0:
+                return False
+            try:
+                parent = os.fstat(self.parent_fd)
+                root = os.fstat(self.root_fd)
+            except OSError:
+                return False
+            return (
+                stat.S_ISDIR(parent.st_mode)
+                and stat.S_ISDIR(root.st_mode)
+                and (parent.st_dev, parent.st_ino, parent.st_uid, parent.st_gid)
+                == self.parent_identity[:4]
+                and (root.st_dev, root.st_ino, root.st_uid, root.st_gid)
+                == self.root_identity[:4]
+            )
+
+        @staticmethod
+        def _directory_owned_after_child_removal(
+            info: os.stat_result,
+            identity: tuple[int, int, int, int, int, int],
+        ) -> bool:
+            return (
+                stat.S_ISDIR(info.st_mode)
+                and not stat.S_ISLNK(info.st_mode)
+                and (info.st_dev, info.st_ino, info.st_uid, info.st_gid,
+                     stat.S_IMODE(info.st_mode)) == identity[:5]
+                and info.st_nlink in {identity[5], max(1, identity[5] - 1)}
+            )
+
+        def _held_file_owned(self) -> bool:
+            if self.file_fd < 0:
+                return False
+            try:
+                held = os.fstat(self.file_fd)
+            except OSError:
+                return False
+            return (
+                stat.S_ISREG(held.st_mode)
+                and (held.st_dev, held.st_ino, held.st_uid, held.st_gid)
+                == self.file_identity[:4]
+            )
+
+        def _named_file_owned(self) -> bool:
+            try:
+                named = os.stat(
+                    self.basename, dir_fd=self.root_fd, follow_symlinks=False
+                )
+            except OSError:
+                return False
+            return (
+                stat.S_ISREG(named.st_mode)
+                and (named.st_dev, named.st_ino, named.st_uid, named.st_gid)
+                == self.file_identity[:4]
+            )
+
+        def read(self, returned_path: object, limit: int) -> bytes:
+            # The typed policy is consulted at every trust boundary.  The
+            # invocation remains restrictive if inner code rebinds it later.
+            persistence_disabled()
+            if str(returned_path) != str(self.path):
+                raise ValueError("unproved ephemeral TTS path")
+            if not self._directories_valid() or not self._file_valid():
+                raise ValueError("ephemeral TTS ownership changed")
+            if os.listdir(self.root_fd) != [self.basename]:
+                raise ValueError("unexpected ephemeral TTS artifact")
+            os.lseek(self.file_fd, 0, os.SEEK_SET)
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = os.read(self.file_fd, min(65536, limit + 1 - total))
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > limit:
+                    raise ValueError("ephemeral audio exceeds in-memory cap")
+                chunks.append(chunk)
+            if not self._directories_valid() or not self._file_valid():
+                raise ValueError("ephemeral TTS output changed during read")
+            return b"".join(chunks)
+
+        def cleanup(self) -> bool:
+            if self.closed:
+                return True
+            self.closed = True
+            persistence_disabled()
+            valid_result = False
+            remove_directories = False
+            try:
+                fully_valid = (
+                    hasattr(self, "parent_identity")
+                    and hasattr(self, "root_identity")
+                    and hasattr(self, "file_identity")
+                    and self._directories_valid()
+                    and self._file_valid()
+                    and os.listdir(self.root_fd) == [self.basename]
+                )
+                held_owned = (
+                    hasattr(self, "parent_identity")
+                    and hasattr(self, "root_identity")
+                    and self._held_directories_owned()
+                )
+                file_owned = (
+                    held_owned
+                    and hasattr(self, "file_identity")
+                    and self._held_file_owned()
+                )
+                # Scrub the exact invocation-owned inode before unlinking so a
+                # hostile hard-link created during provider execution cannot
+                # retain private audio. A replacement inode is never touched.
+                if file_owned:
+                    os.ftruncate(self.file_fd, 0)
+                    os.fsync(self.file_fd)
+                    if self._named_file_owned():
+                        os.unlink(self.basename, dir_fd=self.root_fd)
+                remaining = os.listdir(self.root_fd) if held_owned else []
+                valid_result = fully_valid and not remaining
+                remove_directories = held_owned and file_owned and not remaining
+                if (
+                    not hasattr(self, "file_identity")
+                    and held_owned
+                    and not remaining
+                ):
+                    # Constructor failed before creating the artifact; the two
+                    # exact empty directories are still wholly invocation-owned.
+                    remove_directories = True
+            except OSError:
+                valid_result = False
+                remove_directories = False
+            finally:
+                for descriptor_name in ("file_fd", "root_fd"):
+                    descriptor = getattr(self, descriptor_name, -1)
+                    if descriptor >= 0:
+                        try:
+                            os.close(descriptor)
+                        except OSError:
+                            valid_result = False
+                            remove_directories = False
+                        setattr(self, descriptor_name, -1)
+
+            if remove_directories:
+                try:
+                    current = os.stat(
+                        self.root.name,
+                        dir_fd=self.parent_fd,
+                        follow_symlinks=False,
+                    )
+                    if not self._directory_owned_after_child_removal(
+                        current, self.root_identity
+                    ):
+                        valid_result = False
+                        remove_directories = False
+                    else:
+                        os.rmdir(self.root.name, dir_fd=self.parent_fd)
+                except OSError:
+                    valid_result = False
+                    remove_directories = False
+
+            if self.parent_fd >= 0:
+                try:
+                    os.close(self.parent_fd)
+                except OSError:
+                    valid_result = False
+                    remove_directories = False
+                self.parent_fd = -1
+            if remove_directories:
+                try:
+                    current = self.parent.lstat()
+                    if not self._directory_owned_after_child_removal(
+                        current, self.parent_identity
+                    ):
+                        valid_result = False
+                        remove_directories = False
+                    else:
+                        self.parent.rmdir()
+                except OSError:
+                    valid_result = False
+                    remove_directories = False
+            return valid_result and remove_directories
+
+    owner: Optional[EphemeralOwner] = None
 
     # The wrapper already normalizes text via prepare_spoken_text; the inner
     # function should not re-normalize or truncate.
@@ -3549,18 +3533,14 @@ def _text_to_speech_single(
     platform = get_session_env("HERMES_SESSION_PLATFORM", "").lower()
     want_opus = platform in OPUS_VOICE_PLATFORMS
 
-    # Determine output path
-    if ephemeral_state is not None:
-        if not _same_identity(ephemeral_state.root, ephemeral_state.root_identity):
+    # Determine output path. Ephemeral invocations ignore caller-supplied paths
+    # and allocate exactly one private, pre-opened artifact.
+    if ephemeral:
+        try:
+            owner = EphemeralOwner()
+        except BaseException:
             return tool_error("TTS generation failed", success=False)
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        if command_provider_config is not None:
-            suffix = f".{_get_command_tts_output_format(command_provider_config)}"
-        elif want_opus and provider in {"openai", "elevenlabs", "mistral", "gemini"}:
-            suffix = ".ogg"
-        else:
-            suffix = ".mp3"
-        file_path = ephemeral_state.root / f"tts_{timestamp}{suffix}"
+        file_path = owner.path
     elif output_path:
         # Reject '..' traversal components in the user-supplied path. An
         # explicit absolute path is fine (the agent legitimately writes
@@ -3613,11 +3593,14 @@ def _text_to_speech_single(
             file_path = out_dir / f"tts_{timestamp}.mp3"
 
     # Ensure parent directory exists
-    if ephemeral_state is None:
+    if not ephemeral:
         file_path.parent.mkdir(parents=True, exist_ok=True)
     file_str = str(file_path)
+    durable_output_existed = not ephemeral and file_path.exists()
 
     try:
+        if not ephemeral and persistence_disabled():
+            return tool_error("TTS generation failed", success=False)
         # Generate audio with the configured provider
         if command_provider_config is not None:
             logger.info(
@@ -3764,13 +3747,19 @@ def _text_to_speech_single(
                              "or set up NeuTTS for local synthesis."
                 }, ensure_ascii=False)
 
+        if not ephemeral and persistence_disabled():
+            if not durable_output_existed and file_str == str(file_path):
+                try:
+                    os.unlink(file_path)
+                except OSError:
+                    pass
+            return tool_error("TTS generation failed", success=False)
+
         # Prove provider-returned paths before any repair, conversion, result,
         # or cleanup operation can trust them.
-        if ephemeral_state is not None:
+        if ephemeral:
             try:
-                if not _read_proved_ephemeral_audio(
-                    file_str, limit=_EPHEMERAL_TTS_MAX_BYTES
-                ):
+                if owner is None or not owner.read(file_str, _EPHEMERAL_TTS_MAX_BYTES):
                     raise ValueError("empty ephemeral TTS output")
             except (OSError, ValueError, TypeError):
                 return tool_error("TTS generation failed", success=False)
@@ -3786,19 +3775,15 @@ def _text_to_speech_single(
         # like Telegram render as broken 0-second voice bubbles. Sniff the
         # magic bytes once here — covering every current and future
         # provider — and transcode in place when they don't match.
-        file_str = _repair_ogg_container(file_str)
-        if ephemeral_state is not None:
-            try:
-                _read_proved_ephemeral_audio(file_str, limit=_EPHEMERAL_TTS_MAX_BYTES)
-            except (OSError, ValueError, TypeError):
-                return tool_error("TTS generation failed", success=False)
+        if not ephemeral:
+            file_str = _repair_ogg_container(file_str)
 
         # Try Opus conversion for Telegram compatibility.
         # Edge TTS outputs MP3, NeuTTS/KittenTTS output WAV. Keep those native
         # formats for local/CLI playback and only convert when the current
         # platform actually needs Opus voice delivery.
         voice_compatible = False
-        if command_provider_config is not None:
+        if not ephemeral and command_provider_config is not None:
             # Command providers are documents by default. Voice-bubble
             # delivery only kicks in when the user explicitly opts in
             # via ``voice_compatible: true`` in their provider config.
@@ -3808,7 +3793,7 @@ def _text_to_speech_single(
                     if opus_path:
                         file_str = opus_path
                 voice_compatible = file_str.endswith(".ogg")
-        elif provider not in BUILTIN_TTS_PROVIDERS:
+        elif not ephemeral and provider not in BUILTIN_TTS_PROVIDERS:
             # Plugin-registered provider (issue #30398). Voice-bubble
             # delivery opts in via ``TTSProvider.voice_compatible``
             # (mirrors the command-provider opt-in). Plugins that
@@ -3821,7 +3806,8 @@ def _text_to_speech_single(
                         file_str = opus_path
                 voice_compatible = file_str.endswith(".ogg")
         elif (
-            want_opus
+            not ephemeral
+            and want_opus
             and provider in {"edge", "neutts", "minimax", "xai", "kittentts", "piper"}
             and not file_str.endswith(".ogg")
         ):
@@ -3829,14 +3815,15 @@ def _text_to_speech_single(
             if opus_path:
                 file_str = opus_path
                 voice_compatible = True
-        elif provider in {"elevenlabs", "openai", "mistral", "gemini"}:
+        elif not ephemeral and provider in {"elevenlabs", "openai", "mistral", "gemini"}:
             voice_compatible = want_opus and file_str.endswith(".ogg")
 
-        if ephemeral_state is not None:
+        if ephemeral:
             try:
-                file_size = len(_read_proved_ephemeral_audio(
-                    file_str, limit=_EPHEMERAL_TTS_MAX_BYTES
-                ))
+                if owner is None:
+                    raise ValueError("ephemeral TTS ownership unavailable")
+                raw_audio = owner.read(file_str, _EPHEMERAL_TTS_MAX_BYTES)
+                file_size = len(raw_audio)
             except (OSError, ValueError, TypeError):
                 return tool_error("TTS generation failed", success=False)
             logger.info("TTS audio materialized in memory (%s bytes, provider: %s)", f"{file_size:,}", provider)
@@ -3844,16 +3831,16 @@ def _text_to_speech_single(
             file_size = os.path.getsize(file_str)
             logger.info("TTS audio saved: %s (%s bytes, provider: %s)", file_str, f"{file_size:,}", provider)
 
-        if ephemeral_state is not None:
-            # Keep the materialized path behind a private, one-use token.  No
-            # path or MEDIA tag is ever constructed in an ephemeral result.
-            token = uuid.uuid4().hex
-            ephemeral_state.outputs[token] = Path(file_str)
+        if ephemeral:
+            persistence_disabled()
             return json.dumps({
                 "success": True,
-                "ephemeral_audio_id": token,
+                "audio": (
+                    "data:audio/mpeg;base64,"
+                    + base64.b64encode(raw_audio).decode("ascii")
+                ),
                 "provider": provider,
-                "voice_compatible": voice_compatible,
+                "voice_compatible": False,
             }, ensure_ascii=False)
 
         # Build the durable response with MEDIA tag for platform delivery.
@@ -3870,26 +3857,29 @@ def _text_to_speech_single(
         }, ensure_ascii=False)
 
     except ValueError as e:
-        if ephemeral_state is not None:
+        if ephemeral:
             return tool_error("TTS generation failed", success=False)
         # Configuration errors (missing API keys, etc.)
         error_msg = f"TTS configuration error ({provider}): {e}"
         logger.error("%s", error_msg)
         return tool_error(error_msg, success=False)
     except FileNotFoundError as e:
-        if ephemeral_state is not None:
+        if ephemeral:
             return tool_error("TTS generation failed", success=False)
         # Missing dependencies or files
         error_msg = f"TTS dependency missing ({provider}): {e}"
         logger.error("%s", error_msg, exc_info=True)
         return tool_error(error_msg, success=False)
     except Exception as e:
-        if ephemeral_state is not None:
+        if ephemeral:
             return tool_error("TTS generation failed", success=False)
         # Unexpected errors
         error_msg = f"TTS generation failed ({provider}): {e}"
         logger.error("%s", error_msg, exc_info=True)
         return tool_error(error_msg, success=False)
+    finally:
+        if owner is not None and not owner.cleanup():
+            return tool_error("TTS generation failed", success=False)
 
 
 def text_to_speech_tool(
@@ -3929,19 +3919,7 @@ def text_to_speech_tool(
         return tool_error("Text is required", success=False)
 
     from hermes_cli.persistence import persistence_disabled
-
-    ephemeral_state = _EPHEMERAL_TTS_STATE.get()
-    if persistence_disabled() and ephemeral_state is None:
-        with _trusted_ephemeral_tts_scope():
-            return text_to_speech_tool(
-                text=text,
-                output_path=None,
-                speed=speed,
-                instructions=instructions,
-                provider=provider,
-            )
-
-    ephemeral_state = _EPHEMERAL_TTS_STATE.get()
+    ephemeral = persistence_disabled()
 
     # Normalize text via the shared cleaner: markdown, emoji, think blocks,
     # verifier footer, units, newline flattening.
@@ -3987,13 +3965,53 @@ def text_to_speech_tool(
     want_opus = platform in OPUS_VOICE_PLATFORMS
     delivery_profile = _resolve_audio_delivery_profile(platform, tts_config)
 
-    # Determine output path (single-chunk short-circuit uses the final path).
-    if ephemeral_state is not None:
-        if not _same_identity(ephemeral_state.root, ephemeral_state.root_identity):
+    # Ephemeral long-form delivery is assembled only from bounded data
+    # envelopes returned after each private single-chunk lifecycle has already
+    # cleaned its owned artifact. No path or cleanup authority crosses calls.
+    if ephemeral:
+        audio_data: List[str] = []
+        total_bytes = 0
+        chunk_results: List[Dict[str, Any]] = []
+        try:
+            for chunk in chunks:
+                persistence_disabled()
+                raw_result = _text_to_speech_single(
+                    text=chunk,
+                    output_path=None,
+                    speed=speed,
+                    instructions=instructions,
+                    provider=provider,
+                    tts_config_override=tts_config,
+                )
+                parsed = json.loads(raw_result)
+                audio = parsed.get("audio")
+                if not parsed.get("success") or not isinstance(audio, str):
+                    raise ValueError("invalid ephemeral TTS result")
+                prefix = "data:audio/mpeg;base64,"
+                if not audio.startswith(prefix):
+                    raise ValueError("invalid ephemeral TTS envelope")
+                decoded = base64.b64decode(audio[len(prefix):], validate=True)
+                total_bytes += len(decoded)
+                if total_bytes > delivery_profile.max_file_bytes:
+                    raise ValueError("ephemeral audio exceeds delivery cap")
+                persistence_disabled()
+                audio_data.append(audio)
+                chunk_results.append(parsed)
+            return json.dumps({
+                "success": True,
+                "audio": audio_data[0],
+                "audio_parts": audio_data,
+                "provider": chunk_results[0].get("provider", provider),
+                "voice_compatible": False,
+                "chunk_count": len(chunks),
+                "delivery_file_count": len(audio_data),
+                "combined_chunks": False,
+            }, ensure_ascii=False)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return tool_error("TTS generation failed", success=False)
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        base_path = ephemeral_state.root / f"tts_{timestamp}.mp3"
-    elif output_path:
+
+    # Determine output path (single-chunk short-circuit uses the final path).
+    if output_path:
         from tools.path_security import has_traversal_component
         if has_traversal_component(output_path):
             return json.dumps({
@@ -4029,8 +4047,7 @@ def text_to_speech_tool(
             base_path = out_dir / f"tts_{timestamp}.ogg"
         else:
             base_path = out_dir / f"tts_{timestamp}.mp3"
-    if ephemeral_state is None:
-        base_path.parent.mkdir(parents=True, exist_ok=True)
+    base_path.parent.mkdir(parents=True, exist_ok=True)
 
     generated_artifacts: set[str] = set()
     final_paths: List[str] = []
@@ -4061,27 +4078,13 @@ def text_to_speech_tool(
                     f"TTS chunk {index} returned invalid JSON: {str(raw_result)[:200]}"
                 )
             if not chunk_result.get("success"):
-                if ephemeral_state is not None:
-                    return tool_error("TTS generation failed", success=False)
                 error_msg = chunk_result.get("error", "unknown error")
                 return tool_error(
                     f"TTS chunk {index} failed ({provider}): {error_msg}",
                     success=False,
                 )
-            if ephemeral_state is not None:
-                try:
-                    actual_path = str(_ephemeral_result_path(chunk_result, chunk_path))
-                    if not _read_proved_ephemeral_audio(
-                        actual_path, limit=_EPHEMERAL_TTS_MAX_BYTES
-                    ):
-                        raise ValueError("empty ephemeral TTS chunk")
-                except (OSError, ValueError, TypeError) as exc:
-                    raise RuntimeError("unproved ephemeral TTS chunk") from exc
-            else:
-                actual_path = str(chunk_result.get("file_path") or chunk_path)
-            if ephemeral_state is None and (
-                not os.path.isfile(actual_path) or os.path.getsize(actual_path) <= 0
-            ):
+            actual_path = str(chunk_result.get("file_path") or chunk_path)
+            if not os.path.isfile(actual_path) or os.path.getsize(actual_path) <= 0:
                 raise RuntimeError(
                     f"TTS chunk {index} produced no final audio: {actual_path}"
                 )
@@ -4101,45 +4104,12 @@ def text_to_speech_tool(
         )
 
         for path in final_paths:
-            if ephemeral_state is not None:
-                _read_proved_ephemeral_audio(path, limit=_EPHEMERAL_TTS_MAX_BYTES)
-                logger.info("TTS audio materialized in memory (provider: %s)", provider)
-            else:
-                logger.info(
-                    "TTS audio saved: %s (%s bytes, provider: %s)",
-                    path,
-                    f"{os.path.getsize(path):,}",
-                    provider,
-                )
-        if ephemeral_state is not None:
-            audio_data = []
-            total_bytes = 0
-            for path in final_paths:
-                raw = _read_proved_ephemeral_audio(
-                    path, limit=delivery_profile.max_file_bytes
-                )
-                total_bytes += len(raw)
-                if total_bytes > delivery_profile.max_file_bytes:
-                    raise ValueError("ephemeral audio exceeds delivery cap")
-                suffix = Path(path).suffix.lower()
-                mime = {
-                    ".ogg": "audio/ogg",
-                    ".wav": "audio/wav",
-                    ".m4a": "audio/mp4",
-                }.get(suffix, "audio/mpeg")
-                audio_data.append(
-                    f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
-                )
-            return json.dumps({
-                "success": True,
-                "audio": audio_data[0],
-                "audio_parts": audio_data,
-                "provider": chunk_results[0].get("provider", provider),
-                "voice_compatible": voice_compatible,
-                "chunk_count": len(chunks),
-                "delivery_file_count": len(final_paths),
-                "combined_chunks": bool(combined_chunks),
-            }, ensure_ascii=False)
+            logger.info(
+                "TTS audio saved: %s (%s bytes, provider: %s)",
+                path,
+                f"{os.path.getsize(path):,}",
+                provider,
+            )
 
         media_tag = "\n".join(f"MEDIA:{path}" for path in final_paths)
         if voice_compatible:
@@ -4162,29 +4132,22 @@ def text_to_speech_tool(
             },
         }, ensure_ascii=False)
     except ValueError as exc:
-        if ephemeral_state is not None:
-            return tool_error("TTS delivery failed", success=False)
         error_msg = f"TTS delivery error ({provider}): {exc}"
         logger.error("%s", error_msg)
         return tool_error(error_msg, success=False)
     except Exception as exc:
-        if ephemeral_state is not None:
-            return tool_error("TTS generation failed", success=False)
         error_msg = f"TTS long-form generation failed ({provider}): {exc}"
         logger.error("%s", error_msg, exc_info=True)
         return tool_error(error_msg, success=False)
     finally:
-        if ephemeral_state is None:
-            final_absolute = {os.path.abspath(path) for path in final_paths}
-            for artifact in generated_artifacts:
-                if os.path.abspath(artifact) in final_absolute:
-                    continue
-                try:
-                    os.unlink(artifact)
-                except OSError:
-                    pass
-        # Otherwise the trusted outer scope owns cleanup through held
-        # identity.  A provider-returned string is never cleanup authority.
+        final_absolute = {os.path.abspath(path) for path in final_paths}
+        for artifact in generated_artifacts:
+            if os.path.abspath(artifact) in final_absolute:
+                continue
+            try:
+                os.unlink(artifact)
+            except OSError:
+                pass
 
 
 # ===========================================================================
