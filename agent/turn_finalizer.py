@@ -30,6 +30,7 @@ from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
+from hermes_cli.persistence import persistence_disabled
 
 
 def _assistant_row_missing_visible_text(msg: dict) -> bool:
@@ -434,7 +435,7 @@ def finalize_turn(
                     # compressor ever holds a session_db binding it would
                     # archive_and_compact the CANONICAL session rows — the
                     # exact write class _persist_disabled exists to stop.
-                    and not getattr(agent, "_persist_disabled", False)
+                    and not persistence_disabled(agent)
                 ):
                     _before = len(messages)
                     _compacted = _compressor._micro_compact(messages)

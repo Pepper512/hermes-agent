@@ -34,6 +34,43 @@ def current_persistence_policy() -> PersistencePolicy:
     return _CURRENT_POLICY.get()
 
 
+def activate_invocation_persistence_policy(policy: object) -> object:
+    """Activate a process-lifetime invocation policy during CLI bootstrap.
+
+    The CLI uses this before importing its startup graph.  The returned token
+    is intentionally opaque; one-shot processes terminate after teardown, so
+    callers must not reset it mid-invocation.
+    """
+    return _CURRENT_POLICY.set(coerce_persistence_policy(policy))
+
+
+def persistence_disabled(owner: object | None = None) -> bool:
+    """Return whether persistence is forbidden, failing closed.
+
+    ``persistence_policy`` is authoritative.  The legacy boolean may only
+    further restrict durable helper agents; it can never re-enable an
+    explicitly ephemeral agent.
+    """
+    ambient_policy = current_persistence_policy()
+    if ambient_policy is PersistencePolicy.EPHEMERAL:
+        return True
+
+    state: dict[str, object] = {}
+    if owner is not None:
+        try:
+            state = vars(owner)
+        except TypeError:
+            state = {}
+    value = state.get("persistence_policy", ambient_policy)
+    try:
+        policy = coerce_persistence_policy(value)
+    except ValueError:
+        return True
+    return policy is PersistencePolicy.EPHEMERAL or bool(
+        state.get("_persist_disabled", False) if owner is not None else False
+    )
+
+
 @contextmanager
 def bind_persistence_policy(policy: object) -> Iterator[PersistencePolicy]:
     """Bind one policy for construction, execution, and teardown."""
@@ -83,8 +120,10 @@ def validate_invocation_policy(args: object) -> PersistencePolicy:
 
 __all__ = [
     "PersistencePolicy",
+    "activate_invocation_persistence_policy",
     "bind_persistence_policy",
     "coerce_persistence_policy",
     "current_persistence_policy",
+    "persistence_disabled",
     "validate_invocation_policy",
 ]

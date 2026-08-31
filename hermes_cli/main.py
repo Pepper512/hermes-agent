@@ -74,6 +74,24 @@ suppress_platform_ver_console()
 import os
 import sys
 
+# Establish the restrictive policy before importing the CLI startup graph.
+# Full-parser registration imports many optional command modules, and some of
+# those import session-aware helpers.  Raw detection is safe because the
+# public flag is a const option and anything after ``--`` is prompt data;
+# argparse performs the authoritative closed-grammar validation later.
+_bootstrap_argv = sys.argv[1:]
+if "--" in _bootstrap_argv:
+    _bootstrap_argv = _bootstrap_argv[: _bootstrap_argv.index("--")]
+if "--ephemeral-session" in _bootstrap_argv:
+    from hermes_cli.persistence import (
+        PersistencePolicy as _BootstrapPersistencePolicy,
+        activate_invocation_persistence_policy as _activate_bootstrap_policy,
+    )
+
+    _bootstrap_persistence_token = _activate_bootstrap_policy(
+        _BootstrapPersistencePolicy.EPHEMERAL
+    )
+
 # ── Startup fast-path bootstrap ─────────────────────────────────────────
 # Two lines of inline path math so ``python hermes_cli/main.py`` (script
 # mode — sys.path[0] is hermes_cli/, not the repo root) can import the
@@ -184,52 +202,59 @@ def _run_and_exit_oneshot(
     usage_file: object = None,
     persistence_policy: object = "durable",
 ) -> None:
-    try:
-        from hermes_cli.oneshot import run_oneshot
+    from hermes_cli.persistence import (
+        PersistencePolicy,
+        bind_persistence_policy,
+        coerce_persistence_policy,
+    )
+    policy = coerce_persistence_policy(persistence_policy)
+    with bind_persistence_policy(policy):
+        try:
+            from hermes_cli.oneshot import run_oneshot
 
-        rc = run_oneshot(
-            prompt,
-            model=model,
-            provider=provider,
-            toolsets=toolsets,
-            skills=skills,
-            usage_file=usage_file,
-            persistence_policy=persistence_policy,
-        )
-    except KeyboardInterrupt:
-        rc = 130
-    except SystemExit as exc:
-        if exc.code is not None and not isinstance(exc.code, int):
-            print(exc.code, file=sys.stderr)
+            rc = run_oneshot(
+                prompt,
+                model=model,
+                provider=provider,
+                toolsets=toolsets,
+                skills=skills,
+                usage_file=usage_file,
+                persistence_policy=persistence_policy,
+            )
+        except KeyboardInterrupt:
+            rc = 130
+        except SystemExit as exc:
+            if exc.code is not None and not isinstance(exc.code, int):
+                if policy is PersistencePolicy.EPHEMERAL:
+                    print("hermes -z: agent failed", file=sys.stderr)
+                else:
+                    print(exc.code, file=sys.stderr)
+                rc = 1
+            else:
+                rc = exc.code
+        except BaseException:
+            # Defense-in-depth. ``run_oneshot`` already converts agent failures
+            # into an int return code and only re-raises KeyboardInterrupt /
+            # SystemExit (handled above). Anything still escaping here means
+            # ``run_oneshot`` itself malfunctioned. Ephemeral output remains
+            # categorical so exception text and paths cannot disclose input.
+            if policy is PersistencePolicy.EPHEMERAL:
+                print("hermes -z: agent failed", file=sys.stderr)
+            else:
+                import traceback
+
+                try:
+                    traceback.print_exc()
+                except Exception:
+                    pass
             rc = 1
-        else:
-            rc = exc.code
-    except BaseException:
-        # Defense-in-depth. ``run_oneshot`` already converts agent failures
-        # into an int return code and only re-raises KeyboardInterrupt /
-        # SystemExit (handled above). Anything still escaping here means
-        # ``run_oneshot`` itself malfunctioned — surface it on stderr but never
-        # fall through to normal interpreter teardown, which is the exact path
-        # that aborts with SIGABRT on AL2023 (the bug this routine fixes).
-        from hermes_cli.persistence import PersistencePolicy, coerce_persistence_policy
-
-        if coerce_persistence_policy(persistence_policy) is PersistencePolicy.EPHEMERAL:
-            print("hermes -z: agent failed", file=sys.stderr)
-        else:
-            import traceback
-
-            try:
-                traceback.print_exc()
-            except Exception:
-                pass
-        rc = 1
-    try:
-        _cleanup_oneshot_runtime()
-    finally:
-        # The hard exit is the safety boundary for #43055. Even an interrupt
-        # during best-effort cleanup must not fall back into interpreter
-        # finalization, where the reported native SIGABRT occurs.
-        _exit_after_oneshot(rc)
+        try:
+            _cleanup_oneshot_runtime()
+        finally:
+            # The hard exit is the safety boundary for #43055. Even an interrupt
+            # during best-effort cleanup must not fall back into interpreter
+            # finalization, where the reported native SIGABRT occurs.
+            _exit_after_oneshot(rc)
 
 
 def _project_root_str_fast() -> str:
@@ -785,16 +810,19 @@ except Exception:
 # Dashboard entrypoints bootstrap with GUI mode so gui.log is always present
 # during GUI testing, including pre-dispatch startup failures.
 try:
-    from hermes_logging import setup_logging as _setup_logging
+    from hermes_cli.persistence import persistence_disabled as _persistence_disabled
 
-    _setup_logging(
-        mode=(
-            "gui"
-            if next((arg for arg in sys.argv[1:] if not arg.startswith("-")), "")
-            in {"dashboard", "serve", "gui", "desktop"}
-            else "cli"
+    if not _persistence_disabled():
+        from hermes_logging import setup_logging as _setup_logging
+
+        _setup_logging(
+            mode=(
+                "gui"
+                if next((arg for arg in sys.argv[1:] if not arg.startswith("-")), "")
+                in {"dashboard", "serve", "gui", "desktop"}
+                else "cli"
+            )
         )
-    )
 except Exception:
     pass  # best-effort — don't crash the CLI if logging setup fails
 
@@ -12465,6 +12493,10 @@ def _plugin_cli_discovery_needed() -> bool:
     argparse setup, saving ~500-650ms per invocation for users whose
     enabled plugins don't contribute any CLI command.
     """
+    # The ephemeral surface is deliberately closed to plugin commands.  Do
+    # not import/discover plugin code merely to reject such an invocation.
+    if "--ephemeral-session" in sys.argv[1:]:
+        return False
     first = _first_positional_argv()
     if first is None:
         # Bare ``hermes`` or only flags → defaults to ``chat``.
@@ -12541,9 +12573,15 @@ def _prepare_agent_startup(args) -> None:
     # Fail closed before plugin discovery, hook registration, model access, or
     # persistence construction. Parser callers surface ValueError via
     # argparse; direct callers receive the same side-effect-free failure.
-    from hermes_cli.persistence import validate_invocation_policy
+    from hermes_cli.persistence import bind_persistence_policy, validate_invocation_policy
 
-    validate_invocation_policy(args)
+    policy = validate_invocation_policy(args)
+    with bind_persistence_policy(policy):
+        _prepare_agent_startup_bound(args)
+
+
+def _prepare_agent_startup_bound(args) -> None:
+    """Startup implementation; caller has already bound the typed policy."""
     # --yolo: chokepoint guarantee that HERMES_YOLO_MODE is set before ANY
     # plugin/tool discovery below imports tools.approval, which freezes
     # _YOLO_MODE_FROZEN at import time (PR #7994 security design).  main()'s
@@ -13164,6 +13202,31 @@ def _advertise_agent_env() -> None:
 
 
 def main():
+    """Bind the raw invocation policy before any main-path startup work.
+
+    The full parser imports many command registrations, including optional
+    plugin surfaces.  The public ephemeral flag has a closed grammar, so its
+    presence is enough to establish the restrictive policy before building
+    that parser; normal validation still supplies the authoritative parsed
+    value and rejects every unsupported combination.
+    """
+    argv_before_separator = sys.argv[1:]
+    if "--" in argv_before_separator:
+        argv_before_separator = argv_before_separator[
+            : argv_before_separator.index("--")
+        ]
+    from hermes_cli.persistence import PersistencePolicy, bind_persistence_policy
+
+    policy = (
+        PersistencePolicy.EPHEMERAL
+        if "--ephemeral-session" in argv_before_separator
+        else PersistencePolicy.DURABLE
+    )
+    with bind_persistence_policy(policy):
+        return _main_bound()
+
+
+def _main_bound():
     """Main entry point for hermes CLI."""
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
     # in ps/top/htop.  Non-fatal — just a nicer UX.

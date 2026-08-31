@@ -47,6 +47,7 @@ import queue
 import re
 import sys
 import threading
+from contextvars import copy_context
 import time
 import types
 from contextlib import contextmanager
@@ -6328,8 +6329,9 @@ def start_background_plugin_discovery() -> None:
             except Exception:
                 logger.warning("background plugin discovery failed", exc_info=True)
 
+        context = copy_context()
         _background_discovery_thread = threading.Thread(
-            target=_run, name="plugin-discovery", daemon=True
+            target=context.run, args=(_run,), name="plugin-discovery", daemon=True
         )
         _background_discovery_thread.start()
 
@@ -6349,6 +6351,10 @@ def _plugin_toolset_keys_cache_path():
 
 def _persist_plugin_toolset_keys() -> None:
     """Persist discovered plugin toolset keys + portable MCP names (best-effort)."""
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return
     try:
         import json as _json
         import os as _os
