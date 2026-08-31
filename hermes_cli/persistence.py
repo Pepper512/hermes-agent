@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
 from enum import Enum
+from threading import Lock
 from typing import Iterator
 
 
@@ -22,54 +22,59 @@ _CURRENT_POLICY: ContextVar[PersistencePolicy] = ContextVar(
 )
 
 
-@dataclass(frozen=True)
-class _ObservationState:
-    observation_id: object
-    ever_ephemeral: bool
+class _ObservationLatch:
+    __slots__ = ("__active", "__ever_ephemeral", "__lock")
+
+    def __init__(self, ever_ephemeral: bool) -> None:
+        self.__lock = Lock()
+        self.__ever_ephemeral = ever_ephemeral
+        self.__active = True
+
+    def mark_ephemeral(self) -> None:
+        with self.__lock:
+            if self.__active:
+                self.__ever_ephemeral = True
+
+    def read(self) -> bool:
+        with self.__lock:
+            if not self.__active:
+                raise RuntimeError("inactive persistence observation")
+            return self.__ever_ephemeral
+
+    def deactivate(self) -> None:
+        with self.__lock:
+            self.__active = False
 
 
-_OBSERVERS: ContextVar[tuple[_ObservationState, ...]] = ContextVar(
+_OBSERVERS: ContextVar[tuple[_ObservationLatch, ...]] = ContextVar(
     "hermes_persistence_observers",
     default=(),
 )
 
 
-def _state_for(observation_id: object) -> _ObservationState:
-    for state in _OBSERVERS.get():
-        if state.observation_id is observation_id:
-            return state
-    raise RuntimeError("inactive persistence observation")
-
-
 class PersistenceObservation:
     """Read-only view of one live persistence transaction."""
 
-    __slots__ = ("__observation_id",)
+    __slots__ = ("__latch",)
 
-    def __init__(self, observation_id: object) -> None:
-        self.__observation_id = observation_id
+    def __init__(self, latch: _ObservationLatch) -> None:
+        self.__latch = latch
 
     @property
     def current_policy(self) -> PersistencePolicy:
-        _state_for(self.__observation_id)
+        self.__latch.read()
         return current_persistence_policy()
 
     @property
     def ever_ephemeral(self) -> bool:
-        return _state_for(self.__observation_id).ever_ephemeral
+        return self.__latch.read()
 
 
 def _record_transition(policy: PersistencePolicy) -> None:
     if policy is not PersistencePolicy.EPHEMERAL:
         return
-    _OBSERVERS.set(
-        tuple(
-            replace(state, ever_ephemeral=True)
-            if not state.ever_ephemeral
-            else state
-            for state in _OBSERVERS.get()
-        )
-    )
+    for latch in _OBSERVERS.get():
+        latch.mark_ephemeral()
 
 
 def coerce_persistence_policy(value: object) -> PersistencePolicy:
@@ -141,21 +146,20 @@ def bind_persistence_policy(policy: object) -> Iterator[PersistencePolicy]:
 @contextmanager
 def observe_persistence_transaction() -> Iterator[PersistenceObservation]:
     """Observe policy transitions for one lexical transaction."""
-    observation_id = object()
-    state = _ObservationState(
-        observation_id=observation_id,
-        ever_ephemeral=current_persistence_policy() is PersistencePolicy.EPHEMERAL,
+    latch = _ObservationLatch(
+        ever_ephemeral=current_persistence_policy() is PersistencePolicy.EPHEMERAL
     )
-    _OBSERVERS.set((*_OBSERVERS.get(), state))
-    observation = PersistenceObservation(observation_id)
+    _OBSERVERS.set((*_OBSERVERS.get(), latch))
+    observation = PersistenceObservation(latch)
     try:
         yield observation
     finally:
+        latch.deactivate()
         _OBSERVERS.set(
             tuple(
                 current
                 for current in _OBSERVERS.get()
-                if current.observation_id is not observation_id
+                if current is not latch
             )
         )
 
