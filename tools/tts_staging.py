@@ -18,11 +18,41 @@ import tempfile
 from typing import Final
 
 
-_ALLOWED_FORMATS: Final[frozenset[str]] = frozenset(
-    {"mp3", "wav", "ogg", "flac", "m4a", "aac", "amr", "opus"}
-)
+_ALLOWED_FORMATS: Final[frozenset[str]] = frozenset({
+    "mp3",
+    "wav",
+    "ogg",
+    "flac",
+    "m4a",
+    "aac",
+    "amr",
+    "opus",
+})
 MAX_ANONYMOUS_AUDIO_BYTES: Final[int] = 25 * 1024 * 1024
 _MAX_SIGNATURE_BYTES: Final[int] = 64 * 1024
+_AMR_NB_FRAME_BITS: Final[tuple[int, ...]] = (
+    95,
+    103,
+    118,
+    134,
+    148,
+    159,
+    204,
+    244,
+    39,
+)
+_AMR_WB_FRAME_BITS: Final[tuple[int, ...]] = (
+    132,
+    177,
+    253,
+    285,
+    317,
+    365,
+    397,
+    461,
+    477,
+    40,
+)
 _STAGE_ERROR: Final[str] = "tts_anonymous_stage_failed"
 _UNSUPPORTED_ERROR: Final[str] = "tts_anonymous_stage_unsupported"
 _SCRUB_ERROR: Final[str] = "tts_anonymous_scrub_failed"
@@ -141,19 +171,49 @@ def _valid_format_signature(
             return False
         layer = (header[1] >> 1) & 0x03
         sample_rate_index = (header[2] >> 2) & 0x0F
-        frame_length = (
-            ((header[3] & 0x03) << 11) | (header[4] << 3) | (header[5] >> 5)
-        )
+        header_size = 7 if header[1] & 0x01 else 9
+        frame_length = ((header[3] & 0x03) << 11) | (header[4] << 3) | (header[5] >> 5)
         return (
             layer == 0
             and sample_rate_index < 0x0D
-            and 7 <= frame_length <= total_size
+            and len(header) >= header_size
+            and header_size <= frame_length <= total_size
         )
     if output_format == "amr":
-        return header.startswith(b"#!AMR\n") or header.startswith(b"#!AMR-WB\n")
+        return _valid_amr_first_frame(header)
     if output_format == "opus":
         return _valid_opus_first_page(header, total_size=total_size)
     return False
+
+
+def _valid_amr_first_frame(header: bytes) -> bool:
+    if header.startswith(b"#!AMR-WB\n"):
+        magic = b"#!AMR-WB\n"
+        frame_bits = _AMR_WB_FRAME_BITS
+    elif header.startswith(b"#!AMR\n"):
+        magic = b"#!AMR\n"
+        frame_bits = _AMR_NB_FRAME_BITS
+    else:
+        return False
+
+    if len(header) <= len(magic):
+        return False
+    frame_header = header[len(magic)]
+    if frame_header & 0x83 or not frame_header & 0x04:
+        return False
+    frame_type = (frame_header >> 3) & 0x0F
+    if frame_type >= len(frame_bits):
+        return False
+
+    payload_bits = frame_bits[frame_type]
+    payload_octets = (payload_bits + 7) // 8
+    frame_end = len(magic) + 1 + payload_octets
+    if len(header) < frame_end:
+        return False
+    unused_bits = payload_octets * 8 - payload_bits
+    if unused_bits and header[frame_end - 1] & ((1 << unused_bits) - 1):
+        return False
+    return True
 
 
 def _valid_opus_first_page(header: bytes, *, total_size: int) -> bool:
@@ -179,10 +239,27 @@ def _valid_opus_first_page(header: bytes, *, total_size: int) -> bool:
     if not packet_terminated or first_packet_size < 19:
         return False
     first_packet = header[segment_table_end : segment_table_end + first_packet_size]
-    return (
-        first_packet.startswith(b"OpusHead")
-        and first_packet[8] == 1
-        and first_packet[9] > 0
+    if not first_packet.startswith(b"OpusHead") or first_packet[8] != 1:
+        return False
+    channels = first_packet[9]
+    mapping_family = first_packet[18]
+    if mapping_family == 0:
+        return len(first_packet) == 19 and channels in (1, 2)
+    if (
+        channels == 0
+        or (mapping_family == 1 and channels > 8)
+        or len(first_packet) != 21 + channels
+    ):
+        return False
+    stream_count = first_packet[19]
+    coupled_count = first_packet[20]
+    if stream_count == 0 or coupled_count > stream_count:
+        return False
+    decoded_channels = stream_count + coupled_count
+    if decoded_channels > 255:
+        return False
+    return all(
+        mapping == 255 or mapping < decoded_channels for mapping in first_packet[21:]
     )
 
 
@@ -259,7 +336,9 @@ class AnonymousAudioStage:
         _require_host_capabilities(platform)
 
         try:
-            parent_path = Path(tempfile.gettempdir()) if parent is None else Path(parent)
+            parent_path = (
+                Path(tempfile.gettempdir()) if parent is None else Path(parent)
+            )
         except (OSError, TypeError, ValueError):
             raise AnonymousAudioStageError(_STAGE_ERROR) from None
         parent_fd = -1

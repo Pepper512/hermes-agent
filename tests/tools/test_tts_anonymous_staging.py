@@ -21,16 +21,40 @@ from tools.tts_staging import (
 )
 
 
-VALID_OPUS = (
-    b"OggS"
-    + b"\x00"
-    + b"\x02"
-    + b"\x00" * 20
-    + b"\x01"
-    + b"\x13"
-    + b"OpusHead"
-    + b"\x01\x02\x00\x00\x80\xbb\x00\x00\x00\x00\x00"
+def _opus_head(
+    *, channels: int = 2, mapping_family: int = 0, extra: bytes = b""
+) -> bytes:
+    return (
+        b"OpusHead"
+        + bytes((1, channels))
+        + b"\x00\x00"
+        + b"\x80\xbb\x00\x00"
+        + b"\x00\x00"
+        + bytes((mapping_family,))
+        + extra
+    )
+
+
+def _ogg_first_page(packet: bytes) -> bytes:
+    assert len(packet) < 255
+    return (
+        b"OggS"
+        + b"\x00"
+        + b"\x02"
+        + b"\x00" * 20
+        + b"\x01"
+        + bytes((len(packet),))
+        + packet
+    )
+
+
+VALID_OPUS = _ogg_first_page(_opus_head())
+VALID_OPUS_FAMILY_ONE = _ogg_first_page(
+    _opus_head(channels=3, mapping_family=1, extra=b"\x02\x01\x00\x02\x01")
 )
+
+VALID_AMR_NB = b"#!AMR\n" + b"\x04" + b"\x00" * 12
+VALID_AMR_WB = b"#!AMR-WB\n" + b"\x04" + b"\x00" * 17
 
 VALID_AUDIO = {
     "mp3": b"ID3\x04\x00\x00\x00\x00\x00\x00payload",
@@ -39,7 +63,7 @@ VALID_AUDIO = {
     "flac": b"fLaCpayload",
     "m4a": b"\x00\x00\x00\x18ftypM4A \x00\x00\x00\x00M4A isom",
     "aac": b"\xff\xf1\x50\x80\x00\xff\xfc",
-    "amr": b"#!AMR\npayload",
+    "amr": VALID_AMR_NB,
     "opus": VALID_OPUS,
 }
 
@@ -239,9 +263,7 @@ def test_seal_rejects_object_ack_without_invoking_provider_equality(tmp_path: Pa
 @pytest.mark.parametrize(
     "acknowledgement", ["relative.mp3", "/tmp/different.mp3", b"not-a-path", False]
 )
-def test_seal_rejects_different_returned_path(
-    tmp_path: Path, acknowledgement: object
-):
+def test_seal_rejects_different_returned_path(tmp_path: Path, acknowledgement: object):
     stage = _test_stage("mp3", 1024, tmp_path)
     try:
         _write_valid(stage)
@@ -347,10 +369,151 @@ def test_seal_rejects_invalid_format_signatures(
 def test_amr_wideband_signature_is_accepted(tmp_path: Path):
     stage = _test_stage("amr", 1024, tmp_path)
     try:
-        audio = b"#!AMR-WB\npayload"
+        audio = VALID_AMR_WB
         os.write(_sink_fd(stage), audio)
         sealed = stage.seal(None)
         assert stage.read_bounded(sealed) == audio
+    finally:
+        stage.scrub_and_close()
+
+
+@pytest.mark.parametrize(
+    ("magic", "frame_type", "payload_octets"),
+    [(b"#!AMR\n", 8, 5), (b"#!AMR-WB\n", 9, 5)],
+    ids=("narrowband-sid", "wideband-sid"),
+)
+def test_amr_sid_frame_is_accepted(
+    tmp_path: Path, magic: bytes, frame_type: int, payload_octets: int
+):
+    stage = _test_stage("amr", 1024, tmp_path)
+    try:
+        audio = magic + bytes(((frame_type << 3) | 0x04,)) + b"\x00" * payload_octets
+        os.write(_sink_fd(stage), audio)
+        sealed = stage.seal(None)
+        assert stage.read_bounded(sealed) == audio
+    finally:
+        stage.scrub_and_close()
+
+
+@pytest.mark.parametrize(
+    "invalid_aac",
+    [
+        b"\xff\xf0\x50\x80\x01\x1f\xfc\x00",
+        b"\xff\xf0\x50\x80\x00\xff\xfc\x00\x00",
+    ],
+    ids=("crc-truncated", "frame-shorter-than-crc-header"),
+)
+def test_aac_crc_header_and_frame_length_must_be_complete(
+    tmp_path: Path, invalid_aac: bytes
+):
+    stage = _test_stage("aac", 1024, tmp_path)
+    try:
+        os.write(_sink_fd(stage), invalid_aac)
+        with pytest.raises(AnonymousAudioStageError):
+            stage.seal(None)
+    finally:
+        stage.scrub_and_close()
+
+
+def test_aac_accepts_complete_crc_bearing_header(tmp_path: Path):
+    stage = _test_stage("aac", 1024, tmp_path)
+    try:
+        audio = b"\xff\xf0\x50\x80\x01\x3f\xfc\x00\x00"
+        os.write(_sink_fd(stage), audio)
+        sealed = stage.seal(None)
+        assert stage.read_bounded(sealed) == audio
+    finally:
+        stage.scrub_and_close()
+
+
+@pytest.mark.parametrize(
+    "invalid_amr",
+    [
+        b"#!AMR\n",
+        b"#!AMR-WB\n",
+        b"#!AMR\n" + b"\x4c" + b"\x00" * 12,
+        b"#!AMR-WB\n" + b"\x54" + b"\x00" * 17,
+        b"#!AMR\n" + b"\x7c",
+        b"#!AMR-WB\n" + b"\x7c",
+        VALID_AMR_NB[:-1],
+        VALID_AMR_WB[:-1],
+        b"#!AMR\n" + b"\x05" + b"\x00" * 12,
+        b"#!AMR\n" + b"\x00" + b"\x00" * 12,
+        b"#!AMR\n" + b"\x04" + b"\x00" * 11 + b"\x01",
+    ],
+    ids=(
+        "nb-magic-only",
+        "wb-magic-only",
+        "nb-reserved-frame-type",
+        "wb-reserved-frame-type",
+        "nb-no-data",
+        "wb-no-data",
+        "nb-truncated-frame",
+        "wb-truncated-frame",
+        "header-padding-bits",
+        "bad-quality-bit",
+        "payload-padding-bits",
+    ),
+)
+def test_amr_requires_one_complete_valid_octet_aligned_frame(
+    tmp_path: Path, invalid_amr: bytes
+):
+    stage = _test_stage("amr", 1024, tmp_path)
+    try:
+        os.write(_sink_fd(stage), invalid_amr)
+        with pytest.raises(AnonymousAudioStageError):
+            stage.seal(None)
+    finally:
+        stage.scrub_and_close()
+
+
+def test_opus_accepts_complete_family_one_mapping(tmp_path: Path):
+    stage = _test_stage("opus", 1024, tmp_path)
+    try:
+        os.write(_sink_fd(stage), VALID_OPUS_FAMILY_ONE)
+        sealed = stage.seal(None)
+        assert stage.read_bounded(sealed) == VALID_OPUS_FAMILY_ONE
+    finally:
+        stage.scrub_and_close()
+
+
+@pytest.mark.parametrize(
+    "packet",
+    [
+        _opus_head(channels=3),
+        _opus_head(extra=b"\x00"),
+        _opus_head(channels=3, mapping_family=1),
+        _opus_head(channels=3, mapping_family=1, extra=b"\x02\x01\x00\x02"),
+        _opus_head(channels=3, mapping_family=1, extra=b"\x00\x00\x00\x00\x00"),
+        _opus_head(channels=3, mapping_family=1, extra=b"\x01\x02\x00\x01\x02"),
+        _opus_head(channels=3, mapping_family=1, extra=b"\x02\x01\x00\x02\x03"),
+        _opus_head(
+            channels=9,
+            mapping_family=1,
+            extra=b"\x05\x04\x00\x01\x02\x03\x04\x05\x06\x07\x08",
+        ),
+        _opus_head(channels=1, mapping_family=255, extra=b"\xff\x01\x00"),
+    ],
+    ids=(
+        "family-zero-three-channels",
+        "family-zero-not-fixed-length",
+        "missing-counts-and-map",
+        "truncated-map",
+        "zero-stream-count",
+        "coupled-count-exceeds-stream-count",
+        "map-index-out-of-range",
+        "family-one-channel-count-out-of-range",
+        "decoded-channel-count-overflow",
+    ),
+)
+def test_opus_rejects_incomplete_or_inconsistent_channel_mapping(
+    tmp_path: Path, packet: bytes
+):
+    stage = _test_stage("opus", 1024, tmp_path)
+    try:
+        os.write(_sink_fd(stage), _ogg_first_page(packet))
+        with pytest.raises(AnonymousAudioStageError):
+            stage.seal(None)
     finally:
         stage.scrub_and_close()
 
