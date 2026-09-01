@@ -486,7 +486,8 @@ def _hermetic_environment(tmp_path, monkeypatch):
     #    ``Path.home() / ".hermes"`` instead of ``get_hermes_home()``
     #    is a bug to fix at the callsite.
     fake_hermes_home = tmp_path / "hermes_test"
-    fake_hermes_home.mkdir()
+    fake_hermes_home.mkdir(mode=0o700)
+    fake_hermes_home.chmod(0o700)
     (fake_hermes_home / "sessions").mkdir()
     (fake_hermes_home / "cron").mkdir()
     (fake_hermes_home / "memories").mkdir()

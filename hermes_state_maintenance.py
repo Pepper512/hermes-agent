@@ -7,10 +7,13 @@ receive an opaque shared or exclusive lease, or a fixed categorical error.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import errno
+from functools import wraps
 import math
 import os
 from pathlib import Path
+import secrets
 import stat
 import sys
 import threading
@@ -28,6 +31,14 @@ _LOCK_MODE = 0o600
 _LOCK_RECORD_PREFIX = b"HERMES_STATE_MAINTENANCE_LOCK_V1\n"
 _LOCK_RECORD_LIMIT = 160
 _LOCK_POLL_SECONDS = 0.01
+_RECOVERY_BARRIER_NAME = ".hermes-state-recovery.barrier"
+_RECOVERY_BARRIER_STAGE_PREFIX = ".hermes-state-recovery.stage."
+_RECOVERY_BARRIER_RECORD_PREFIX = b"HERMES_STATE_RECOVERY_BARRIER_V1\n"
+_RECOVERY_BARRIER_NONCE_BYTES = 64
+_RECOVERY_BARRIER_RECORD_SIZE = (
+    len(_RECOVERY_BARRIER_RECORD_PREFIX) + _RECOVERY_BARRIER_NONCE_BYTES + 1
+)
+_WRITER_LEASE_TIMEOUT_SECONDS = 60.0
 _LEASE_AUTHORITY = object()
 
 
@@ -56,6 +67,22 @@ class ProfileStateMaintenanceUnsupported(ProfileStateMaintenanceError):
     """The host lacks the required maintenance-lock semantics."""
 
     category = "profile_state_maintenance_unsupported"
+
+
+class ProfileStateRecoveryRequired(ProfileStateMaintenanceError):
+    """A durable maintenance recovery barrier blocks profile mutation."""
+
+    category = "profile_state_recovery_required"
+
+
+class UnsafeRecoveryBarrier(ProfileStateMaintenanceError):
+    """Recovery-barrier evidence was malformed, substituted, or ambiguous."""
+
+    category = "unsafe_recovery_barrier"
+
+
+class _LockInitializationInProgress(Exception):
+    """The same safe lock inode changed size while its record was initialized."""
 
 
 def _require_supported_platform(platform: str) -> None:
@@ -135,6 +162,18 @@ def _lock_identity(value: os.stat_result) -> tuple[int, ...]:
     )
 
 
+def _barrier_identity(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_uid,
+        value.st_gid,
+        stat.S_IMODE(value.st_mode),
+        value.st_nlink,
+        value.st_size,
+    )
+
+
 def _valid_profile_stat(value: os.stat_result) -> bool:
     expected_uid, _expected_gid = _current_identity()
     return (
@@ -153,6 +192,17 @@ def _valid_lock_stat(value: os.stat_result) -> bool:
         and value.st_uid == expected_uid
         and value.st_nlink == 1
         and 0 <= value.st_size <= _LOCK_RECORD_LIMIT
+    )
+
+
+def _valid_barrier_stat(value: os.stat_result) -> bool:
+    expected_uid, _expected_gid = _current_identity()
+    return (
+        stat.S_ISREG(value.st_mode)
+        and stat.S_IMODE(value.st_mode) == _LOCK_MODE
+        and value.st_uid == expected_uid
+        and value.st_nlink == 1
+        and value.st_size == _RECOVERY_BARRIER_RECORD_SIZE
     )
 
 
@@ -236,6 +286,7 @@ def _validate_lock_metadata(
     lock_fd: int,
     *,
     expected_identity: tuple[int, ...] | None = None,
+    allow_initialization_transition: bool = False,
 ) -> tuple[os.stat_result, tuple[int, ...]]:
     held = os.fstat(lock_fd)
     named = os.stat(
@@ -244,12 +295,19 @@ def _validate_lock_metadata(
         follow_symlinks=False,
     )
     held_identity = _lock_identity(held)
-    if (
-        not _valid_lock_stat(held)
-        or not _valid_lock_stat(named)
-        or held_identity != _lock_identity(named)
-        or (expected_identity is not None and held_identity != expected_identity)
-    ):
+    named_identity = _lock_identity(named)
+    if not _valid_lock_stat(held) or not _valid_lock_stat(named):
+        raise UnsafeProfileState
+    if held_identity != named_identity:
+        if (
+            allow_initialization_transition
+            and expected_identity is None
+            and held_identity[:-1] == named_identity[:-1]
+            and 0 in (held.st_size, named.st_size)
+        ):
+            raise _LockInitializationInProgress
+        raise UnsafeProfileState
+    if expected_identity is not None and held_identity != expected_identity:
         raise UnsafeProfileState
     return held, held_identity
 
@@ -374,7 +432,19 @@ def _acquire_initialized_lock(
     attempt_is_initial = True
     try:
         while True:
-            held, _ = _validate_lock_metadata(profile_fd, lock_fd)
+            try:
+                held, _ = _validate_lock_metadata(
+                    profile_fd,
+                    lock_fd,
+                    allow_initialization_transition=True,
+                )
+            except _LockInitializationInProgress:
+                attempt_is_initial = False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ProfileStateLeaseTimeout
+                time.sleep(min(_LOCK_POLL_SECONDS, remaining))
+                continue
             record_state = _read_lock_record_state(lock_fd, held)
             if record_state == "valid":
                 _wait_for_flock(
@@ -495,6 +565,374 @@ class SharedStateLease(_ProfileStateLease):
 
 class ExclusiveMaintenanceLease(_ProfileStateLease):
     """A held exclusive profile-state maintenance lease."""
+
+
+def _validate_operation_nonce(operation_nonce: str) -> str:
+    if (
+        type(operation_nonce) is not str
+        or len(operation_nonce) != _RECOVERY_BARRIER_NONCE_BYTES
+        or any(character not in "0123456789abcdef" for character in operation_nonce)
+    ):
+        raise UnsafeRecoveryBarrier
+    return operation_nonce
+
+
+def _barrier_record(operation_nonce: str) -> bytes:
+    nonce = _validate_operation_nonce(operation_nonce)
+    return _RECOVERY_BARRIER_RECORD_PREFIX + nonce.encode("ascii") + b"\n"
+
+
+def _parse_barrier_record(payload: bytes) -> str:
+    if (
+        len(payload) != _RECOVERY_BARRIER_RECORD_SIZE
+        or not payload.startswith(_RECOVERY_BARRIER_RECORD_PREFIX)
+        or not payload.endswith(b"\n")
+    ):
+        raise UnsafeRecoveryBarrier
+    nonce_bytes = payload[len(_RECOVERY_BARRIER_RECORD_PREFIX) : -1]
+    try:
+        nonce = nonce_bytes.decode("ascii")
+    except UnicodeDecodeError:
+        raise UnsafeRecoveryBarrier from None
+    return _validate_operation_nonce(nonce)
+
+
+def _validate_live_lease(
+    lease: _ProfileStateLease,
+    expected_type: type[SharedStateLease] | type[ExclusiveMaintenanceLease],
+) -> int:
+    if type(lease) is not expected_type:
+        raise UnsafeProfileState
+    profile_fd = lease._profile_fd
+    lock_fd = lease._lock_fd
+    if profile_fd < 0 or lock_fd < 0:
+        raise UnsafeProfileState
+    profile_stat = os.fstat(profile_fd)
+    if (
+        not _valid_profile_stat(profile_stat)
+        or _profile_identity(profile_stat) != lease._profile_identity
+    ):
+        raise UnsafeProfileState
+    _validate_initialized_lock(
+        profile_fd,
+        lock_fd,
+        expected_identity=lease._lock_identity,
+    )
+    return profile_fd
+
+
+def _open_recovery_barrier(profile_fd: int) -> int:
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    return os.open(_RECOVERY_BARRIER_NAME, flags, dir_fd=profile_fd)
+
+
+def _read_recovery_barrier(
+    profile_fd: int,
+) -> tuple[int, tuple[int, ...], str] | None:
+    try:
+        barrier_fd = _open_recovery_barrier(profile_fd)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise UnsafeRecoveryBarrier from None
+    try:
+        held = os.fstat(barrier_fd)
+        named = os.stat(
+            _RECOVERY_BARRIER_NAME,
+            dir_fd=profile_fd,
+            follow_symlinks=False,
+        )
+        identity = _barrier_identity(held)
+        if (
+            not _valid_barrier_stat(held)
+            or not _valid_barrier_stat(named)
+            or _barrier_identity(named) != identity
+        ):
+            raise UnsafeRecoveryBarrier
+        payload = os.pread(barrier_fd, _RECOVERY_BARRIER_RECORD_SIZE + 1, 0)
+        nonce = _parse_barrier_record(payload)
+        held_after = os.fstat(barrier_fd)
+        named_after = os.stat(
+            _RECOVERY_BARRIER_NAME,
+            dir_fd=profile_fd,
+            follow_symlinks=False,
+        )
+        if (
+            _barrier_identity(held_after) != identity
+            or _barrier_identity(named_after) != identity
+        ):
+            raise UnsafeRecoveryBarrier
+        return barrier_fd, identity, nonce
+    except ProfileStateMaintenanceError:
+        os.close(barrier_fd)
+        raise
+    except (OSError, TypeError, ValueError, OverflowError):
+        try:
+            os.close(barrier_fd)
+        except OSError:
+            pass
+        raise UnsafeRecoveryBarrier from None
+    except BaseException:
+        os.close(barrier_fd)
+        raise
+
+
+def _write_all(fd: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        try:
+            written = os.write(fd, payload[offset:])
+        except OSError as exc:
+            if exc.errno == errno.EINTR:
+                continue
+            raise
+        if written <= 0:
+            raise OSError(errno.EIO, "barrier publication failed")
+        offset += written
+
+
+def _stage_recovery_barrier(profile_fd: int, payload: bytes) -> tuple[int, str]:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    for _attempt in range(16):
+        stage_name = _RECOVERY_BARRIER_STAGE_PREFIX + secrets.token_hex(16)
+        try:
+            stage_fd = os.open(
+                stage_name,
+                flags,
+                _LOCK_MODE,
+                dir_fd=profile_fd,
+            )
+        except FileExistsError:
+            continue
+        try:
+            os.fchmod(stage_fd, _LOCK_MODE)
+            _write_all(stage_fd, payload)
+            os.fsync(stage_fd)
+            return stage_fd, stage_name
+        except BaseException:
+            os.close(stage_fd)
+            try:
+                os.unlink(stage_name, dir_fd=profile_fd)
+            except OSError:
+                pass
+            raise
+    raise UnsafeRecoveryBarrier
+
+
+def publish_recovery_barrier(
+    lease: ExclusiveMaintenanceLease,
+    operation_nonce: str,
+) -> None:
+    """Durably publish the fixed categorical recovery barrier."""
+    payload = _barrier_record(operation_nonce)
+    with lease._close_lock:
+        profile_fd = _validate_live_lease(lease, ExclusiveMaintenanceLease)
+        existing = _read_recovery_barrier(profile_fd)
+        if existing is not None:
+            existing_fd, _identity, _nonce = existing
+            os.close(existing_fd)
+            raise ProfileStateRecoveryRequired
+        stage_fd = -1
+        stage_name = ""
+        published = False
+        try:
+            stage_fd, stage_name = _stage_recovery_barrier(profile_fd, payload)
+            os.link(
+                stage_name,
+                _RECOVERY_BARRIER_NAME,
+                src_dir_fd=profile_fd,
+                dst_dir_fd=profile_fd,
+                follow_symlinks=False,
+            )
+            published = True
+            os.unlink(stage_name, dir_fd=profile_fd)
+            stage_name = ""
+            os.fsync(profile_fd)
+            barrier = _read_recovery_barrier(profile_fd)
+            if barrier is None:
+                raise UnsafeRecoveryBarrier
+            barrier_fd, _identity, nonce = barrier
+            os.close(barrier_fd)
+            if nonce != operation_nonce:
+                raise UnsafeRecoveryBarrier
+        except ProfileStateMaintenanceError:
+            raise
+        except (OSError, TypeError, ValueError, OverflowError):
+            raise UnsafeRecoveryBarrier from None
+        finally:
+            if stage_fd >= 0:
+                try:
+                    os.close(stage_fd)
+                except OSError:
+                    pass
+            if stage_name:
+                try:
+                    os.unlink(stage_name, dir_fd=profile_fd)
+                    if not published:
+                        os.fsync(profile_fd)
+                except OSError:
+                    pass
+
+
+def require_no_recovery_barrier(lease: SharedStateLease) -> None:
+    """Refuse a mutation while any durable recovery barrier is present."""
+    with lease._close_lock:
+        profile_fd = _validate_live_lease(lease, SharedStateLease)
+        barrier = _read_recovery_barrier(profile_fd)
+        if barrier is None:
+            return
+        barrier_fd, _identity, _nonce = barrier
+        os.close(barrier_fd)
+        raise ProfileStateRecoveryRequired
+
+
+def _republish_barrier_after_failed_retirement(
+    profile_fd: int,
+    payload: bytes,
+) -> None:
+    stage_fd = -1
+    stage_name = ""
+    try:
+        stage_fd, stage_name = _stage_recovery_barrier(profile_fd, payload)
+        os.link(
+            stage_name,
+            _RECOVERY_BARRIER_NAME,
+            src_dir_fd=profile_fd,
+            dst_dir_fd=profile_fd,
+            follow_symlinks=False,
+        )
+        os.unlink(stage_name, dir_fd=profile_fd)
+        stage_name = ""
+        try:
+            os.fsync(profile_fd)
+        except OSError:
+            pass
+    except OSError:
+        pass
+    finally:
+        if stage_fd >= 0:
+            try:
+                os.close(stage_fd)
+            except OSError:
+                pass
+        if stage_name:
+            try:
+                os.unlink(stage_name, dir_fd=profile_fd)
+            except OSError:
+                pass
+
+
+def retire_recovery_barrier(
+    lease: ExclusiveMaintenanceLease,
+    operation_nonce: str,
+) -> None:
+    """Durably retire only the exact nonce-bound recovery barrier."""
+    payload = _barrier_record(operation_nonce)
+    with lease._close_lock:
+        profile_fd = _validate_live_lease(lease, ExclusiveMaintenanceLease)
+        barrier = _read_recovery_barrier(profile_fd)
+        if barrier is None:
+            raise UnsafeRecoveryBarrier
+        barrier_fd, identity, nonce = barrier
+        removed = False
+        try:
+            if nonce != operation_nonce:
+                raise UnsafeRecoveryBarrier
+            held = os.fstat(barrier_fd)
+            named = os.stat(
+                _RECOVERY_BARRIER_NAME,
+                dir_fd=profile_fd,
+                follow_symlinks=False,
+            )
+            if (
+                _barrier_identity(held) != identity
+                or _barrier_identity(named) != identity
+            ):
+                raise UnsafeRecoveryBarrier
+            os.unlink(_RECOVERY_BARRIER_NAME, dir_fd=profile_fd)
+            removed = True
+            os.fsync(profile_fd)
+        except ProfileStateMaintenanceError:
+            raise
+        except (OSError, TypeError, ValueError, OverflowError):
+            if removed:
+                _republish_barrier_after_failed_retirement(profile_fd, payload)
+            raise UnsafeRecoveryBarrier from None
+        finally:
+            os.close(barrier_fd)
+
+
+@contextmanager
+def _profile_state_mutation_scope(
+    profile_roots: tuple[Path, ...],
+    *,
+    timeout_seconds: float = _WRITER_LEASE_TIMEOUT_SECONDS,
+):
+    """Hold ordered shared authority and check every profile barrier."""
+    timeout = _validate_timeout(timeout_seconds)
+    unique_roots = {os.fspath(root): root for root in profile_roots}
+    ordered_roots = tuple(
+        sorted(unique_roots.values(), key=_canonical_profile_order_key)
+    )
+    deadline = time.monotonic() + timeout
+    leases: list[SharedStateLease] = []
+    try:
+        for profile_root in ordered_roots:
+            remaining = max(0.0, deadline - time.monotonic())
+            lease = acquire_profile_state_shared(
+                profile_root,
+                timeout_seconds=remaining,
+            )
+            leases.append(lease)
+        for lease in leases:
+            require_no_recovery_barrier(lease)
+        yield
+    finally:
+        for lease in reversed(leases):
+            lease.close()
+
+
+def _leased_profile_mutation(profile_roots):
+    """Decorate one audited writer with its complete profile-lease span."""
+
+    def decorate(function):
+        @wraps(function)
+        def wrapped(*args, **kwargs):
+            roots = tuple(profile_roots(*args, **kwargs))
+            if not roots:
+                return function(*args, **kwargs)
+            with _profile_state_mutation_scope(roots):
+                return function(*args, **kwargs)
+
+        return wrapped
+
+    return decorate
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Durably publish a canonical profile-sidecar directory mutation."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    directory_fd = os.open(directory, flags)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _canonical_profile_order_key(profile_root: Path) -> tuple[str, str]:
+    """Return a deterministic resolved-path key without changing authority."""
+    _validate_profile_argument(profile_root)
+    try:
+        resolved = profile_root.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise UnsafeProfileState from None
+    return os.fspath(resolved), os.fspath(profile_root)
 
 
 def _acquire_profile_state(

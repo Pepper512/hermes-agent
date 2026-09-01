@@ -16,7 +16,8 @@ from hermes_state import SessionDB
 
 def _profile_db(home, name: str) -> SessionDB:
     profile_dir = home / "profiles" / name if name != "default" else home
-    profile_dir.mkdir(parents=True, exist_ok=True)
+    profile_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    profile_dir.chmod(0o700)
     return SessionDB(db_path=profile_dir / "state.db")
 
 

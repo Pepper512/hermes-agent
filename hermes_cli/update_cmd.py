@@ -38,6 +38,7 @@ from typing import Optional
 
 from hermes_cli.config import get_hermes_home
 from hermes_constants import venv_python_path
+from hermes_state_maintenance import _fsync_directory, _leased_profile_mutation
 
 logger = logging.getLogger(__name__)
 
@@ -1784,6 +1785,11 @@ def _write_gateway_update_exit_code(ok: bool) -> None:
         pass
 
 
+@_leased_profile_mutation(
+    lambda state_path, _snap_state: (
+        (state_path.parent,) if state_path.name == "state.db" else ()
+    )
+)
 def _restore_state_db_from_snapshot(state_path: Path, snap_state: Path) -> bool:
     """Replace *state_path* with the snapshot image at *snap_state*.
 
@@ -1815,6 +1821,7 @@ def _restore_state_db_from_snapshot(state_path: Path, snap_state: Path) -> bool:
         return False
     _clear_stale_sqlite_sidecars(state_path)
     shutil.copy2(snap_state, state_path)
+    _fsync_directory(state_path.parent)
     restored = verify_sqlite_integrity(
         state_path, check_header=True, run_pragma=True
     )

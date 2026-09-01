@@ -65,6 +65,7 @@ from types import SimpleNamespace
 
 from hermes_constants import get_hermes_home
 from hermes_cli.persistence import persistence_disabled
+from hermes_state_maintenance import _fsync_directory, _leased_profile_mutation
 
 
 def _launch_cwd_for_session(source: str) -> Optional[str]:
@@ -3207,6 +3208,14 @@ class AIAgent:
             return redacted
         return content
 
+    @_leased_profile_mutation(
+        lambda self, messages=None: (
+            ()
+            if persistence_disabled(self)
+            or not getattr(self, "_session_json_enabled", False)
+            else (Path(self.logs_dir).parent,)
+        )
+    )
     def _save_session_log(self, messages: List[Dict[str, Any]] = None):
         """Optional per-session JSON snapshot writer.
 
@@ -3297,6 +3306,7 @@ class AIAgent:
                 indent=2,
                 default=str,
             )
+            _fsync_directory(self.logs_dir)
 
         except Exception as e:
             if self.verbose_logging:

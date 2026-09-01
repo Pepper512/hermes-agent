@@ -1,5 +1,6 @@
 """Tests for gateway session management."""
 import json
+import os
 import pytest
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -602,6 +603,7 @@ class TestSlackWorkspaceSessionIsolation:
         scoped_key = build_session_key(source)
         legacy_key = build_session_key(replace(source, scope_id=None, guild_id=None))
         store._db = MagicMock()
+        store._db.db_path = Path(os.environ["HERMES_HOME"]) / "state.db"
         store._db.find_latest_gateway_session_for_peer.side_effect = [
             None,
             {
@@ -1642,5 +1644,3 @@ class TestGatewayRoutingTable:
         recovered = restarted.get_or_create_session(self._source())
         assert recovered.session_id == entry.session_id
         restarted._db.close()
-
-

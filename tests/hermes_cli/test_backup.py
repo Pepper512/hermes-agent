@@ -55,6 +55,12 @@ def _advance_backup_clock(seconds: float = 1.1) -> None:
     shim._offset += _dt.timedelta(seconds=seconds)
 
 
+def _make_profile_root(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.chmod(0o700)
+    return path
+
+
 def _make_hermes_tree(root: Path) -> None:
     """Create a realistic ~/.hermes directory structure for testing."""
     (root / "config.yaml").write_text("model:\n  provider: openrouter\n")
@@ -171,7 +177,7 @@ class TestBackup:
         filesystem (dir=out_path.parent), NOT the system /tmp default — a
         small tmpfs there silently drops large DBs from the backup (#35376)."""
         hermes_home = tmp_path / ".hermes"
-        hermes_home.mkdir()
+        _make_profile_root(hermes_home)
         _make_hermes_tree(hermes_home)
 
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -259,7 +265,7 @@ class TestBackup:
         by the full backup — each snapshot already holds a copy of state.db, so
         nesting them multiplies the archive by (1 + retained snapshots)."""
         hermes_home = tmp_path / ".hermes"
-        hermes_home.mkdir()
+        _make_profile_root(hermes_home)
         _make_hermes_tree(hermes_home)
         with sqlite3.connect(hermes_home / "state.db") as conn:
             conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
@@ -1196,7 +1202,7 @@ class TestQuickSnapshot:
     def hermes_home(self, tmp_path):
         """Create a fake HERMES_HOME with critical state files."""
         home = tmp_path / ".hermes"
-        home.mkdir()
+        _make_profile_root(home)
         (home / "config.yaml").write_text("model:\n  provider: openrouter\n")
         (home / ".env").write_text("OPENROUTER_API_KEY=test-key-123\n")
         (home / "auth.json").write_text('{"providers": {}}\n')
@@ -1506,7 +1512,7 @@ class TestPreUpdateBackup:
     @pytest.fixture
     def hermes_home(self, tmp_path):
         root = tmp_path / ".hermes"
-        root.mkdir()
+        _make_profile_root(root)
         _make_hermes_tree(root)
         return root
 
@@ -1789,7 +1795,7 @@ class TestRestoreCronJobsIfEmptied:
 
 class TestMemoryProviderExternalPaths:
     def _make_min_tree(self, hermes_home: Path) -> None:
-        hermes_home.mkdir(parents=True, exist_ok=True)
+        _make_profile_root(hermes_home)
         (hermes_home / "config.yaml").write_text("model:\n  provider: openrouter\n")
         (hermes_home / ".env").write_text("OPENROUTER_API_KEY=sk-test\n")
         (hermes_home / "state.db").write_bytes(b"x")
@@ -1850,7 +1856,5 @@ class TestMemoryProviderExternalPaths:
         assert (restored.stat().st_mode & 0o777) == 0o600
         # External state did NOT leak into HERMES_HOME.
         assert not (hermes_home / "_external").exists()
-
-
 
 

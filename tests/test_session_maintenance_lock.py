@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -71,6 +72,42 @@ else:
     lease.close()
     print("acquired", flush=True)
 """
+_PUBLISH_BARRIER_SCRIPT = r"""
+import os
+import sys
+from pathlib import Path
+
+import hermes_state_maintenance as maintenance
+
+lease = maintenance.acquire_profile_state_exclusive(
+    Path(sys.argv[1]), timeout_seconds=5.0
+)
+maintenance.publish_recovery_barrier(lease, sys.argv[2])
+print("published", flush=True)
+os._exit(0)
+"""
+_BARRIER_STRESS_SCRIPT = r"""
+import os
+import sys
+from pathlib import Path
+
+import hermes_state_maintenance as maintenance
+from hermes_state import SessionDB
+
+blocked_path = Path(sys.argv[1]) / "state.db"
+open_path = Path(sys.argv[2]) / "state.db"
+try:
+    SessionDB(blocked_path)
+except maintenance.ProfileStateMaintenanceError as exc:
+    category = exc.category
+else:
+    category = "unexpected_write_authority"
+
+db = SessionDB(open_path)
+db.set_meta(f"stress-{os.getpid()}", "ok")
+db.close()
+print(f"{category}:unrelated_ok", flush=True)
+"""
 
 
 def _profile(tmp_path: Path, name: str = "profile") -> Path:
@@ -82,6 +119,14 @@ def _profile(tmp_path: Path, name: str = "profile") -> Path:
 
 def _lock_path(profile: Path) -> Path:
     return profile / maintenance._PROFILE_STATE_LOCK_NAME
+
+
+def _barrier_path(profile: Path) -> Path:
+    return profile / maintenance._RECOVERY_BARRIER_NAME
+
+
+def _operation_nonce(character: str = "a") -> str:
+    return character * 64
 
 
 def _read_line(process: subprocess.Popen[str], timeout_seconds: float = 5.0) -> str:
@@ -287,6 +332,765 @@ def test_lease_context_manager_releases_authority(tmp_path):
     exclusive.close()
 
 
+def test_published_recovery_barrier_blocks_later_same_profile_writer(tmp_path):
+    profile = _profile(tmp_path, "do-not-disclose")
+    with maintenance.acquire_profile_state_exclusive(
+        profile, timeout_seconds=1.0
+    ) as exclusive:
+        maintenance.publish_recovery_barrier(exclusive, _operation_nonce())
+
+    with maintenance.acquire_profile_state_shared(
+        profile, timeout_seconds=1.0
+    ) as shared:
+        with pytest.raises(maintenance.ProfileStateRecoveryRequired) as exc_info:
+            maintenance.require_no_recovery_barrier(shared)
+
+    _assert_categorical(
+        exc_info.value,
+        category="profile_state_recovery_required",
+        profile=profile,
+    )
+
+
+def test_recovery_barrier_retires_only_with_exact_nonce(tmp_path):
+    profile = _profile(tmp_path, "do-not-disclose")
+    with maintenance.acquire_profile_state_exclusive(
+        profile, timeout_seconds=1.0
+    ) as exclusive:
+        maintenance.publish_recovery_barrier(exclusive, _operation_nonce("a"))
+        with pytest.raises(maintenance.UnsafeRecoveryBarrier):
+            maintenance.retire_recovery_barrier(exclusive, _operation_nonce("b"))
+        assert _barrier_path(profile).exists()
+        maintenance.retire_recovery_barrier(exclusive, _operation_nonce("a"))
+
+    assert not _barrier_path(profile).exists()
+    with maintenance.acquire_profile_state_shared(
+        profile, timeout_seconds=1.0
+    ) as shared:
+        maintenance.require_no_recovery_barrier(shared)
+
+
+@pytest.mark.require_symlinks
+def test_recovery_barrier_symlink_is_rejected(tmp_path):
+    profile = _profile(tmp_path)
+    with maintenance.acquire_profile_state_shared(
+        profile, timeout_seconds=1.0
+    ) as shared:
+        target = profile / "other"
+        _write_private_file(target, b"not-authority")
+        _barrier_path(profile).symlink_to(target.name)
+        with pytest.raises(maintenance.UnsafeRecoveryBarrier):
+            maintenance.require_no_recovery_barrier(shared)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"HERMES_STATE_RECOVERY_BARRIER_V2\n" + b"a" * 64 + b"\n",
+        b"HERMES_STATE_RECOVERY_BARRIER_V1\n" + b"g" * 64 + b"\n",
+    ],
+)
+def test_recovery_barrier_rejects_wrong_schema_or_nonce(payload, tmp_path):
+    profile = _profile(tmp_path)
+    with maintenance.acquire_profile_state_shared(
+        profile, timeout_seconds=1.0
+    ) as shared:
+        _write_private_file(_barrier_path(profile), payload)
+        with pytest.raises(maintenance.UnsafeRecoveryBarrier):
+            maintenance.require_no_recovery_barrier(shared)
+
+
+def test_recovery_barrier_replacement_during_check_is_rejected(tmp_path, monkeypatch):
+    profile = _profile(tmp_path)
+    nonce = _operation_nonce()
+    with maintenance.acquire_profile_state_exclusive(
+        profile, timeout_seconds=1.0
+    ) as exclusive:
+        maintenance.publish_recovery_barrier(exclusive, nonce)
+    payload = _barrier_path(profile).read_bytes()
+    shared = maintenance.acquire_profile_state_shared(profile, timeout_seconds=1.0)
+    real_stat = maintenance.os.stat
+    replaced = False
+
+    def replace_before_named_stat(path, *args, **kwargs):
+        nonlocal replaced
+        if path == maintenance._RECOVERY_BARRIER_NAME and not replaced:
+            replaced = True
+            _barrier_path(profile).rename(profile / "retired-barrier")
+            _write_private_file(_barrier_path(profile), payload)
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(maintenance.os, "stat", replace_before_named_stat)
+    try:
+        with pytest.raises(maintenance.UnsafeRecoveryBarrier):
+            maintenance.require_no_recovery_barrier(shared)
+    finally:
+        shared.close()
+
+
+def test_recovery_barrier_disappearance_during_check_is_categorical(
+    tmp_path, monkeypatch
+):
+    profile = _profile(tmp_path)
+    with maintenance.acquire_profile_state_exclusive(
+        profile, timeout_seconds=1.0
+    ) as exclusive:
+        maintenance.publish_recovery_barrier(exclusive, _operation_nonce())
+    shared = maintenance.acquire_profile_state_shared(profile, timeout_seconds=1.0)
+    real_stat = maintenance.os.stat
+    disappeared = False
+
+    def disappear_before_named_stat(path, *args, **kwargs):
+        nonlocal disappeared
+        if path == maintenance._RECOVERY_BARRIER_NAME and not disappeared:
+            disappeared = True
+            _barrier_path(profile).unlink()
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(maintenance.os, "stat", disappear_before_named_stat)
+    try:
+        with pytest.raises(maintenance.UnsafeRecoveryBarrier) as exc_info:
+            maintenance.require_no_recovery_barrier(shared)
+    finally:
+        shared.close()
+
+    _assert_categorical(
+        exc_info.value,
+        category="unsafe_recovery_barrier",
+        profile=profile,
+    )
+
+
+def test_recovery_barrier_persists_after_publisher_process_death(tmp_path):
+    profile = _profile(tmp_path)
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            _PUBLISH_BARRIER_SCRIPT,
+            os.fspath(profile),
+            _operation_nonce(),
+        ],
+        cwd=_REPOSITORY_ROOT,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert _read_line(process) == "published"
+    process.wait(timeout=5.0)
+    assert process.returncode == 0
+
+    with maintenance.acquire_profile_state_shared(
+        profile, timeout_seconds=1.0
+    ) as shared:
+        with pytest.raises(maintenance.ProfileStateRecoveryRequired):
+            maintenance.require_no_recovery_barrier(shared)
+
+
+def test_recovery_barrier_file_fsync_failure_does_not_publish(tmp_path, monkeypatch):
+    profile = _profile(tmp_path)
+    exclusive = maintenance.acquire_profile_state_exclusive(
+        profile, timeout_seconds=1.0
+    )
+    real_fsync = maintenance.os.fsync
+
+    def fail_file_fsync(fd: int) -> None:
+        if stat.S_ISREG(os.fstat(fd).st_mode) and fd != exclusive._lock_fd:
+            raise OSError(errno.EIO, "synthetic file durability failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(maintenance.os, "fsync", fail_file_fsync)
+    try:
+        with pytest.raises(maintenance.UnsafeRecoveryBarrier):
+            maintenance.publish_recovery_barrier(exclusive, _operation_nonce())
+    finally:
+        exclusive.close()
+    assert not _barrier_path(profile).exists()
+
+
+def test_recovery_barrier_directory_fsync_failure_stays_blocking(tmp_path, monkeypatch):
+    profile = _profile(tmp_path)
+    exclusive = maintenance.acquire_profile_state_exclusive(
+        profile, timeout_seconds=1.0
+    )
+    real_fsync = maintenance.os.fsync
+
+    def fail_directory_fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.EIO, "synthetic directory durability failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(maintenance.os, "fsync", fail_directory_fsync)
+    try:
+        with pytest.raises(maintenance.UnsafeRecoveryBarrier):
+            maintenance.publish_recovery_barrier(exclusive, _operation_nonce())
+    finally:
+        exclusive.close()
+    assert _barrier_path(profile).exists()
+
+
+def test_recovery_barrier_retirement_identity_mismatch_keeps_barrier(
+    tmp_path, monkeypatch
+):
+    profile = _profile(tmp_path)
+    nonce = _operation_nonce()
+    exclusive = maintenance.acquire_profile_state_exclusive(
+        profile, timeout_seconds=1.0
+    )
+    maintenance.publish_recovery_barrier(exclusive, nonce)
+    payload = _barrier_path(profile).read_bytes()
+    real_stat = maintenance.os.stat
+    replaced = False
+
+    def replace_before_named_stat(path, *args, **kwargs):
+        nonlocal replaced
+        if path == maintenance._RECOVERY_BARRIER_NAME and not replaced:
+            replaced = True
+            _barrier_path(profile).rename(profile / "retired-barrier")
+            _write_private_file(_barrier_path(profile), payload)
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(maintenance.os, "stat", replace_before_named_stat)
+    try:
+        with pytest.raises(maintenance.UnsafeRecoveryBarrier):
+            maintenance.retire_recovery_barrier(exclusive, nonce)
+    finally:
+        exclusive.close()
+    assert _barrier_path(profile).exists()
+
+
+def test_recovery_barrier_authority_is_lease_typed_and_profile_scoped(tmp_path):
+    blocked = _profile(tmp_path, "blocked")
+    unrelated = _profile(tmp_path, "unrelated")
+    with maintenance.acquire_profile_state_exclusive(
+        blocked, timeout_seconds=1.0
+    ) as exclusive:
+        maintenance.publish_recovery_barrier(exclusive, _operation_nonce())
+        with pytest.raises(maintenance.UnsafeProfileState):
+            maintenance.require_no_recovery_barrier(exclusive)
+
+    with maintenance.acquire_profile_state_shared(
+        blocked, timeout_seconds=1.0
+    ) as shared:
+        with pytest.raises(maintenance.UnsafeProfileState):
+            maintenance.publish_recovery_barrier(shared, _operation_nonce())
+        with pytest.raises(maintenance.UnsafeProfileState):
+            maintenance.retire_recovery_barrier(shared, _operation_nonce())
+
+    with maintenance.acquire_profile_state_shared(
+        unrelated, timeout_seconds=1.0
+    ) as unrelated_shared:
+        maintenance.require_no_recovery_barrier(unrelated_shared)
+    assert not _barrier_path(unrelated).exists()
+
+
+def test_already_open_sessiondb_rechecks_barrier_before_each_later_mutation(
+    tmp_path,
+):
+    from hermes_state import SessionDB
+
+    profile = _profile(tmp_path)
+    db = SessionDB(profile / "state.db")
+    try:
+        db.set_meta("synthetic-key", "before")
+        with maintenance.acquire_profile_state_exclusive(
+            profile, timeout_seconds=1.0
+        ) as exclusive:
+            maintenance.publish_recovery_barrier(exclusive, _operation_nonce())
+
+        assert db.get_meta("synthetic-key") == "before"
+        with pytest.raises(maintenance.ProfileStateRecoveryRequired):
+            db.set_meta("synthetic-key", "blocked")
+        assert db.get_meta("synthetic-key") == "before"
+
+        with maintenance.acquire_profile_state_exclusive(
+            profile, timeout_seconds=1.0
+        ) as exclusive:
+            maintenance.retire_recovery_barrier(exclusive, _operation_nonce())
+        db.set_meta("synthetic-key", "after")
+        assert db.get_meta("synthetic-key") == "after"
+    finally:
+        db.close()
+
+
+def test_sessiondb_writable_open_refuses_before_database_creation(tmp_path):
+    from hermes_state import SessionDB
+
+    profile = _profile(tmp_path)
+    with maintenance.acquire_profile_state_exclusive(
+        profile, timeout_seconds=1.0
+    ) as exclusive:
+        maintenance.publish_recovery_barrier(exclusive, _operation_nonce())
+
+    with pytest.raises(maintenance.ProfileStateRecoveryRequired):
+        SessionDB(profile / "state.db")
+    assert not (profile / "state.db").exists()
+
+    with maintenance.acquire_profile_state_exclusive(
+        profile, timeout_seconds=1.0
+    ) as exclusive:
+        maintenance.retire_recovery_barrier(exclusive, _operation_nonce())
+
+
+@pytest.mark.parametrize(
+    "writer",
+    [
+        lambda db: db._try_wal_checkpoint(),
+        lambda db: db.optimize_fts(),
+        lambda db: db.rebuild_fts(),
+        lambda db: db._merge_fts_incrementally(max_pages=1, max_commands=1),
+        lambda db: db.optimize_fts_storage(),
+        lambda db: db.vacuum(),
+        lambda db: db.purge_stale_tool_call_markers(backup=False),
+        lambda db: db.maybe_auto_prune_and_vacuum(vacuum=False),
+    ],
+    ids=[
+        "checkpoint",
+        "fts-optimize",
+        "fts-rebuild",
+        "fts-merge",
+        "fts-storage",
+        "vacuum",
+        "marker-purge",
+        "auto-prune",
+    ],
+)
+def test_direct_sessiondb_maintenance_writer_refuses_active_barrier(tmp_path, writer):
+    from hermes_state import SessionDB
+
+    profile = _profile(tmp_path)
+    db = SessionDB(profile / "state.db")
+    try:
+        with maintenance.acquire_profile_state_exclusive(
+            profile, timeout_seconds=1.0
+        ) as exclusive:
+            maintenance.publish_recovery_barrier(exclusive, _operation_nonce())
+        with pytest.raises(maintenance.ProfileStateRecoveryRequired):
+            writer(db)
+        with maintenance.acquire_profile_state_exclusive(
+            profile, timeout_seconds=1.0
+        ) as exclusive:
+            maintenance.retire_recovery_barrier(exclusive, _operation_nonce())
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "writer_name",
+    [
+        "preflight_db_writability",
+        "_db_opens_cleanly",
+        "_live_writer_holds_db",
+        "repair_state_db_schema",
+        "quarantine_zeroed_state_db",
+    ],
+)
+def test_direct_state_repair_writer_refuses_active_barrier(tmp_path, writer_name):
+    import hermes_state
+
+    profile = _profile(tmp_path)
+    db = hermes_state.SessionDB(profile / "state.db")
+    db.close()
+    with maintenance.acquire_profile_state_exclusive(
+        profile, timeout_seconds=1.0
+    ) as exclusive:
+        maintenance.publish_recovery_barrier(exclusive, _operation_nonce())
+    writer = getattr(hermes_state, writer_name)
+    with pytest.raises(maintenance.ProfileStateRecoveryRequired):
+        writer(profile / "state.db")
+    with maintenance.acquire_profile_state_exclusive(
+        profile, timeout_seconds=1.0
+    ) as exclusive:
+        maintenance.retire_recovery_barrier(exclusive, _operation_nonce())
+
+
+@pytest.mark.parametrize(
+    "writer_name",
+    [
+        "flush_pending_to_file",
+        "spool_dropped_transcript_message",
+        "flush_agent_history_to_file",
+    ],
+)
+def test_shutdown_spool_writer_refuses_active_barrier(
+    tmp_path, monkeypatch, writer_name
+):
+    from gateway import shutdown_flush
+
+    profile = _profile(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", os.fspath(profile))
+    with maintenance.acquire_profile_state_exclusive(
+        profile, timeout_seconds=1.0
+    ) as exclusive:
+        maintenance.publish_recovery_barrier(exclusive, _operation_nonce())
+
+    writer = getattr(shutdown_flush, writer_name)
+    with pytest.raises(maintenance.ProfileStateRecoveryRequired):
+        if writer_name == "flush_pending_to_file":
+            writer({"synthetic": "value"})
+        elif writer_name == "spool_dropped_transcript_message":
+            writer("synthetic", {"role": "user", "content": "value"})
+        else:
+            writer("synthetic", [{"role": "user", "content": "value"}])
+    assert not (profile / "pending_messages").exists()
+
+
+def test_session_mirror_writer_refuses_active_fixed_profile_barrier(tmp_path):
+    from gateway.session import SessionStore
+
+    profile = _profile(tmp_path)
+    sessions_dir = profile / "sessions"
+    sessions_dir.mkdir(mode=0o700)
+    store = object.__new__(SessionStore)
+    store.sessions_dir = sessions_dir
+    with maintenance.acquire_profile_state_exclusive(
+        profile, timeout_seconds=1.0
+    ) as exclusive:
+        maintenance.publish_recovery_barrier(exclusive, _operation_nonce())
+
+    with pytest.raises(maintenance.ProfileStateRecoveryRequired):
+        store._save_sessions_json({})
+    assert not (sessions_dir / "sessions.json").exists()
+
+
+@pytest.mark.parametrize("operation", ["load", "persist"])
+def test_gateway_routing_writer_checks_dynamic_database_profile(
+    tmp_path, monkeypatch, operation
+):
+    from gateway.session import SessionStore
+
+    fixed_parent = tmp_path / "fixed"
+    dynamic_parent = tmp_path / "dynamic"
+    fixed_parent.mkdir()
+    dynamic_parent.mkdir()
+    fixed_profile = _profile(fixed_parent)
+    dynamic_profile = _profile(dynamic_parent)
+    monkeypatch.setenv("HERMES_HOME", os.fspath(fixed_profile))
+    store = object.__new__(SessionStore)
+    store.sessions_dir = fixed_profile / "sessions"
+    store._db = SimpleNamespace(db_path=dynamic_profile / "state.db")
+    store._loaded = False
+    with maintenance.acquire_profile_state_exclusive(
+        dynamic_profile, timeout_seconds=1.0
+    ) as exclusive:
+        maintenance.publish_recovery_barrier(exclusive, _operation_nonce())
+
+    with pytest.raises(maintenance.ProfileStateRecoveryRequired):
+        if operation == "load":
+            store._ensure_loaded_locked()
+        else:
+            store._persist_routing_data({}, 1)
+    assert not store.sessions_dir.exists()
+
+
+def test_gateway_profile_resolution_requires_explicit_database_path(tmp_path):
+    from gateway.session import _session_store_profile_roots
+
+    profile = _profile(tmp_path)
+    store = SimpleNamespace(
+        sessions_dir=profile / "sessions",
+        _db=SimpleNamespace(),
+    )
+
+    with pytest.raises(AttributeError):
+        _session_store_profile_roots(store)
+
+
+def test_gateway_profile_resolution_without_database_uses_fixed_profile(tmp_path):
+    from gateway.session import _session_store_profile_roots
+
+    profile = _profile(tmp_path)
+    store = SimpleNamespace(
+        sessions_dir=profile / "sessions",
+        _db=None,
+    )
+
+    assert _session_store_profile_roots(store) == (profile,)
+
+
+def test_multi_profile_mutation_scope_uses_canonical_resolved_path_order(
+    tmp_path, monkeypatch
+):
+    real_parent = tmp_path / "real"
+    real_parent.mkdir()
+    first_profile = _profile(real_parent, "a-profile")
+    second_profile = _profile(real_parent, "b-profile")
+    alias_parent = tmp_path / "alias"
+    alias_parent.symlink_to(real_parent, target_is_directory=True)
+    aliased_second_profile = alias_parent / second_profile.name
+    acquired: list[Path] = []
+
+    class SyntheticLease:
+        def close(self) -> None:
+            return None
+
+    def acquire(profile_root: Path, *, timeout_seconds: float):
+        assert timeout_seconds >= 0
+        acquired.append(profile_root)
+        return SyntheticLease()
+
+    monkeypatch.setattr(maintenance, "acquire_profile_state_shared", acquire)
+    monkeypatch.setattr(
+        maintenance,
+        "require_no_recovery_barrier",
+        lambda _lease: None,
+    )
+
+    with maintenance._profile_state_mutation_scope((
+        aliased_second_profile,
+        first_profile,
+    )):
+        pass
+
+    assert acquired == [first_profile, aliased_second_profile]
+
+
+@pytest.mark.parametrize("operation", ["drain", "recover"])
+def test_shutdown_recovery_writer_checks_supplied_database_profile(
+    tmp_path, monkeypatch, operation
+):
+    from gateway import shutdown_flush
+
+    spool_parent = tmp_path / "spool"
+    database_parent = tmp_path / "database"
+    spool_parent.mkdir()
+    database_parent.mkdir()
+    spool_profile = _profile(spool_parent)
+    database_profile = _profile(database_parent)
+    monkeypatch.setenv("HERMES_HOME", os.fspath(spool_profile))
+    with maintenance.acquire_profile_state_exclusive(
+        database_profile, timeout_seconds=1.0
+    ) as exclusive:
+        maintenance.publish_recovery_barrier(exclusive, _operation_nonce())
+
+    with pytest.raises(maintenance.ProfileStateRecoveryRequired):
+        if operation == "drain":
+            shutdown_flush.drain_transcript_spool(
+                "synthetic",
+                lambda _message: None,
+                replay_profile_root=database_profile,
+            )
+        else:
+            shutdown_flush.recover_pending_to_db(
+                SimpleNamespace(db_path=database_profile / "state.db")
+            )
+    assert not (spool_profile / "pending_messages").exists()
+
+
+def test_request_dump_writer_refuses_active_barrier(tmp_path):
+    from agent.agent_runtime_helpers import dump_api_request_debug
+
+    profile = _profile(tmp_path)
+    logs_dir = profile / "sessions"
+    logs_dir.mkdir(mode=0o700)
+    agent = SimpleNamespace(
+        _persist_disabled=False,
+        persistence_policy="durable",
+        logs_dir=logs_dir,
+        client=SimpleNamespace(api_key="synthetic"),
+        session_id="synthetic",
+        base_url="https://invalid.test",
+        api_mode="chat_completions",
+        log_prefix="",
+        verbose_logging=False,
+        _mask_api_key_for_logs=lambda _value: "masked",
+        _vprint=lambda _value: None,
+    )
+    with maintenance.acquire_profile_state_exclusive(
+        profile, timeout_seconds=1.0
+    ) as exclusive:
+        maintenance.publish_recovery_barrier(exclusive, _operation_nonce())
+
+    with pytest.raises(maintenance.ProfileStateRecoveryRequired):
+        dump_api_request_debug(
+            agent,
+            {"messages": []},
+            reason="synthetic",
+        )
+    assert list(logs_dir.iterdir()) == []
+
+
+def test_durable_agent_initialization_refuses_active_barrier(tmp_path, monkeypatch):
+    from agent import agent_init
+    from run_agent import AIAgent
+
+    profile = _profile(tmp_path)
+    agent = object.__new__(AIAgent)
+    agent._base_url = ""
+    agent._base_url_lower = ""
+    agent._base_url_hostname = ""
+    monkeypatch.setattr(agent_init, "get_hermes_home", lambda: profile)
+    with maintenance.acquire_profile_state_exclusive(
+        profile, timeout_seconds=1.0
+    ) as exclusive:
+        maintenance.publish_recovery_barrier(exclusive, _operation_nonce())
+
+    with (
+        patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(None, None),
+        ),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch(
+            "agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()
+        ),
+        patch("agent.anthropic_adapter.resolve_anthropic_token", return_value=""),
+        patch("agent.anthropic_adapter._is_oauth_token", return_value=False),
+        patch("agent.azure_identity_adapter.is_token_provider", return_value=False),
+        patch(
+            "hermes_cli.model_normalize.normalize_model_for_provider",
+            return_value="synthetic",
+        ),
+        patch("agent.credential_pool.load_pool", return_value=MagicMock()),
+        patch("hermes_cli.config.load_config", return_value={}),
+        patch("hermes_cli.config.get_compatible_custom_providers", return_value=[]),
+        patch("hermes_cli.plugins.discover_plugins"),
+        patch("agent.iteration_budget.IterationBudget"),
+        patch("hermes_cli.config.cfg_get", return_value=None),
+    ):
+        with pytest.raises(maintenance.ProfileStateRecoveryRequired):
+            agent_init.init_agent(
+                agent,
+                base_url="https://api.anthropic.com",
+                api_key="synthetic",
+                model="synthetic",
+                skip_context_files=True,
+                skip_memory=True,
+                quiet_mode=True,
+            )
+    assert not (profile / "sessions").exists()
+
+
+def test_optional_session_snapshot_writer_refuses_active_barrier(tmp_path):
+    from run_agent import AIAgent
+
+    profile = _profile(tmp_path)
+    logs_dir = profile / "sessions"
+    logs_dir.mkdir(mode=0o700)
+    agent = SimpleNamespace(
+        _persist_disabled=False,
+        persistence_policy="durable",
+        _session_json_enabled=True,
+        _session_messages=[],
+        session_id="synthetic",
+        logs_dir=logs_dir,
+        model="synthetic",
+        base_url="https://invalid.test",
+        platform="test",
+        session_start=__import__("datetime").datetime.now(),
+        _cached_system_prompt="",
+        tools=[],
+        verbose_logging=False,
+        _clean_session_content=lambda value: value,
+        _redact_message_content=lambda value: value,
+    )
+    with maintenance.acquire_profile_state_exclusive(
+        profile, timeout_seconds=1.0
+    ) as exclusive:
+        maintenance.publish_recovery_barrier(exclusive, _operation_nonce())
+
+    with pytest.raises(maintenance.ProfileStateRecoveryRequired):
+        AIAgent._save_session_log(
+            agent,
+            messages=[{"role": "user", "content": "value"}],
+        )
+    assert list(logs_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize("operation", ["copy", "restore"])
+def test_snapshot_database_writer_refuses_active_barrier(tmp_path, operation):
+    from hermes_cli.backup import _safe_copy_db, _safe_restore_db
+    from hermes_state import SessionDB
+
+    profile = _profile(tmp_path)
+    state_path = profile / "state.db"
+    db = SessionDB(state_path)
+    db.close()
+    snapshot = tmp_path / "snapshot.db"
+    assert _safe_copy_db(state_path, snapshot)
+    with maintenance.acquire_profile_state_exclusive(
+        profile, timeout_seconds=1.0
+    ) as exclusive:
+        maintenance.publish_recovery_barrier(exclusive, _operation_nonce())
+
+    with pytest.raises(maintenance.ProfileStateRecoveryRequired):
+        if operation == "copy":
+            _safe_copy_db(state_path, tmp_path / "second.db")
+        else:
+            _safe_restore_db(snapshot, state_path)
+
+
+def test_update_restore_writer_refuses_active_barrier(tmp_path, monkeypatch):
+    from hermes_cli import update_cmd
+
+    profile = _profile(tmp_path)
+    state_path = profile / "state.db"
+    state_path.write_bytes(b"synthetic-current")
+    snapshot = tmp_path / "snapshot.db"
+    snapshot.write_bytes(b"synthetic-snapshot")
+    monkeypatch.setattr(update_cmd, "_foreign_db_holder_pids", None, raising=False)
+    with maintenance.acquire_profile_state_exclusive(
+        profile, timeout_seconds=1.0
+    ) as exclusive:
+        maintenance.publish_recovery_barrier(exclusive, _operation_nonce())
+
+    with pytest.raises(maintenance.ProfileStateRecoveryRequired):
+        update_cmd._restore_state_db_from_snapshot(state_path, snapshot)
+    assert state_path.read_bytes() == b"synthetic-current"
+
+
+def test_cross_process_barrier_stress_is_profile_scoped(tmp_path):
+    from hermes_state import SessionDB
+
+    blocked_profile = _profile(tmp_path, "blocked")
+    open_profile = _profile(tmp_path, "open")
+    for profile in (blocked_profile, open_profile):
+        db = SessionDB(profile / "state.db")
+        db.close()
+    with maintenance.acquire_profile_state_exclusive(
+        blocked_profile, timeout_seconds=1.0
+    ) as exclusive:
+        maintenance.publish_recovery_barrier(exclusive, _operation_nonce())
+
+    processes = [
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                _BARRIER_STRESS_SCRIPT,
+                os.fspath(blocked_profile),
+                os.fspath(open_profile),
+            ],
+            cwd=_REPOSITORY_ROOT,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _index in range(8)
+    ]
+    try:
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=15.0)
+            assert process.returncode == 0, stderr
+            assert stdout.strip() == "profile_state_recovery_required:unrelated_ok"
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5.0)
+
+    db = SessionDB(open_profile / "state.db", read_only=True)
+    try:
+        rows = db._conn.execute(
+            "SELECT COUNT(*) FROM state_meta WHERE key LIKE 'stress-%'"
+        ).fetchone()[0]
+    finally:
+        db.close()
+    assert rows == len(processes)
+
+
 def test_inflight_shared_holder_delays_exclusive_acquisition(tmp_path):
     profile = _profile(tmp_path)
     shared = maintenance.acquire_profile_state_shared(profile, timeout_seconds=1.0)
@@ -407,6 +1211,43 @@ def test_empty_lock_initializer_does_not_retry_at_monotonic_deadline(
 
     assert attempts == 1
     assert _lock_path(profile).stat().st_size == 0
+
+
+def test_same_inode_lock_initialization_size_transition_is_retried(
+    tmp_path, monkeypatch
+):
+    profile = _profile(tmp_path)
+    _write_private_file(_lock_path(profile))
+    real_stat = maintenance.os.stat
+    injected_transition = False
+
+    def stat_during_initialization(path, *args, **kwargs):
+        nonlocal injected_transition
+        value = real_stat(path, *args, **kwargs)
+        if path == maintenance._PROFILE_STATE_LOCK_NAME and not injected_transition:
+            injected_transition = True
+            fields = list(value)
+            fields[6] = 1
+            return os.stat_result(fields)
+        return value
+
+    monkeypatch.setattr(maintenance.os, "stat", stat_during_initialization)
+    monkeypatch.setattr(
+        maintenance.os,
+        "supports_dir_fd",
+        maintenance.os.supports_dir_fd | {stat_during_initialization},
+    )
+    monkeypatch.setattr(
+        maintenance.os,
+        "supports_follow_symlinks",
+        maintenance.os.supports_follow_symlinks | {stat_during_initialization},
+    )
+
+    lease = maintenance.acquire_profile_state_shared(profile, timeout_seconds=1.0)
+    lease.close()
+
+    assert injected_transition is True
+    assert _lock_path(profile).read_bytes().startswith(maintenance._LOCK_RECORD_PREFIX)
 
 
 def test_repeated_eintr_cannot_retry_flock_past_deadline(tmp_path, monkeypatch):

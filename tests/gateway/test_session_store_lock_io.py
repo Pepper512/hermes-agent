@@ -9,9 +9,11 @@ These tests assert those three I/O calls are invoked *outside* the lock.
 They follow the mock-DB idiom from ``test_session_store_runtime_stale_guard``.
 """
 import json
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -74,6 +76,7 @@ def _make_store(tmp_path, db_mock=None) -> SessionStore:
     with patch("gateway.session.SessionStore._ensure_loaded"):
         store = SessionStore(sessions_dir=tmp_path, config=config)
     if db_mock is not None:
+        db_mock.db_path = Path(os.environ["HERMES_HOME"]) / "state.db"
         store._db = db_mock
     store._loaded = True
     store._lock = _TrackedLock()
@@ -252,5 +255,4 @@ def test_auto_reset_does_not_recover_session_being_ended(tmp_path):
         old.session_id, "suspended"
     )
     db.end_session.assert_not_called()
-
 

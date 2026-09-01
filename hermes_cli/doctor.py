@@ -35,6 +35,10 @@ from hermes_cli.colors import Colors, color
 from hermes_cli.models import _HERMES_USER_AGENT
 from hermes_cli.vercel_auth import describe_vercel_auth
 from hermes_constants import OPENROUTER_MODELS_URL
+from hermes_state_maintenance import (
+    ProfileStateMaintenanceError,
+    _profile_state_mutation_scope,
+)
 from utils import base_url_host_matches
 
 
@@ -2182,9 +2186,12 @@ def run_doctor(args):
                 )
                 if should_fix:
                     import sqlite3
-                    conn = sqlite3.connect(str(state_db_path))
-                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                    conn.close()
+                    with _profile_state_mutation_scope((hermes_home,)):
+                        conn = sqlite3.connect(str(state_db_path))
+                        try:
+                            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                        finally:
+                            conn.close()
                     new_size = wal_path.stat().st_size if wal_path.exists() else 0
                     check_ok(f"WAL checkpoint performed ({wal_size // 1024}K → {new_size // 1024}K)")
                     fixed_count += 1
@@ -2192,6 +2199,8 @@ def run_doctor(args):
                     issues.append("Large WAL file — run 'hermes doctor --fix' to checkpoint")
             elif wal_size > 10 * 1024 * 1024:  # 10 MB
                 check_info(f"WAL file is {wal_size // (1024*1024)} MB (normal for active sessions)")
+        except ProfileStateMaintenanceError:
+            raise
         except Exception:
             pass
 

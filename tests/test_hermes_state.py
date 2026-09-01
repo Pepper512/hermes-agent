@@ -5208,7 +5208,8 @@ class TestPerformancePragmasEndToEnd:
             lambda version_info=None: False,
         )
         home = tmp_path / "hermes_home"
-        home.mkdir()
+        home.mkdir(mode=0o700)
+        home.chmod(0o700)
         monkeypatch.setenv("HERMES_HOME", str(home))
         if config_text is not None:
             (home / "config.yaml").write_text(config_text)

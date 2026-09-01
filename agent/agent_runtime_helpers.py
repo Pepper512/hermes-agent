@@ -49,6 +49,7 @@ from agent.credential_pool import (
 )
 from agent.error_classifier import FailoverReason
 from agent.turn_context import drop_stale_api_content
+from hermes_state_maintenance import _fsync_directory, _leased_profile_mutation
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -2051,6 +2052,15 @@ def extract_reasoning(agent, assistant_message) -> Optional[str]:
 
 
 
+def _request_dump_profile_roots(agent, *_args, **_kwargs) -> tuple[Path, ...]:
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled(agent):
+        return ()
+    return (Path(agent.logs_dir).parent,)
+
+
+@_leased_profile_mutation(_request_dump_profile_roots)
 def dump_api_request_debug(
     agent,
     api_kwargs: Dict[str, Any],
@@ -2137,6 +2147,7 @@ def dump_api_request_debug(
         _serialized = json.dumps(dump_payload, ensure_ascii=False, indent=2, default=str)
         _redacted_payload = json.loads(redact_sensitive_text(_serialized, force=True))
         atomic_json_write(dump_file, _redacted_payload, default=str)
+        _fsync_directory(agent.logs_dir)
 
         agent._vprint(f"{agent.log_prefix}🧾 Request debug dump written to: {dump_file}")
 

@@ -85,6 +85,7 @@ def test_recover_inserts_via_append_message_and_deletes_file(tmp_path, monkeypat
     flush_file.write_text(json.dumps(payload), encoding="utf-8")
 
     mock_db = MagicMock()
+    mock_db.db_path = Path(os.environ["HERMES_HOME"]) / "state.db"
     count = recover_pending_to_db(mock_db)
 
     assert count == 1
@@ -166,5 +167,4 @@ def test_get_flush_dir_uses_get_hermes_home(tmp_path, monkeypatch):
     result = mod._get_flush_dir()
     assert captured.get("called") is True
     assert result == tmp_path / "pending_messages"
-
 

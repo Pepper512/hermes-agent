@@ -38,7 +38,8 @@ pytestmark = [
 def hermes_home(tmp_path, monkeypatch):
     """Isolated HERMES_HOME so the repair scope covers tmp DBs."""
     home = tmp_path / ".hermes"
-    home.mkdir()
+    home.mkdir(mode=0o700)
+    home.chmod(0o700)
     monkeypatch.setenv("HERMES_HOME", str(home))
     return home
 
@@ -176,7 +177,8 @@ class TestSessionDBIntegration:
         self, hermes_home, tmp_path
     ):
         outside = tmp_path / "custom-loc"
-        outside.mkdir()
+        outside.mkdir(mode=0o700)
+        outside.chmod(0o700)
         db_path = outside / "state.db"
         first = SessionDB(db_path)
         first.close()

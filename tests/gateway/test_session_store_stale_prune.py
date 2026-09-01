@@ -48,6 +48,7 @@ def _make_store_with_db(tmp_path, db_mock) -> SessionStore:
     config = GatewayConfig(default_reset_policy=SessionResetPolicy(mode="none"))
     with patch("gateway.session.SessionStore._ensure_loaded"):
         store = SessionStore(sessions_dir=tmp_path, config=config)
+    db_mock.db_path = tmp_path.parent / "state.db"
     store._db = db_mock
     store._loaded = True
     return store
@@ -248,6 +249,7 @@ class TestStartupRecoveryResetPolicy:
         )
         with patch("gateway.session.SessionStore._ensure_loaded"):
             store = SessionStore(sessions_dir=tmp_path, config=config)
+        db.db_path = tmp_path.parent / "state.db"
         store._db = db
         store._loaded = True
         store._entries[key] = _make_entry_with_origin(key, "sid_parent")
@@ -298,9 +300,9 @@ class TestEnsureLoadedCallsPrune:
         db = _db_returning({"sid_stale": {"end_reason": "agent_close", "id": "sid_stale"}})
         config = GatewayConfig(default_reset_policy=SessionResetPolicy(mode="none"))
         store = SessionStore(sessions_dir=tmp_path, config=config)
+        db.db_path = tmp_path.parent / "state.db"
         store._db = db
 
         store._ensure_loaded()
 
         assert "dm_key" not in store._entries
-

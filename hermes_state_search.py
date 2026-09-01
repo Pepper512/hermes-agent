@@ -29,6 +29,7 @@ from hermes_state_common import (
     escape_like as _escape_like,
     fts_rebuild_admission,
 )
+from hermes_state_maintenance import _leased_profile_mutation
 
 # Moved methods logged under the "hermes_state" logger before the split;
 # keep that logger identity so log filtering/capture behavior is unchanged.
@@ -433,6 +434,7 @@ class SessionSearchMixin:
         self._fts_cjk_available = True
         logger.info("CJK FTS index backfill complete — serving CJK search.")
 
+    @_leased_profile_mutation(lambda self: (self.db_path.parent,))
     def _fts_cjk_reset_if_stale(self) -> None:
         """Rebuild path for a stale cjk index (triggers were dropped).
 
@@ -677,6 +679,7 @@ class SessionSearchMixin:
             # finished or never needed). Re-run seeds markers and backfills.
             return self._fts_external_index_empty_with_messages(self._conn)
 
+    @_leased_profile_mutation(lambda self: (self.db_path.parent,))
     def _demote_legacy_fts_to_trash(self) -> int:
         """Demote the legacy inline FTS vtables and stage their shadow tables
         for chunked teardown. Returns MAX(messages.id) as the rebuild high
@@ -745,6 +748,7 @@ class SessionSearchMixin:
             self._conn.commit()
         return hw
 
+    @_leased_profile_mutation(lambda self, *_args, **_kwargs: (self.db_path.parent,))
     def optimize_fts_storage(
         self,
         *,
@@ -2352,6 +2356,7 @@ class SessionSearchMixin:
             # teardown) — in every case the table is not queryable.
             return False
 
+    @_leased_profile_mutation(lambda self: (self.db_path.parent,))
     def optimize_fts(self) -> int:
         """Merge fragmented FTS5 b-tree segments into one per index.
 
@@ -2391,6 +2396,7 @@ class SessionSearchMixin:
                     )
         return optimized
 
+    @_leased_profile_mutation(lambda self: (self.db_path.parent,))
     def rebuild_fts(self) -> int:
         """Rebuild FTS5 indexes from the canonical ``messages`` table.
 
@@ -2438,6 +2444,7 @@ class SessionSearchMixin:
                         )
         return rebuilt
 
+    @_leased_profile_mutation(lambda self, *_args, **_kwargs: (self.db_path.parent,))
     def _merge_fts_incrementally(
         self, *, max_pages: int, max_commands: Optional[int] = None
     ) -> int:

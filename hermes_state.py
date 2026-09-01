@@ -96,6 +96,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_schema import SessionSchemaMixin
 from hermes_state_search import SessionSearchMixin
+from hermes_state_maintenance import _fsync_directory, _leased_profile_mutation
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
     import psutil
@@ -106,6 +107,21 @@ logger = logging.getLogger(__name__)
 
 MAX_SAFE_RESUME_MESSAGES = 20_000
 MAX_SAFE_EXPORT_MESSAGES = 20_000
+
+
+def _sessiondb_profile_roots(
+    session_db: "SessionDB",
+    sessions_dir: Optional[Path] = None,
+) -> tuple[Path, ...]:
+    roots = [session_db.db_path.parent]
+    if sessions_dir is not None:
+        roots.append(sessions_dir.parent)
+    return tuple(roots)
+
+
+def _state_db_profile_roots(db_path: Path | str) -> tuple[Path, ...]:
+    path = Path(db_path)
+    return (path.parent,) if path.name == "state.db" else ()
 
 
 def _configured_transcript_limit(key: str, fallback: int) -> int:
@@ -2730,6 +2746,7 @@ def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
         return None, f"backup copy failed: {exc}"
 
 
+@_leased_profile_mutation(lambda db_path, **_kwargs: _state_db_profile_roots(db_path))
 def preflight_db_writability(
     db_path: Path,
     *,
@@ -3007,6 +3024,7 @@ def _copy_database_snapshot(
             source.close()
 
 
+@_leased_profile_mutation(lambda db_path: _state_db_profile_roots(db_path))
 def _db_opens_cleanly(db_path: Path) -> Optional[str]:
     """Probe a DB on a fresh connection. Returns None if healthy, else a reason.
 
@@ -3133,6 +3151,7 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         conn.close()
 
 
+@_leased_profile_mutation(lambda db_path: _state_db_profile_roots(db_path))
 def _live_writer_holds_db(db_path: Path) -> bool:
     """True when a connection outside this call still holds ``db_path`` open.
 
@@ -3187,6 +3206,7 @@ def _live_writer_holds_db(db_path: Path) -> bool:
                 pass
 
 
+@_leased_profile_mutation(lambda db_path, **_kwargs: _state_db_profile_roots(db_path))
 def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, Any]:
     """Repair a state.db whose ``sqlite_master`` schema is malformed or whose
     FTS indexes reject writes.
@@ -3380,6 +3400,7 @@ def _restore_journal_mode_after_repair(db_path: Path, before_mode: Optional[str]
         )
 
 
+@_leased_profile_mutation(lambda db_path, **_kwargs: _state_db_profile_roots(db_path))
 def _repair_state_db_schema_locked(
     db_path: Path, *, backup: bool, report: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -3964,6 +3985,7 @@ def is_zeroed_state_db(
     return all(byte == 0 for byte in head)
 
 
+@_leased_profile_mutation(lambda path: _state_db_profile_roots(path))
 def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
     """Move a zeroed state.db aside (preserve bytes) and return quarantine path.
 
@@ -4511,6 +4533,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except Exception:
             logger.debug("Could not close a SessionDB connection", exc_info=True)
 
+    @_leased_profile_mutation(
+        lambda _self, db_path=None, read_only=False: (
+            () if read_only else ((db_path or _default_db_path()).parent,)
+        )
+    )
     def __init__(self, db_path: Path = None, read_only: bool = False):
         self.db_path = db_path or _default_db_path()
         # Fail hard (before any connection/pragma/mkdir) if a pytest-context
@@ -5249,6 +5276,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._warn_fts5_unavailable(exc)
             return False
 
+    @_leased_profile_mutation(lambda self, *_args, **_kwargs: (self.db_path.parent,))
     def _execute_write(
         self,
         fn: Callable[[sqlite3.Connection], T],
@@ -5655,6 +5683,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         )
         return True
 
+    @_leased_profile_mutation(lambda self, *_args, **_kwargs: (self.db_path.parent,))
     def _enter_fts_fail_open(self, exc: sqlite3.DatabaseError) -> bool:
         """Detach corrupt FTS indexes so canonical writes can continue.
 
@@ -5712,6 +5741,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         )
         return True
 
+    @_leased_profile_mutation(lambda self, *_args, **_kwargs: (self.db_path.parent,))
     def _try_wal_checkpoint(self) -> None:
         """Best-effort PASSIVE WAL checkpoint.  Never raises.
 
@@ -5780,6 +5810,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self.close()
         return False
 
+    @_leased_profile_mutation(
+        lambda self, *_args, **_kwargs: (
+            () if self.read_only else (self.db_path.parent,)
+        )
+    )
     def close(self):
         """Close the database connection.
 
@@ -13476,6 +13511,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     pass
         except OSError:
             pass
+        try:
+            _fsync_directory(sessions_dir)
+        except OSError:
+            pass
 
     def get_session_delete_targets(self, session_id: str) -> List[str]:
         """Return every session row that :meth:`delete_session` would remove.
@@ -13494,6 +13533,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             delegate_ids = _collect_delegate_child_ids(self._conn, [session_id])
         return [session_id, *sorted(delegate_ids)]
 
+    @_leased_profile_mutation(
+        lambda self, _session_id, sessions_dir=None, **_kwargs: (
+            _sessiondb_profile_roots(self, sessions_dir)
+        )
+    )
     def delete_session(
         self,
         session_id: str,
@@ -13553,6 +13597,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._remove_session_files(sessions_dir, session_id)
         return bool(deleted)
 
+    @_leased_profile_mutation(
+        lambda self, _session_id, sessions_dir=None: (
+            _sessiondb_profile_roots(self, sessions_dir)
+        )
+    )
     def delete_session_if_empty(
         self,
         session_id: str,
@@ -13597,6 +13646,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._remove_session_files(sessions_dir, session_id)
         return bool(deleted)
 
+    @_leased_profile_mutation(
+        lambda self, _session_ids, sessions_dir=None: (
+            _sessiondb_profile_roots(self, sessions_dir)
+        )
+    )
     def delete_sessions(
         self,
         session_ids: List[str],
@@ -13726,6 +13780,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             return cursor.fetchone()[0]
 
+    @_leased_profile_mutation(
+        lambda self, sessions_dir=None: _sessiondb_profile_roots(self, sessions_dir)
+    )
     def delete_empty_sessions(
         self,
         sessions_dir: Optional[Path] = None,
@@ -14105,6 +14162,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self.set_session_archived(sid, True)
         return len(ids)
 
+    @_leased_profile_mutation(
+        lambda self, older_than_days=90, source=None, sessions_dir=None, **_filters: (
+            _sessiondb_profile_roots(self, sessions_dir)
+        )
+    )
     def prune_sessions(
         self,
         older_than_days: Optional[float] = 90,
@@ -14182,6 +14244,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._remove_session_files(sessions_dir, sid)
         return count
 
+    @_leased_profile_mutation(
+        lambda self, *, dry_run=False, backup=True: (
+            () if dry_run else (self.db_path.parent,)
+        )
+    )
     def purge_stale_tool_call_markers(
         self, *, dry_run: bool = False, backup: bool = True
     ) -> Dict[str, Any]:
@@ -14925,6 +14992,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             logger.debug("Could not read logical DB size: %s", exc)
             return None
 
+    @_leased_profile_mutation(lambda self: (self.db_path.parent,))
     def vacuum(self) -> int:
         """Run VACUUM to reclaim disk space after large deletes.
 
@@ -14978,6 +15046,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 logger.debug("WAL checkpoint (TRUNCATE) after VACUUM failed: %s", exc)
         return optimized
 
+    @_leased_profile_mutation(
+        lambda self, retention_days=90, min_interval_hours=24, vacuum=True,
+        sessions_dir=None, min_vacuum_interval_days=30: (
+            _sessiondb_profile_roots(self, sessions_dir)
+        )
+    )
     def maybe_auto_prune_and_vacuum(
         self,
         retention_days: int = 90,

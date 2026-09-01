@@ -33,7 +33,8 @@ def test_session_store_default_db_uses_runtime_hermes_home(tmp_path, monkeypatch
     """
     config = GatewayConfig(default_reset_policy=SessionResetPolicy(mode="none"))
     fake_home = tmp_path / "alt_hermes_home"
-    fake_home.mkdir()
+    fake_home.mkdir(mode=0o700)
+    fake_home.chmod(0o700)
     monkeypatch.setenv("HERMES_HOME", str(fake_home))
 
     with patch("gateway.session.SessionStore._ensure_loaded"):
@@ -258,4 +259,3 @@ class TestReadmeSentinel:
         # The note points users at the real store and command.
         assert "state.db" in raw["_README"]
         assert "hermes sessions list" in raw["_README"]
-

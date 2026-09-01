@@ -52,6 +52,7 @@ from hermes_cli.config import cfg_get
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.timeouts import get_provider_request_timeout
 from hermes_constants import get_hermes_home
+from hermes_state_maintenance import _fsync_directory, _profile_state_mutation_scope
 from utils import base_url_host_matches, is_truthy_value
 
 # Use the same logger name as run_agent so tests patching ``run_agent.logger``
@@ -1719,9 +1720,13 @@ def init_agent(
 
     # Session logs go into ~/.hermes/sessions/ alongside gateway sessions
     hermes_home = get_hermes_home()
-    agent.logs_dir = hermes_home / "sessions"
-    if not ephemeral_session:
-        agent.logs_dir.mkdir(parents=True, exist_ok=True)
+    if ephemeral_session:
+        agent.logs_dir = hermes_home / "sessions"
+    else:
+        with _profile_state_mutation_scope((hermes_home,)):
+            agent.logs_dir = hermes_home / "sessions"
+            agent.logs_dir.mkdir(parents=True, exist_ok=True)
+            _fsync_directory(hermes_home)
     # Per-session JSON snapshot writer (~/.hermes/sessions/session_{sid}.json)
     # is opt-in via sessions.write_json_snapshots (default False).  state.db
     # is canonical — the snapshot is only useful for external tooling that

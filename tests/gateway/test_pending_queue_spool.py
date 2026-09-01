@@ -9,6 +9,7 @@ successful transcript flush — not silently discarded (#78182, #82616).
 import json
 import logging
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -29,9 +30,10 @@ def _make_store(db):
 class BrokenThenHealedDb:
     """append_message fails while ``broken`` is True, then records rows."""
 
-    def __init__(self):
+    def __init__(self, profile_root: Path):
         self.broken = True
         self.rows = []
+        self.db_path = profile_root / "state.db"
 
     def append_message(self, **kwargs):
         if self.broken:
@@ -59,7 +61,7 @@ class TestSpoolOnDrop:
     def test_drop_spool_drain_roundtrip(self, spool_home, caplog, monkeypatch):
         # Small cap so the test stays fast.
         monkeypatch.setattr(SessionStore, "_MAX_PENDING_PER_SESSION", 5)
-        db = BrokenThenHealedDb()
+        db = BrokenThenHealedDb(spool_home)
         store = _make_store(db)
 
         n_extra = 3
@@ -112,7 +114,7 @@ class TestSpoolOnDrop:
 
     def test_drain_only_touches_own_session(self, spool_home, monkeypatch):
         monkeypatch.setattr(SessionStore, "_MAX_PENDING_PER_SESSION", 3)
-        db = BrokenThenHealedDb()
+        db = BrokenThenHealedDb(spool_home)
         store = _make_store(db)
 
         for i in range(SessionStore._MAX_PENDING_PER_SESSION + 1):
@@ -145,7 +147,7 @@ class TestSpoolOnDrop:
 
         monkeypatch.setattr(shutdown_flush, "_get_flush_dir", _boom)
 
-        db = BrokenThenHealedDb()
+        db = BrokenThenHealedDb(spool_home)
         store = _make_store(db)
 
         with caplog.at_level(logging.WARNING, logger="gateway.session"):
@@ -171,7 +173,7 @@ class TestSpoolOnDrop:
     def test_replay_failure_keeps_spool_files(self, spool_home, monkeypatch):
         """A failed replay must preserve the spool files for a later retry."""
         monkeypatch.setattr(SessionStore, "_MAX_PENDING_PER_SESSION", 3)
-        db = BrokenThenHealedDb()
+        db = BrokenThenHealedDb(spool_home)
         store = _make_store(db)
 
         for i in range(SessionStore._MAX_PENDING_PER_SESSION + 2):
@@ -185,7 +187,7 @@ class TestSpoolOnDrop:
                     raise RuntimeError("still broken for replays")
                 self.rows.append(kwargs)
 
-        flaky = FlakyDb()
+        flaky = FlakyDb(spool_home)
         flaky.broken = False
         store._db = flaky
         # This append pushes pending over the cap again (dropping/spooling

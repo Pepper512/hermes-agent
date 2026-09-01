@@ -44,8 +44,10 @@ def multiplex_homes(tmp_path, monkeypatch):
 
     root = tmp_path / "hermes"
     profile = root / "profiles" / "fitness"
-    root.mkdir(parents=True)
-    profile.mkdir(parents=True)
+    root.mkdir(parents=True, mode=0o700)
+    root.chmod(0o700)
+    profile.mkdir(parents=True, mode=0o700)
+    profile.chmod(0o700)
     monkeypatch.setenv("HERMES_HOME", str(root))
 
     # The suite-wide fixture in conftest re-points ``hermes_state.DEFAULT_DB_PATH``

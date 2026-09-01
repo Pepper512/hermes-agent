@@ -96,6 +96,15 @@ from .whatsapp_identity import (
 )
 from utils import atomic_replace
 from agent.turn_context import extract_api_content_sidecar
+from hermes_state_maintenance import _fsync_directory, _leased_profile_mutation
+
+
+def _session_store_profile_roots(store) -> tuple[Path, ...]:
+    fixed_profile = Path(store.sessions_dir).parent
+    database = store._db
+    if database is None:
+        return (fixed_profile,)
+    return (fixed_profile, Path(database.db_path).parent)
 
 # Session keys/ids flow into filesystem paths downstream (e.g.
 # ``sessions_dir / f"{session_id}.json"`` in hermes_state, request-dump
@@ -1451,6 +1460,7 @@ class SessionStore:
         except Exception:
             return str(self.sessions_dir)
 
+    @_leased_profile_mutation(lambda self: _session_store_profile_roots(self))
     def _ensure_loaded_locked(self) -> None:
         """Load the routing index. Must be called with self._lock held.
 
@@ -1723,6 +1733,9 @@ class SessionStore:
             self._next_routing_generation_locked(),
         )
 
+    @_leased_profile_mutation(
+        lambda self, _data, _generation: _session_store_profile_roots(self)
+    )
     def _persist_routing_data(self, data: Dict[str, Any], generation: int) -> None:
         """Serialize all whole-index writers through one durable write lock."""
         save_lock = getattr(self, "_save_lock", None)
@@ -1780,6 +1793,7 @@ class SessionStore:
                 ]:
                     del fast_persisted[key]
 
+    @_leased_profile_mutation(lambda self, _data: (Path(self.sessions_dir).parent,))
     def _save_sessions_json(self, data: Dict[str, Any]) -> None:
         """Write the legacy sessions.json mirror of the routing index."""
         import tempfile
@@ -1813,6 +1827,7 @@ class SessionStore:
                 f.flush()
                 os.fsync(f.fileno())
             atomic_replace(tmp_path, sessions_file)
+            _fsync_directory(self.sessions_dir)
         except BaseException:
             try:
                 os.unlink(tmp_path)
@@ -3887,6 +3902,7 @@ class SessionStore:
                 lambda message: self._append_transcript_message(
                     session_id, message
                 ),
+                replay_profile_root=Path(self._db.db_path).parent,
             )
             if not remaining:
                 spooled_sessions.discard(session_id)

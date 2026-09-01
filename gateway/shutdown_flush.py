@@ -34,6 +34,9 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from hermes_constants import get_hermes_home
+from hermes_state_maintenance import _leased_profile_mutation
+
 logger = logging.getLogger(__name__)
 
 
@@ -84,6 +87,9 @@ def _write_payload(flush_dir: Path, payload: Dict[str, Any]) -> Path:
     return final_path
 
 
+@_leased_profile_mutation(
+    lambda pending, **_kwargs: ((get_hermes_home(),) if pending else ())
+)
 def flush_pending_to_file(
     pending: Dict[str, Any],
     *,
@@ -148,6 +154,7 @@ def flush_pending_to_file(
 TRANSCRIPT_CAP_DROP_REASON = "transcript_cap_drop"
 
 
+@_leased_profile_mutation(lambda _session_id, _message: (get_hermes_home(),))
 def spool_dropped_transcript_message(
     session_id: str,
     message: Dict[str, Any],
@@ -190,7 +197,19 @@ def spool_dropped_transcript_message(
 _TRANSCRIPT_SPOOL_SEQ = itertools.count()
 
 
-def drain_transcript_spool(session_id: str, replay) -> tuple[int, int]:
+@_leased_profile_mutation(
+    lambda _session_id, _replay, *, replay_profile_root=None: (
+        (get_hermes_home(),)
+        if replay_profile_root is None
+        else (get_hermes_home(), Path(replay_profile_root))
+    )
+)
+def drain_transcript_spool(
+    session_id: str,
+    replay,
+    *,
+    replay_profile_root: Optional[Path] = None,
+) -> tuple[int, int]:
     """Replay cap-dropped transcript messages spooled for *session_id*.
 
     ``replay(message_dict)`` is invoked for each spooled message in drop
@@ -247,6 +266,7 @@ def drain_transcript_spool(session_id: str, replay) -> tuple[int, int]:
         replayed += 1
 
     if replayed:
+        _fsync_directory(flush_dir)
         logger.info(
             "Replayed %d spooled transcript message(s) for %s after DB recovery",
             replayed, session_id,
@@ -283,6 +303,13 @@ def _serialise_value(value: Any) -> Optional[dict]:
     return {"text": str(value)}
 
 
+@_leased_profile_mutation(
+    lambda session_db=None: (
+        (get_hermes_home(),)
+        if session_db is None
+        else (get_hermes_home(), Path(session_db.db_path).parent)
+    )
+)
 def recover_pending_to_db(
     session_db=None,
 ) -> int:
@@ -411,12 +438,16 @@ def recover_pending_to_db(
     _close_owned_db()
 
     if recovered:
+        _fsync_directory(flush_dir)
         logger.info(
             "Recovered %d pending message(s) from shutdown flush", recovered,
         )
     return recovered
 
 
+@_leased_profile_mutation(
+    lambda _session_id, history: ((get_hermes_home(),) if history else ())
+)
 def flush_agent_history_to_file(
     session_id: Optional[str],
     history: list,

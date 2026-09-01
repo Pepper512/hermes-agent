@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from hermes_constants import get_default_hermes_root, get_hermes_home, display_hermes_home
+from hermes_state_maintenance import _leased_profile_mutation
 from utils import (
     _preserve_file_mode,
     _preserve_file_owner,
@@ -371,6 +372,9 @@ def _should_skip_backup_file(abs_path: Path, rel_path: Path, out_path: Path) -> 
 # SQLite safe copy
 # ---------------------------------------------------------------------------
 
+@_leased_profile_mutation(
+    lambda src, _dst, **_kwargs: ((src.parent,) if src.name == "state.db" else ())
+)
 def _safe_copy_db(
     src: Path,
     dst: Path,
@@ -687,6 +691,9 @@ def _foreign_db_holder_pids(db_path: Path) -> Optional[List[int]]:
     return pids
 
 
+@_leased_profile_mutation(
+    lambda _src, dst: ((dst.parent,) if dst.name == "state.db" else ())
+)
 def _safe_restore_db(src: Path, dst: Path) -> bool:
     """Restore a SQLite database from snapshot *src* into live *dst*.
 
