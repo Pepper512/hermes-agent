@@ -4002,6 +4002,7 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
 # ===========================================================================
 
 _EPHEMERAL_TTS_MAX_BYTES = 25 * 1024 * 1024
+_TTS_DURABILITY_UNCERTAIN_ERROR = "TTS durability uncertain"
 _EPHEMERAL_AUDIO_MIME_TYPES = (
     ("mp3", "audio/mpeg"),
     ("wav", "audio/wav"),
@@ -4012,6 +4013,15 @@ _EPHEMERAL_AUDIO_MIME_TYPES = (
     ("amr", "audio/amr"),
     ("opus", "audio/ogg"),
 )
+
+
+def _is_tts_publish_uncertain(error: BaseException) -> bool:
+    """Recognize the genuine durable-publication uncertainty control type."""
+    try:
+        from tools.tts_publish import TTSPublishUncertain
+    except ImportError:
+        return False
+    return type(error) is TTSPublishUncertain
 
 
 def _anonymous_adapter_for_provider(
@@ -4239,7 +4249,8 @@ def _generate_anonymous_tts(
 
     with TTSTransaction.begin(aggregate_cap) as transaction:
         for chunk in chunks:
-            stage = AnonymousAudioStage.create(output_format, aggregate_cap)
+            stage_limit = transaction.reserve_stage_limit()
+            stage = AnonymousAudioStage.create(output_format, stage_limit)
             request = ProviderRequest(
                 text=chunk,
                 voice=voice if isinstance(voice, str) else None,
@@ -4359,7 +4370,9 @@ def _text_to_speech_single(
         return tool_error(str(exc), success=False)
     except asyncio.CancelledError:
         raise
-    except BaseException:
+    except BaseException as exc:
+        if _is_tts_publish_uncertain(exc):
+            return tool_error(_TTS_DURABILITY_UNCERTAIN_ERROR, success=False)
         return tool_error("TTS generation failed", success=False)
 
 
@@ -4489,7 +4502,9 @@ def text_to_speech_tool(
         return tool_error(str(exc), success=False)
     except asyncio.CancelledError:
         raise
-    except BaseException:
+    except BaseException as exc:
+        if _is_tts_publish_uncertain(exc):
+            return tool_error(_TTS_DURABILITY_UNCERTAIN_ERROR, success=False)
         return tool_error("TTS generation failed", success=False)
 
 

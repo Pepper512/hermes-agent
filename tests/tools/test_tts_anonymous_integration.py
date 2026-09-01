@@ -110,6 +110,98 @@ def test_public_ephemeral_multichunk_uses_one_path_free_transaction(
     assert (tmp_path / "caller.mp3").exists() is False
 
 
+def test_multichunk_uses_remaining_budget_before_each_provider_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools import tts_tool
+    from tools.tts_transaction import EphemeralDelivery
+
+    payloads = (VALID_MP3, VALID_MP3 + b"second")
+    limits: list[int] = []
+
+    class BudgetRecordingAdapter:
+        def generate(self, _request, sink):
+            limits.append(sink.maximum_bytes)
+            payload = payloads[len(limits) - 1]
+            os.write(int(Path(sink.path).name), payload)
+            return sink.path
+
+        def finish_owned_work(self) -> None:
+            return None
+
+        def stop_owned_work(self) -> None:
+            return None
+
+    aggregate_cap = sum(len(payload) for payload in payloads)
+    monkeypatch.setattr(
+        tts_tool,
+        "_anonymous_adapter_for_provider",
+        lambda *_args, **_kwargs: BudgetRecordingAdapter(),
+    )
+
+    with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
+        decision, output_format = tts_tool._generate_anonymous_tts(
+            ["first", "second"],
+            provider="edge",
+            tts_config={},
+            speed=None,
+            instructions=None,
+            aggregate_cap=aggregate_cap,
+            output_format="mp3",
+        )
+
+    assert type(decision) is EphemeralDelivery
+    assert decision.chunks == payloads
+    assert output_format == "mp3"
+    assert limits == [aggregate_cap, aggregate_cap - len(payloads[0])]
+
+
+def test_exhausted_aggregate_budget_stops_before_next_provider_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools import tts_tool
+    from tools.tts_transaction import TTSTransactionError
+
+    calls = 0
+
+    class ExhaustingAdapter:
+        def generate(self, _request, sink):
+            nonlocal calls
+            calls += 1
+            os.write(int(Path(sink.path).name), VALID_MP3)
+            return sink.path
+
+        def finish_owned_work(self) -> None:
+            return None
+
+        def stop_owned_work(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        tts_tool,
+        "_anonymous_adapter_for_provider",
+        lambda *_args, **_kwargs: ExhaustingAdapter(),
+    )
+
+    with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
+        with pytest.raises(
+            TTSTransactionError,
+            match="^tts_generation_failed$",
+        ):
+            tts_tool._generate_anonymous_tts(
+                ["first", "must-not-dispatch"],
+                provider="edge",
+                tts_config={},
+                speed=None,
+                instructions=None,
+                aggregate_cap=len(VALID_MP3),
+                output_format="mp3",
+            )
+
+    assert calls == 1
+
+
 @pytest.mark.parametrize(
     ("output_format", "mime_type"), EPHEMERAL_AUDIO_MIME_TYPES.items()
 )
@@ -397,6 +489,109 @@ def test_public_durable_all_chunks_seal_before_first_publish(
         )
     assert result["success"] is True, result
     assert observed_counts == [2]
+
+
+@pytest.mark.parametrize("entry", ["single", "multi"])
+def test_public_tts_reports_fixed_path_free_durability_uncertainty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+) -> None:
+    from tools import tts_tool
+    from tools.tts_publish import TTSPublishUncertain
+
+    destination = tmp_path / "private-destination.mp3"
+    private_detail = "private transcript provider-token health-value"
+    observed_chunks: list[list[str]] = []
+
+    def uncertain(chunks, **_kwargs):
+        observed_chunks.append(list(chunks))
+        raise TTSPublishUncertain(private_detail)
+
+    monkeypatch.setattr(tts_tool, "_generate_anonymous_tts", uncertain)
+    monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: {"provider": "edge"})
+    if entry == "multi":
+        monkeypatch.setattr(
+            tts_tool,
+            "_split_text_for_tts",
+            lambda *_args: ["first", "second"],
+        )
+
+    with bind_persistence_policy(PersistencePolicy.DURABLE):
+        rendered = (
+            tts_tool._text_to_speech_single(
+                private_detail,
+                str(destination),
+                provider="edge",
+            )
+            if entry == "single"
+            else tts_tool.text_to_speech_tool(
+                private_detail,
+                str(destination),
+                provider="edge",
+            )
+        )
+
+    assert json.loads(rendered) == {
+        "success": False,
+        "error": "TTS durability uncertain",
+    }
+    assert observed_chunks == (
+        [[private_detail]]
+        if entry == "single"
+        else [["first", "second"]]
+    )
+    assert str(destination) not in rendered
+    assert private_detail not in rendered
+    assert destination.exists() is False
+
+
+@pytest.mark.parametrize("entry", ["single", "multi"])
+def test_public_tts_keeps_generic_publication_failure_generic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+) -> None:
+    from tools import tts_tool
+    from tools.tts_publish import TTSPublishError
+
+    destination = tmp_path / "private-destination.mp3"
+    private_detail = "private generic publication detail"
+
+    def fail_generic(*_args, **_kwargs):
+        raise TTSPublishError(private_detail)
+
+    monkeypatch.setattr(tts_tool, "_generate_anonymous_tts", fail_generic)
+    monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: {"provider": "edge"})
+    if entry == "multi":
+        monkeypatch.setattr(
+            tts_tool,
+            "_split_text_for_tts",
+            lambda *_args: ["first", "second"],
+        )
+
+    with bind_persistence_policy(PersistencePolicy.DURABLE):
+        rendered = (
+            tts_tool._text_to_speech_single(
+                "private speech",
+                str(destination),
+                provider="edge",
+            )
+            if entry == "single"
+            else tts_tool.text_to_speech_tool(
+                "private speech",
+                str(destination),
+                provider="edge",
+            )
+        )
+
+    assert json.loads(rendered) == {
+        "success": False,
+        "error": "TTS generation failed",
+    }
+    assert private_detail not in rendered
+    assert str(destination) not in rendered
+    assert destination.exists() is False
 
 
 class _ForeignDestination:

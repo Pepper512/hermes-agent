@@ -25,9 +25,18 @@ from tools.tts_transaction import (
 VALID_MP3 = b"ID3\x04\x00\x00\x00\x00\x00\x00private-audio"
 
 
-def _sealed_stage(parent: Path, payload: bytes = VALID_MP3):
+def _sealed_stage(
+    parent: Path,
+    payload: bytes = VALID_MP3,
+    *,
+    maximum_bytes: int = 4096,
+):
     parent.mkdir(parents=True, exist_ok=True)
-    stage = _create_anonymous_audio_stage_for_test("mp3", 4096, parent)
+    stage = _create_anonymous_audio_stage_for_test(
+        "mp3",
+        maximum_bytes,
+        parent,
+    )
     os.write(int(Path(stage.sink.path).name), payload)
     return stage, stage.seal(stage.sink.path)
 
@@ -43,6 +52,11 @@ def _consume_and_scrub(stages, _observation):
         payloads.append(stage.read_bounded(sealed))
         stage.scrub_and_close()
     return tuple(payloads)
+
+
+def _reserve_and_add(transaction, stage, sealed) -> None:
+    assert transaction.reserve_stage_limit() == stage.sink.maximum_bytes
+    transaction.add_sealed(stage, sealed)
 
 
 @pytest.mark.parametrize(
@@ -64,10 +78,10 @@ def _consume_and_scrub(stages, _observation):
     ],
 )
 def test_decision_is_monotonic(tmp_path: Path, entry, transitions, expected):
-    stage, sealed = _sealed_stage(tmp_path)
+    stage, sealed = _sealed_stage(tmp_path, maximum_bytes=1024)
     with bind_persistence_policy(entry):
         with TTSTransaction.begin(1024) as transaction:
-            transaction.add_sealed(stage, sealed)
+            _reserve_and_add(transaction, stage, sealed)
             for policy in transitions:
                 with bind_persistence_policy(policy):
                     pass
@@ -83,10 +97,13 @@ def test_decision_is_monotonic(tmp_path: Path, entry, transitions, expected):
 
 
 def test_entry_ephemeral_returns_bounded_path_free_memory_and_scrubs(tmp_path: Path):
-    stage, sealed = _sealed_stage(tmp_path)
+    stage, sealed = _sealed_stage(
+        tmp_path,
+        maximum_bytes=len(VALID_MP3),
+    )
     with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
         with TTSTransaction.begin(len(VALID_MP3)) as transaction:
-            transaction.add_sealed(stage, sealed)
+            _reserve_and_add(transaction, stage, sealed)
             delivery = transaction.decide()
 
     assert type(delivery) is EphemeralDelivery
@@ -114,7 +131,7 @@ def test_ephemeral_delivery_reads_only_the_sealed_descriptor(
     monkeypatch.setattr(Path, "read_bytes", forbidden_path_read)
     with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
         with TTSTransaction.begin(4096) as transaction:
-            transaction.add_sealed(stage, sealed)
+            _reserve_and_add(transaction, stage, sealed)
             delivery = transaction.decide()
     assert delivery.chunks == (VALID_MP3,)
     assert sentinel.stat().st_size == len(b"caller-owned")
@@ -145,7 +162,7 @@ def test_forged_old_global_cannot_change_stage_or_cleanup(
 
     with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
         with TTSTransaction.begin(4096) as transaction:
-            transaction.add_sealed(stage, sealed)
+            _reserve_and_add(transaction, stage, sealed)
             delivery = transaction.decide()
 
     assert delivery.chunks == (VALID_MP3,)
@@ -153,23 +170,35 @@ def test_forged_old_global_cannot_change_stage_or_cleanup(
     assert not any(tmp_path.joinpath("stage").glob("hermes-tts-*"))
 
 
-def test_ephemeral_multiple_chunks_enforces_aggregate_cap_before_second_read(
+def test_decide_time_aggregate_defense_rejects_corrupt_cap_before_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    first, first_sealed = _sealed_stage(tmp_path / "first")
-    second, second_sealed = _sealed_stage(tmp_path / "second")
     calls: list[object] = []
-    real_read = type(second).read_bounded
+    aggregate_cap = len(VALID_MP3) * 2
+    first, first_sealed = _sealed_stage(
+        tmp_path / "first",
+        maximum_bytes=aggregate_cap,
+    )
+    real_read = type(first).read_bounded
 
     def record_read(self, sealed):
         calls.append(self)
         return real_read(self, sealed)
 
-    monkeypatch.setattr(type(second), "read_bounded", record_read)
+    monkeypatch.setattr(type(first), "read_bounded", record_read)
     with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
-        with TTSTransaction.begin(len(VALID_MP3) * 2 - 1) as transaction:
-            transaction.add_sealed(first, first_sealed)
+        with TTSTransaction.begin(aggregate_cap) as transaction:
+            _reserve_and_add(transaction, first, first_sealed)
+            second, second_sealed = _sealed_stage(
+                tmp_path / "second",
+                maximum_bytes=transaction.reserve_stage_limit(),
+            )
             transaction.add_sealed(second, second_sealed)
+            object.__setattr__(
+                transaction,
+                "_TTSTransaction__aggregate_cap",
+                aggregate_cap - 1,
+            )
             with pytest.raises(TTSTransactionError, match="^tts_generation_failed$"):
                 transaction.decide()
 
@@ -178,11 +207,107 @@ def test_ephemeral_multiple_chunks_enforces_aggregate_cap_before_second_read(
     _assert_scrubbed(second)
 
 
+def test_transaction_reserves_and_debits_authentic_stage_budget(
+    tmp_path: Path,
+) -> None:
+    aggregate_cap = len(VALID_MP3) * 2 + 5
+    with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
+        with TTSTransaction.begin(aggregate_cap) as transaction:
+            first_limit = transaction.reserve_stage_limit()
+            first, first_sealed = _sealed_stage(
+                tmp_path / "first",
+                maximum_bytes=first_limit,
+            )
+            transaction.add_sealed(first, first_sealed)
+
+            second_limit = transaction.reserve_stage_limit()
+            second, second_sealed = _sealed_stage(
+                tmp_path / "second",
+                maximum_bytes=second_limit,
+            )
+            transaction.add_sealed(second, second_sealed)
+            delivery = transaction.decide()
+
+    assert first_limit == aggregate_cap
+    assert second_limit == aggregate_cap - len(VALID_MP3)
+    assert delivery.chunks == (VALID_MP3, VALID_MP3)
+    _assert_scrubbed(first)
+    _assert_scrubbed(second)
+
+
+@pytest.mark.parametrize("delta", [-1, 1])
+def test_transaction_rejects_stage_whose_cap_differs_from_issued_reservation(
+    tmp_path: Path,
+    delta: int,
+) -> None:
+    aggregate_cap = len(VALID_MP3) + 5
+    with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
+        with TTSTransaction.begin(aggregate_cap) as transaction:
+            issued_limit = transaction.reserve_stage_limit()
+            stage, sealed = _sealed_stage(
+                tmp_path,
+                maximum_bytes=issued_limit + delta,
+            )
+            with pytest.raises(
+                TTSTransactionError,
+                match="^tts_generation_failed$",
+            ):
+                transaction.add_sealed(stage, sealed)
+
+    _assert_scrubbed(stage)
+
+
+def test_transaction_rejects_add_without_reservation(tmp_path: Path) -> None:
+    stage, sealed = _sealed_stage(tmp_path)
+    with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
+        with TTSTransaction.begin(4096) as transaction:
+            with pytest.raises(
+                TTSTransactionError,
+                match="^tts_generation_failed$",
+            ):
+                transaction.add_sealed(stage, sealed)
+
+    _assert_scrubbed(stage)
+
+
+def test_transaction_rejects_second_outstanding_reservation() -> None:
+    with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
+        with TTSTransaction.begin(4096) as transaction:
+            assert transaction.reserve_stage_limit() == 4096
+            with pytest.raises(
+                TTSTransactionError,
+                match="^tts_generation_failed$",
+            ):
+                transaction.reserve_stage_limit()
+
+
+def test_decide_rejects_outstanding_reservation_and_scrubs_prior_stage(
+    tmp_path: Path,
+) -> None:
+    stage, sealed = _sealed_stage(tmp_path)
+    with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
+        with TTSTransaction.begin(4096) as transaction:
+            _reserve_and_add(transaction, stage, sealed)
+            assert transaction.reserve_stage_limit() == 4096 - len(VALID_MP3)
+            with pytest.raises(
+                TTSTransactionError,
+                match="^tts_generation_failed$",
+            ):
+                transaction.decide()
+
+    _assert_scrubbed(stage)
+
+
 def test_late_rebind_failure_is_fixed_and_scrubs_all_stages(tmp_path: Path):
-    stages = [_sealed_stage(tmp_path / str(index)) for index in range(2)]
+    stages = []
     with bind_persistence_policy(PersistencePolicy.DURABLE):
         with TTSTransaction.begin(4096) as transaction:
-            for stage, sealed in stages:
+            for index in range(2):
+                stage, sealed = _sealed_stage(
+                    tmp_path / str(index),
+                    maximum_bytes=transaction.reserve_stage_limit(),
+                )
+                stages.append((stage, sealed))
                 transaction.add_sealed(stage, sealed)
             with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
                 pass
@@ -202,7 +327,7 @@ def test_context_error_scrubs_all_chunks_and_returns_fixed_failure(
     with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
         with pytest.raises(TTSTransactionError) as exc_info:
             with TTSTransaction.begin(4096) as transaction:
-                transaction.add_sealed(stage, sealed)
+                _reserve_and_add(transaction, stage, sealed)
                 raise failure
     assert str(exc_info.value) == "tts_generation_failed"
     assert "private" not in str(exc_info.value)
@@ -218,7 +343,7 @@ def test_context_cancel_scrubs_all_chunks(tmp_path: Path):
     with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
         with pytest.raises(Cancelled):
             with TTSTransaction.begin(4096) as transaction:
-                transaction.add_sealed(stage, sealed)
+                _reserve_and_add(transaction, stage, sealed)
                 raise Cancelled
     _assert_scrubbed(stage)
 
@@ -239,7 +364,7 @@ def test_scrub_failure_has_high_severity_precedence(
     with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
         with pytest.raises(TTSTransactionStop) as exc_info:
             with TTSTransaction.begin(4096) as transaction:
-                transaction.add_sealed(stage, sealed)
+                _reserve_and_add(transaction, stage, sealed)
                 raise RuntimeError("provider secret")
     assert str(exc_info.value) == "tts_anonymous_scrub_failed"
     assert "private" not in str(exc_info.value)
@@ -259,7 +384,7 @@ def test_decide_scrub_failure_is_not_downgraded_by_context_exit(
     with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
         with pytest.raises(TTSTransactionStop) as exc_info:
             with TTSTransaction.begin(4096) as transaction:
-                transaction.add_sealed(stage, sealed)
+                _reserve_and_add(transaction, stage, sealed)
                 transaction.decide()
     assert str(exc_info.value) == "tts_anonymous_scrub_failed"
 
@@ -268,7 +393,7 @@ def test_durable_permit_is_unforgeable_path_free_and_owns_stages(tmp_path: Path)
     stage, sealed = _sealed_stage(tmp_path)
     with bind_persistence_policy(PersistencePolicy.DURABLE):
         with TTSTransaction.begin(4096) as transaction:
-            transaction.add_sealed(stage, sealed)
+            _reserve_and_add(transaction, stage, sealed)
             permit = transaction.decide()
             assert type(permit) is DurablePublicationPermit
             assert not any(
@@ -298,8 +423,9 @@ def test_same_stage_cannot_be_claimed_by_nested_transactions(tmp_path: Path):
     stage, sealed = _sealed_stage(tmp_path)
     with bind_persistence_policy(PersistencePolicy.DURABLE):
         with TTSTransaction.begin(4096) as outer:
-            outer.add_sealed(stage, sealed)
+            _reserve_and_add(outer, stage, sealed)
             with TTSTransaction.begin(4096) as inner:
+                inner.reserve_stage_limit()
                 with pytest.raises(
                     TTSTransactionError, match="^tts_generation_failed$"
                 ):
@@ -322,8 +448,9 @@ def test_slot_cloned_stage_cannot_bypass_exclusive_claim(tmp_path: Path):
 
     with bind_persistence_policy(PersistencePolicy.DURABLE):
         with TTSTransaction.begin(4096) as outer:
-            outer.add_sealed(stage, sealed)
+            _reserve_and_add(outer, stage, sealed)
             with TTSTransaction.begin(4096) as inner:
+                inner.reserve_stage_limit()
                 with pytest.raises(
                     TTSTransactionError, match="^tts_generation_failed$"
                 ):
@@ -346,18 +473,18 @@ def test_unconsumed_permit_is_scrubbed_on_every_context_exit(
         if exit_mode == "error":
             with pytest.raises(TTSTransactionError, match="^tts_generation_failed$"):
                 with TTSTransaction.begin(4096) as transaction:
-                    transaction.add_sealed(stage, sealed)
+                    _reserve_and_add(transaction, stage, sealed)
                     transaction.decide()
                     raise RuntimeError("private provider failure")
         elif exit_mode == "cancel":
             with pytest.raises(Cancelled):
                 with TTSTransaction.begin(4096) as transaction:
-                    transaction.add_sealed(stage, sealed)
+                    _reserve_and_add(transaction, stage, sealed)
                     transaction.decide()
                     raise Cancelled
         else:
             with TTSTransaction.begin(4096) as transaction:
-                transaction.add_sealed(stage, sealed)
+                _reserve_and_add(transaction, stage, sealed)
                 transaction.decide()
     _assert_scrubbed(stage)
 
@@ -366,7 +493,8 @@ def test_duplicate_add_scrubs_transaction_owned_stage(tmp_path: Path):
     stage, sealed = _sealed_stage(tmp_path)
     with bind_persistence_policy(PersistencePolicy.DURABLE):
         with TTSTransaction.begin(4096) as transaction:
-            transaction.add_sealed(stage, sealed)
+            _reserve_and_add(transaction, stage, sealed)
+            transaction.reserve_stage_limit()
             with pytest.raises(TTSTransactionError, match="^tts_generation_failed$"):
                 transaction.add_sealed(stage, sealed)
     _assert_scrubbed(stage)
@@ -378,6 +506,7 @@ def test_mismatched_add_scrubs_unclaimed_presented_stage_only(tmp_path: Path):
     try:
         with bind_persistence_policy(PersistencePolicy.DURABLE):
             with TTSTransaction.begin(4096) as transaction:
+                transaction.reserve_stage_limit()
                 with pytest.raises(
                     TTSTransactionError, match="^tts_generation_failed$"
                 ):
@@ -392,12 +521,16 @@ def test_mismatched_add_scrubs_presented_and_prior_transaction_stage(
     tmp_path: Path,
 ):
     prior, prior_seal = _sealed_stage(tmp_path / "prior")
-    presented, _presented_seal = _sealed_stage(tmp_path / "presented")
     other, other_seal = _sealed_stage(tmp_path / "other")
     try:
         with bind_persistence_policy(PersistencePolicy.DURABLE):
             with TTSTransaction.begin(4096) as transaction:
-                transaction.add_sealed(prior, prior_seal)
+                _reserve_and_add(transaction, prior, prior_seal)
+                next_limit = transaction.reserve_stage_limit()
+                presented, _presented_seal = _sealed_stage(
+                    tmp_path / "presented",
+                    maximum_bytes=next_limit,
+                )
                 with pytest.raises(
                     TTSTransactionError, match="^tts_generation_failed$"
                 ):
@@ -422,6 +555,7 @@ def test_partial_add_failure_scrubs_presented_stage(tmp_path: Path):
                 "_TTSTransaction__stages",
                 FailingAppend(),
             )
+            transaction.reserve_stage_limit()
             with pytest.raises(TTSTransactionError) as exc_info:
                 transaction.add_sealed(stage, sealed)
     assert str(exc_info.value) == "tts_generation_failed"
@@ -434,7 +568,7 @@ def test_add_after_decision_scrubs_new_stage_and_recovers_original(tmp_path: Pat
     rejected, rejected_seal = _sealed_stage(tmp_path / "rejected")
     with bind_persistence_policy(PersistencePolicy.DURABLE):
         with TTSTransaction.begin(4096) as transaction:
-            transaction.add_sealed(original, original_seal)
+            _reserve_and_add(transaction, original, original_seal)
             transaction.decide()
             with pytest.raises(TTSTransactionError, match="^tts_generation_failed$"):
                 transaction.add_sealed(rejected, rejected_seal)
@@ -447,7 +581,7 @@ def test_cloned_permit_is_rejected_before_consumer_or_stage_access(tmp_path: Pat
     called = False
     with bind_persistence_policy(PersistencePolicy.DURABLE):
         with TTSTransaction.begin(4096) as transaction:
-            transaction.add_sealed(stage, sealed)
+            _reserve_and_add(transaction, stage, sealed)
             permit = transaction.decide()
             clone = object.__new__(DurablePublicationPermit)
             for slot in getattr(DurablePublicationPermit, "__slots__", ()):
@@ -476,7 +610,7 @@ def test_permit_rejects_cross_transaction_and_replay(tmp_path: Path):
     stage, sealed = _sealed_stage(tmp_path)
     with bind_persistence_policy(PersistencePolicy.DURABLE):
         with TTSTransaction.begin(4096) as owner:
-            owner.add_sealed(stage, sealed)
+            _reserve_and_add(owner, stage, sealed)
             permit = owner.decide()
             with TTSTransaction.begin(4096):
                 with pytest.raises(
@@ -494,7 +628,7 @@ def test_permit_cannot_escape_with_inactive_observation(tmp_path: Path):
     stage, sealed = _sealed_stage(tmp_path)
     with bind_persistence_policy(PersistencePolicy.DURABLE):
         with TTSTransaction.begin(4096) as transaction:
-            transaction.add_sealed(stage, sealed)
+            _reserve_and_add(transaction, stage, sealed)
             permit = transaction.decide()
     _assert_scrubbed(stage)
     with pytest.raises(TTSTransactionError, match="^tts_generation_failed$"):
@@ -518,7 +652,7 @@ def test_consumer_noncompletion_scrubs_and_fails_closed(
             )
         with expected:
             with TTSTransaction.begin(4096) as transaction:
-                transaction.add_sealed(stage, sealed)
+                _reserve_and_add(transaction, stage, sealed)
                 permit = transaction.decide()
                 if mode == "late-policy":
                     with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
@@ -535,6 +669,58 @@ def test_consumer_noncompletion_scrubs_and_fails_closed(
                     permit._consume_for_publication(
                         lambda *_args: (_ for _ in ()).throw(Cancelled())
                     )
+    _assert_scrubbed(stage)
+
+
+def test_durable_publication_uncertainty_survives_consume_and_context_cleanup(
+    tmp_path: Path,
+) -> None:
+    from tools.tts_publish import TTSPublishUncertain
+
+    stage, sealed = _sealed_stage(tmp_path)
+    uncertainty = TTSPublishUncertain("tts_durable_publication_uncertain")
+
+    def report_uncertain(*_args):
+        raise uncertainty
+
+    with bind_persistence_policy(PersistencePolicy.DURABLE):
+        with pytest.raises(TTSPublishUncertain) as exc_info:
+            with TTSTransaction.begin(4096) as transaction:
+                _reserve_and_add(transaction, stage, sealed)
+                permit = transaction.decide()
+                permit._consume_for_publication(report_uncertain)
+
+    assert exc_info.value is uncertainty
+    _assert_scrubbed(stage)
+
+
+def test_scrub_failure_takes_precedence_over_publication_uncertainty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools.tts_publish import TTSPublishUncertain
+
+    stage, sealed = _sealed_stage(tmp_path)
+    real_scrub = type(stage).scrub_and_close
+
+    def close_then_fail(self) -> None:
+        real_scrub(self)
+        if self is stage:
+            raise AnonymousAudioScrubError("private scrub detail")
+
+    def report_uncertain(*_args):
+        raise TTSPublishUncertain("private publication detail")
+
+    monkeypatch.setattr(type(stage), "scrub_and_close", close_then_fail)
+    with bind_persistence_policy(PersistencePolicy.DURABLE):
+        with pytest.raises(TTSTransactionStop) as exc_info:
+            with TTSTransaction.begin(4096) as transaction:
+                _reserve_and_add(transaction, stage, sealed)
+                permit = transaction.decide()
+                permit._consume_for_publication(report_uncertain)
+
+    assert str(exc_info.value) == "tts_anonymous_scrub_failed"
+    assert "private" not in str(exc_info.value)
     _assert_scrubbed(stage)
 
 
@@ -555,7 +741,7 @@ def test_durable_consume_preserves_syscall_scrub_failure_after_close(
     with bind_persistence_policy(PersistencePolicy.DURABLE):
         with pytest.raises(TTSTransactionStop) as exc_info:
             with TTSTransaction.begin(4096) as transaction:
-                transaction.add_sealed(stage, sealed)
+                _reserve_and_add(transaction, stage, sealed)
                 permit = transaction.decide()
                 permit._consume_for_publication(_consume_and_scrub)
     assert str(exc_info.value) == "tts_anonymous_scrub_failed"
@@ -585,15 +771,17 @@ def test_closed_stage_scrub_failure_remains_sticky_across_lifecycle_cleanup(
         ):
             with pytest.raises(TTSTransactionStop) as exc_info:
                 with TTSTransaction.begin(4096) as transaction:
-                    transaction.add_sealed(stage, sealed)
+                    _reserve_and_add(transaction, stage, sealed)
                     if lifecycle == "consume":
                         permit = transaction.decide()
                         permit._consume_for_publication(_consume_and_scrub)
                     elif lifecycle == "decision":
                         transaction.decide()
                     elif lifecycle == "add":
+                        next_limit = transaction.reserve_stage_limit()
                         rejected, rejected_seal = _sealed_stage(
-                            tmp_path / "rejected"
+                            tmp_path / "rejected",
+                            maximum_bytes=next_limit,
                         )
                         transaction.add_sealed(rejected, rejected_seal)
                         transaction.add_sealed(stage, sealed)
@@ -615,7 +803,7 @@ def test_twenty_consumed_transactions_leave_no_descriptor_or_stage_root_leak(
         stage, sealed = _sealed_stage(parent)
         with bind_persistence_policy(PersistencePolicy.DURABLE):
             with TTSTransaction.begin(4096) as transaction:
-                transaction.add_sealed(stage, sealed)
+                _reserve_and_add(transaction, stage, sealed)
                 permit = transaction.decide()
                 permit._consume_for_publication(_consume_and_scrub)
         _assert_scrubbed(stage)
@@ -630,7 +818,7 @@ def test_decide_revalidates_stage_after_add_and_scrubs(
     stage, sealed = _sealed_stage(tmp_path)
     with bind_persistence_policy(PersistencePolicy.DURABLE):
         with TTSTransaction.begin(4096) as transaction:
-            transaction.add_sealed(stage, sealed)
+            _reserve_and_add(transaction, stage, sealed)
             fd = int(Path(stage.sink.path).name)
             if mutation == "bytes":
                 os.pwrite(fd, b"X", len(VALID_MP3) - 1)
@@ -648,7 +836,7 @@ def test_consume_revalidates_stage_and_rejects_mutation_before_consumer(
     called = False
     with bind_persistence_policy(PersistencePolicy.DURABLE):
         with TTSTransaction.begin(4096) as transaction:
-            transaction.add_sealed(stage, sealed)
+            _reserve_and_add(transaction, stage, sealed)
             permit = transaction.decide()
             os.pwrite(int(Path(stage.sink.path).name), b"X", len(VALID_MP3) - 1)
 
@@ -675,7 +863,7 @@ def test_parallel_decide_transfers_once(tmp_path: Path):
     stage, sealed = _sealed_stage(tmp_path)
     with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
         with TTSTransaction.begin(4096) as transaction:
-            transaction.add_sealed(stage, sealed)
+            _reserve_and_add(transaction, stage, sealed)
             with ThreadPoolExecutor(max_workers=2) as pool:
                 outcomes = list(
                     pool.map(
@@ -705,7 +893,7 @@ def test_reentrant_decide_fails_without_interrupting_outer_decision(
 
     with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
         with TTSTransaction.begin(4096) as transaction:
-            transaction.add_sealed(stage, sealed)
+            _reserve_and_add(transaction, stage, sealed)
 
             def reentrant_read(self, proof):
                 with pytest.raises(
@@ -739,7 +927,7 @@ def test_second_reentrant_and_add_after_decision_fail_closed_without_double_scru
     monkeypatch.setattr(type(stage), "scrub_and_close", record_scrub)
     with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
         with TTSTransaction.begin(4096) as transaction:
-            transaction.add_sealed(stage, sealed)
+            _reserve_and_add(transaction, stage, sealed)
             transaction.decide()
             with pytest.raises(TTSTransactionError, match="^tts_generation_failed$"):
                 transaction.decide()

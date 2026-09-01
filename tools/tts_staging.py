@@ -7,14 +7,16 @@ the only code allowed to seal, read, scrub, or close the staged audio.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import os
 from pathlib import Path
 import secrets
+import signal
 import stat
 import sys
 import tempfile
+import threading
 from typing import Final
 
 
@@ -70,6 +72,99 @@ class AnonymousAudioStageUnsupported(AnonymousAudioStageError):
 
 class AnonymousAudioScrubError(AnonymousAudioStageError):
     """Held-descriptor destruction did not complete cleanly."""
+
+
+@dataclass(slots=True)
+class _OwnedDescriptor:
+    fd: int = -1
+    stat: os.stat_result | None = None
+    state: str = "empty"
+    close_proof: int | None = None
+    close_active: bool = False
+    lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+
+
+def _require_signal_deferral_support():
+    masker = getattr(signal, "pthread_sigmask", None)
+    valid_signals = getattr(signal, "valid_signals", None)
+    if not callable(masker) or not callable(valid_signals):
+        raise AnonymousAudioStageUnsupported(_UNSUPPORTED_ERROR)
+    excluded = {
+        candidate
+        for candidate in (
+            getattr(signal, "SIGKILL", None),
+            getattr(signal, "SIGSTOP", None),
+        )
+        if candidate is not None
+    }
+    catchable = frozenset(valid_signals()) - excluded
+    if not catchable:
+        raise AnonymousAudioStageUnsupported(_UNSUPPORTED_ERROR)
+    return masker, catchable
+
+
+def _open_owned_descriptor(owner: _OwnedDescriptor, *args, **kwargs) -> None:
+    masker, catchable = _require_signal_deferral_support()
+    previous_mask = masker(signal.SIG_BLOCK, catchable)
+    try:
+        owner.fd = os.open(*args, **kwargs)
+        owner.state = "open"
+        owner.stat = os.fstat(owner.fd)
+    finally:
+        masker(signal.SIG_SETMASK, previous_mask)
+
+
+def _same_owned_open_description(owner: _OwnedDescriptor) -> bool:
+    if owner.stat is None or owner.close_proof is None or owner.fd < 0:
+        return False
+    try:
+        held = os.fstat(owner.fd)
+        offset = os.lseek(owner.fd, 0, os.SEEK_CUR)
+    except (OSError, TypeError, ValueError):
+        return False
+    expected = owner.stat
+    return (
+        held.st_dev == expected.st_dev
+        and held.st_ino == expected.st_ino
+        and stat.S_IFMT(held.st_mode) == stat.S_IFMT(expected.st_mode)
+        and held.st_uid == expected.st_uid
+        and held.st_gid == expected.st_gid
+        and offset == owner.close_proof
+    )
+
+
+def _close_owned_descriptor(owner: _OwnedDescriptor) -> None:
+    masker, catchable = _require_signal_deferral_support()
+    with owner.lock:
+        owns_attempt = False
+        try:
+            if owner.close_active:
+                return
+            owns_attempt = True
+            owner.close_active = True
+            if owner.state in ("empty", "released"):
+                return
+            if owner.state == "open":
+                if owner.stat is None:
+                    owner.stat = os.fstat(owner.fd)
+                proof = (1 << 30) | secrets.randbits(30)
+                os.lseek(owner.fd, proof, os.SEEK_SET)
+                owner.close_proof = proof
+                owner.state = "attempted"
+            elif not _same_owned_open_description(owner):
+                owner.state = "released"
+                owner.fd = -1
+                return
+            previous_mask = masker(signal.SIG_BLOCK, catchable)
+            try:
+                os.close(owner.fd)
+                owner.state = "released"
+                owner.fd = -1
+            finally:
+                masker(signal.SIG_SETMASK, previous_mask)
+        finally:
+            if owns_attempt:
+                owner.close_active = False
 
 
 def _create_provider_audio_sink_boundary():
@@ -256,6 +351,7 @@ def _current_posix_identity() -> tuple[int, int] | None:
 
 def _require_host_capabilities(platform: str) -> tuple[int, int]:
     _descriptor_path_for_platform(0, platform)
+    _require_signal_deferral_support()
     required_flags = ("O_DIRECTORY", "O_NOFOLLOW")
     if os.name != "posix" or any(not hasattr(os, name) for name in required_flags):
         raise AnonymousAudioStageUnsupported(_UNSUPPORTED_ERROR)
@@ -402,15 +498,19 @@ class AnonymousAudioStage:
     """Trusted owner of one already-unlinked TTS output descriptor."""
 
     __slots__ = (
+        "_audio_owner",
         "_authority",
+        "_cleanup_lock",
         "_closed",
         "_fd",
         "_initial_device",
         "_initial_inode",
         "_parent_fd",
+        "_parent_owner",
         "_root_basename",
         "_root_device",
         "_root_fd",
+        "_root_owner",
         "_root_gid",
         "_root_inode",
         "_root_uid",
@@ -422,28 +522,32 @@ class AnonymousAudioStage:
         self,
         token: object,
         *,
-        fd: int,
+        audio_owner: _OwnedDescriptor,
         sink: ProviderAudioSink,
-        parent_fd: int,
-        root_fd: int,
+        parent_owner: _OwnedDescriptor,
+        root_owner: _OwnedDescriptor,
         root_basename: str,
         root_stat: os.stat_result,
         file_stat: os.stat_result,
     ) -> None:
         if token is not _CONSTRUCTION_TOKEN:
             raise AnonymousAudioStageError(_STAGE_ERROR)
+        self._audio_owner = audio_owner
         self._authority = object()
+        self._cleanup_lock = threading.RLock()
         self._closed = False
-        self._fd = fd
+        self._fd = audio_owner.fd
         self._initial_device = file_stat.st_dev
         self._initial_inode = file_stat.st_ino
-        self._parent_fd = parent_fd
+        self._parent_fd = parent_owner.fd
+        self._parent_owner = parent_owner
         self._root_basename = root_basename
         self._root_device = root_stat.st_dev
         self._root_gid = root_stat.st_gid
         self._root_inode = root_stat.st_ino
         self._root_uid = root_stat.st_uid
-        self._root_fd = root_fd
+        self._root_fd = root_owner.fd
+        self._root_owner = root_owner
         self._sealed = False
         self._sink = sink
 
@@ -480,14 +584,15 @@ class AnonymousAudioStage:
             )
         except (OSError, TypeError, ValueError):
             raise AnonymousAudioStageError(_STAGE_ERROR) from None
-        parent_fd = -1
-        root_fd = -1
-        audio_fd = -1
+        parent_owner = _OwnedDescriptor()
+        root_owner = _OwnedDescriptor()
+        audio_owner = _OwnedDescriptor()
         root_basename: str | None = None
         audio_basename: str | None = None
         try:
             parent_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-            parent_fd = os.open(parent_path, parent_flags)
+            _open_owned_descriptor(parent_owner, parent_path, parent_flags)
+            parent_fd = parent_owner.fd
             parent_stat = os.fstat(parent_fd)
             if not stat.S_ISDIR(parent_stat.st_mode):
                 raise AnonymousAudioStageError(_STAGE_ERROR)
@@ -495,7 +600,13 @@ class AnonymousAudioStage:
             root_basename = Path(
                 tempfile.mkdtemp(prefix="hermes-tts-", dir=parent_path)
             ).name
-            root_fd = os.open(root_basename, parent_flags, dir_fd=parent_fd)
+            _open_owned_descriptor(
+                root_owner,
+                root_basename,
+                parent_flags,
+                dir_fd=parent_fd,
+            )
+            root_fd = root_owner.fd
             os.fchown(root_fd, owner_uid, owner_gid)
             os.fchmod(root_fd, 0o700)
             root_stat = os.fstat(root_fd)
@@ -509,7 +620,14 @@ class AnonymousAudioStage:
 
             audio_basename = f"audio-{secrets.token_hex(16)}"
             audio_flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW
-            audio_fd = os.open(audio_basename, audio_flags, 0o600, dir_fd=root_fd)
+            _open_owned_descriptor(
+                audio_owner,
+                audio_basename,
+                audio_flags,
+                0o600,
+                dir_fd=root_fd,
+            )
+            audio_fd = audio_owner.fd
             os.fchown(audio_fd, owner_uid, owner_gid)
             os.fchmod(audio_fd, 0o600)
             file_stat = os.fstat(audio_fd)
@@ -531,28 +649,35 @@ class AnonymousAudioStage:
             )
             return cls(
                 _CONSTRUCTION_TOKEN,
-                fd=audio_fd,
+                audio_owner=audio_owner,
                 sink=sink,
-                parent_fd=parent_fd,
-                root_fd=root_fd,
+                parent_owner=parent_owner,
+                root_owner=root_owner,
                 root_basename=root_basename,
                 root_stat=root_stat,
                 file_stat=file_stat,
             )
         except AnonymousAudioStageError:
             cls._close_failed_creation(
-                audio_fd=audio_fd,
-                root_fd=root_fd,
-                parent_fd=parent_fd,
+                audio_owner=audio_owner,
+                root_owner=root_owner,
+                parent_owner=parent_owner,
             )
             raise
         except (OSError, ValueError, TypeError):
             cls._close_failed_creation(
-                audio_fd=audio_fd,
-                root_fd=root_fd,
-                parent_fd=parent_fd,
+                audio_owner=audio_owner,
+                root_owner=root_owner,
+                parent_owner=parent_owner,
             )
             raise AnonymousAudioStageError(_STAGE_ERROR) from None
+        except BaseException:
+            cls._close_failed_creation(
+                audio_owner=audio_owner,
+                root_owner=root_owner,
+                parent_owner=parent_owner,
+            )
+            raise
 
     @staticmethod
     def _valid_root_identity(held: os.stat_result, named: os.stat_result) -> bool:
@@ -586,33 +711,48 @@ class AnonymousAudioStage:
     @staticmethod
     def _close_failed_creation(
         *,
-        audio_fd: int,
-        root_fd: int,
-        parent_fd: int,
+        audio_owner: _OwnedDescriptor,
+        root_owner: _OwnedDescriptor,
+        parent_owner: _OwnedDescriptor,
     ) -> None:
-        if audio_fd >= 0:
+        failed = False
+        if audio_owner.state not in ("empty", "released"):
             try:
-                os.ftruncate(audio_fd, 0)
-            except OSError:
-                pass
+                os.ftruncate(audio_owner.fd, 0)
+            except BaseException:
+                failed = True
             try:
-                os.fsync(audio_fd)
-            except OSError:
-                pass
+                os.fsync(audio_owner.fd)
+            except BaseException:
+                failed = True
             try:
-                os.close(audio_fd)
-            except OSError:
-                pass
-        if root_fd >= 0:
+                _close_owned_descriptor(audio_owner)
+            except BaseException:
+                failed = True
+                try:
+                    _close_owned_descriptor(audio_owner)
+                except BaseException:
+                    pass
+        if root_owner.state not in ("empty", "released"):
             try:
-                os.close(root_fd)
-            except OSError:
-                pass
-        if parent_fd >= 0:
+                _close_owned_descriptor(root_owner)
+            except BaseException:
+                failed = True
+                try:
+                    _close_owned_descriptor(root_owner)
+                except BaseException:
+                    pass
+        if parent_owner.state not in ("empty", "released"):
             try:
-                os.close(parent_fd)
-            except OSError:
-                pass
+                _close_owned_descriptor(parent_owner)
+            except BaseException:
+                failed = True
+                try:
+                    _close_owned_descriptor(parent_owner)
+                except BaseException:
+                    pass
+        if failed:
+            raise AnonymousAudioScrubError(_SCRUB_ERROR)
 
     @property
     def sink(self) -> ProviderAudioSink:
@@ -738,37 +878,68 @@ class AnonymousAudioStage:
         )
 
     def scrub_and_close(self) -> None:
-        if self._closed:
-            return
-        failed = False
-        try:
-            os.ftruncate(self._fd, 0)
-        except OSError:
-            failed = True
-        try:
-            os.fsync(self._fd)
-        except OSError:
-            failed = True
-        try:
-            os.close(self._fd)
-        except OSError:
-            failed = True
-        else:
-            self._closed = True
-            self._fd = -1
+        with self._cleanup_lock:
+            failed = False
+            first_stop: BaseException | None = None
+            if self._audio_owner.state not in ("empty", "released"):
+                try:
+                    os.ftruncate(self._audio_owner.fd, 0)
+                except OSError:
+                    failed = True
+                except BaseException as exc:
+                    first_stop = exc
+                try:
+                    os.fsync(self._audio_owner.fd)
+                except OSError:
+                    failed = True
+                except BaseException as exc:
+                    if first_stop is None:
+                        first_stop = exc
+                try:
+                    _close_owned_descriptor(self._audio_owner)
+                except OSError:
+                    failed = True
+                except BaseException as exc:
+                    if first_stop is None:
+                        first_stop = exc
 
-        if failed:
-            self._close_root_descriptors()
-            raise AnonymousAudioScrubError(_SCRUB_ERROR)
+            self._sync_descriptor_fields()
+            try:
+                self._teardown_exact_empty_root()
+            except BaseException as exc:
+                if first_stop is None:
+                    first_stop = exc
+            try:
+                self._close_root_descriptors()
+            except AnonymousAudioScrubError:
+                failed = True
+            except BaseException as exc:
+                if first_stop is None:
+                    first_stop = exc
+            self._sync_descriptor_fields()
 
-        self._teardown_exact_empty_root()
+            if failed:
+                raise AnonymousAudioScrubError(_SCRUB_ERROR)
+            if first_stop is not None:
+                raise first_stop
+
+    def _sync_descriptor_fields(self) -> None:
+        self._fd = self._audio_owner.fd
+        self._root_fd = self._root_owner.fd
+        self._parent_fd = self._parent_owner.fd
+        self._closed = self._audio_owner.state == "released"
 
     def _teardown_exact_empty_root(self) -> None:
+        if (
+            self._root_owner.state in ("empty", "released")
+            or self._parent_owner.state in ("empty", "released")
+        ):
+            return
         try:
-            held = os.fstat(self._root_fd)
+            held = os.fstat(self._root_owner.fd)
             named = os.stat(
                 self._root_basename,
-                dir_fd=self._parent_fd,
+                dir_fd=self._parent_owner.fd,
                 follow_symlinks=False,
             )
             exact = (
@@ -777,28 +948,36 @@ class AnonymousAudioStage:
                 and held.st_ino == self._root_inode
                 and held.st_uid == self._root_uid
                 and held.st_gid == self._root_gid
-                and os.listdir(self._root_fd) == []
+                and os.listdir(self._root_owner.fd) == []
             )
             if exact:
-                os.rmdir(self._root_basename, dir_fd=self._parent_fd)
+                os.rmdir(self._root_basename, dir_fd=self._parent_owner.fd)
         except OSError:
             pass
-        finally:
-            self._close_root_descriptors()
 
     def _close_root_descriptors(self) -> None:
-        if self._root_fd >= 0:
+        failed = False
+        first_stop: BaseException | None = None
+        if self._root_owner.state not in ("empty", "released"):
             try:
-                os.close(self._root_fd)
+                _close_owned_descriptor(self._root_owner)
             except OSError:
-                pass
-            self._root_fd = -1
-        if self._parent_fd >= 0:
+                failed = True
+            except BaseException as exc:
+                first_stop = exc
+        if self._parent_owner.state not in ("empty", "released"):
             try:
-                os.close(self._parent_fd)
+                _close_owned_descriptor(self._parent_owner)
             except OSError:
-                pass
-            self._parent_fd = -1
+                failed = True
+            except BaseException as exc:
+                if first_stop is None:
+                    first_stop = exc
+        self._sync_descriptor_fields()
+        if failed:
+            raise AnonymousAudioScrubError(_SCRUB_ERROR)
+        if first_stop is not None:
+            raise first_stop
 
 
 del _temporary_issue_provider_audio_sink

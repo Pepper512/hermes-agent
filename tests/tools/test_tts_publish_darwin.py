@@ -28,6 +28,7 @@ def _publish(tmp_path: Path, destination: Path):
     error = None
     with bind_persistence_policy(PersistencePolicy.DURABLE):
         with TTSTransaction.begin(4096) as transaction:
+            transaction.reserve_stage_limit()
             transaction.add_sealed(stage, sealed)
             try:
                 published = publish_durable(transaction.decide(), destination)

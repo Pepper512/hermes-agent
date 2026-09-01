@@ -37,6 +37,15 @@ class TTSTransactionStop(TTSTransactionError):
     """High-severity stop because descriptor destruction was not proved."""
 
 
+def _is_publish_uncertain(error: BaseException) -> bool:
+    """Recognize only the genuine late-imported publication control type."""
+    try:
+        from tools.tts_publish import TTSPublishUncertain
+    except ImportError:
+        return False
+    return type(error) is TTSPublishUncertain
+
+
 def _create_transaction_boundary():
     boundary_lock = RLock()
     claimed_stages: dict[object, object] = {}
@@ -171,6 +180,8 @@ def _create_transaction_boundary():
             "__lock",
             "__observation",
             "__permit",
+            "__remaining_bytes",
+            "__reserved_limit",
             "__scrub_failed_ever",
             "__stages",
             "__state",
@@ -214,6 +225,14 @@ def _create_transaction_boundary():
                     transaction, "_TTSTransaction__permit", None
                 )
                 object.__setattr__(
+                    transaction,
+                    "_TTSTransaction__remaining_bytes",
+                    aggregate_cap,
+                )
+                object.__setattr__(
+                    transaction, "_TTSTransaction__reserved_limit", None
+                )
+                object.__setattr__(
                     transaction, "_TTSTransaction__scrub_failed_ever", False
                 )
                 object.__setattr__(
@@ -238,13 +257,29 @@ def _create_transaction_boundary():
                         transaction.__remember_scrub_failure()
                         transaction.__abort_if_unconsumed()
                         raise TTSTransactionStop(_SCRUB_ERROR) from None
-                    except Exception:
+                    except Exception as exc:
                         transaction.__abort_if_unconsumed()
+                        if _is_publish_uncertain(exc):
+                            raise
                         raise TTSTransactionError(_TRANSACTION_ERROR) from None
                     finally:
                         transaction.__abort_if_unconsumed()
                 finally:
                     active_transactions.reset(active_token)
+
+        def reserve_stage_limit(self) -> int:
+            """Issue the exact remaining byte budget for one provider stage."""
+            with self.__lock:
+                if self.__state != "open":
+                    raise TTSTransactionError(_TRANSACTION_ERROR)
+                if (
+                    self.__reserved_limit is not None
+                    or self.__remaining_bytes <= 0
+                ):
+                    self.__scrub_all()
+                    raise TTSTransactionError(_TRANSACTION_ERROR)
+                self.__reserved_limit = self.__remaining_bytes
+                return self.__reserved_limit
 
         def add_sealed(
             self,
@@ -254,7 +289,20 @@ def _create_transaction_boundary():
             with self.__lock:
                 if self.__state != "open":
                     self.__fail_add(stage)
-                if not self.__valid_pair(stage, sealed):
+                if type(stage) is AnonymousAudioStage:
+                    with boundary_lock:
+                        if claimed_stages.get(stage._authority) is not None:
+                            self.__fail_add(stage)
+                reserved_limit = self.__reserved_limit
+                if (
+                    type(reserved_limit) is not int
+                    or not self.__valid_pair(stage, sealed)
+                    or stage.sink.maximum_bytes != reserved_limit
+                    or type(sealed._size) is not int
+                    or sealed._size <= 0
+                    or sealed._size > reserved_limit
+                    or sealed._size > self.__remaining_bytes
+                ):
                     self.__fail_add(stage)
                 with boundary_lock:
                     stage_key = stage._authority
@@ -266,10 +314,15 @@ def _create_transaction_boundary():
                     self.__stages.append((stage, sealed))
                 except BaseException:
                     self.__fail_add(stage)
+                self.__remaining_bytes -= sealed._size
+                self.__reserved_limit = None
 
         def decide(self) -> EphemeralDelivery | DurablePublicationPermit:
             with self.__lock:
                 if self.__state != "open":
+                    raise TTSTransactionError(_TRANSACTION_ERROR)
+                if self.__reserved_limit is not None:
+                    self.__scrub_all()
                     raise TTSTransactionError(_TRANSACTION_ERROR)
                 self.__state = "deciding"
                 if not self.__stages:
@@ -335,6 +388,8 @@ def _create_transaction_boundary():
                 ):
                     raise TTSTransactionError(_TRANSACTION_ERROR)
                 total += size
+            if total != self.__aggregate_cap - self.__remaining_bytes:
+                raise TTSTransactionError(_TRANSACTION_ERROR)
             return total
 
         def __revalidate_all(
@@ -397,8 +452,10 @@ def _create_transaction_boundary():
                     self.__remember_scrub_failure()
                     self.__scrub_all()
                     raise TTSTransactionStop(_SCRUB_ERROR) from None
-                except Exception:
+                except Exception as exc:
                     self.__scrub_all()
+                    if _is_publish_uncertain(exc):
+                        raise
                     raise TTSTransactionError(_TRANSACTION_ERROR) from None
                 except BaseException:
                     self.__scrub_all()
@@ -462,6 +519,7 @@ def _create_transaction_boundary():
         def __scrub_all(self) -> None:
             unregister_permit(self.__permit, self)
             self.__permit = None
+            self.__reserved_limit = None
             failed = self.__scrub_failed_ever
             remaining: list[tuple[AnonymousAudioStage, SealedAudio]] = []
             for stage, sealed in self.__stages:

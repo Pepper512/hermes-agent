@@ -6,10 +6,15 @@ from pathlib import Path
 import signal
 import sys
 import threading
+from types import SimpleNamespace
 
 import pytest
 
-from hermes_cli.persistence import PersistencePolicy, bind_persistence_policy
+from hermes_cli.persistence import (
+    PersistenceObservation,
+    PersistencePolicy,
+    bind_persistence_policy,
+)
 from tools import tts_publish as tts_publish_module
 from tools.tts_publish import (
     PublishedAudio,
@@ -90,6 +95,7 @@ def _publish_one(stage_parent: Path, destination: Path) -> PublishedAudio:
     error = None
     with bind_persistence_policy(PersistencePolicy.DURABLE):
         with TTSTransaction.begin(4096) as transaction:
+            transaction.reserve_stage_limit()
             transaction.add_sealed(stage, sealed)
             try:
                 published = publish_durable(transaction.decide(), destination)
@@ -150,6 +156,7 @@ def test_permit_rejects_clone_before_destination_access(tmp_path: Path):
     destination = tmp_path / "missing-parent" / "voice.mp3"
     with bind_persistence_policy(PersistencePolicy.DURABLE):
         with TTSTransaction.begin(4096) as transaction:
+            transaction.reserve_stage_limit()
             transaction.add_sealed(stage, sealed)
             permit = transaction.decide()
             clone = object.__new__(DurablePublicationPermit)
@@ -169,9 +176,11 @@ def test_permit_replay_and_cross_transaction_reject_before_destination_access(
     destination = tmp_path / "voice.mp3"
     with bind_persistence_policy(PersistencePolicy.DURABLE):
         with TTSTransaction.begin(4096) as outer:
+            outer.reserve_stage_limit()
             outer.add_sealed(first, first_sealed)
             permit = outer.decide()
             with TTSTransaction.begin(4096) as inner:
+                inner.reserve_stage_limit()
                 inner.add_sealed(second, second_sealed)
                 with pytest.raises(TTSTransactionError):
                     publish_durable(permit, destination)
@@ -191,6 +200,7 @@ def test_inactive_permit_rejects_without_destination_access(tmp_path: Path):
     stage, sealed = _sealed_stage(tmp_path / "stage")
     with bind_persistence_policy(PersistencePolicy.DURABLE):
         with TTSTransaction.begin(4096) as transaction:
+            transaction.reserve_stage_limit()
             transaction.add_sealed(stage, sealed)
             permit = transaction.decide()
     destination = tmp_path / "voice.mp3"
@@ -338,6 +348,114 @@ def test_temp_name_substitution_scrubs_held_original_without_unlinking_replaceme
     assert len(current) == 1
     assert current[0].read_bytes() == replacement
     assert (tmp_path / "held-original").stat().st_size == 0
+
+
+@pytest.mark.parametrize("preexisting", [False, True])
+def test_temp_name_substitution_during_digest_is_rejected_before_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    preexisting: bool,
+):
+    """Removing the final post-digest identity proof must fail this test."""
+
+    from tools import tts_publish
+
+    destination = tmp_path / "voice.mp3"
+    original_destination = b"authorized-old"
+    if preexisting:
+        destination.write_bytes(original_destination)
+    replacement = b"ID3\x04\x00\x00\x00\x00\x00\x00untrusted-replacement"
+    moved = tmp_path / "held-original"
+    real_read = os.read
+    substituted = False
+
+    def substitute_on_publication_digest(fd: int, size: int) -> bytes:
+        nonlocal substituted
+        names = list(tmp_path.glob(".hermes-tts-publish-*"))
+        if not substituted and len(names) == 1:
+            named = names[0]
+            held = os.fstat(fd)
+            current = named.stat(follow_symlinks=False)
+            if (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino):
+                substituted = True
+                named.rename(moved)
+                named.write_bytes(replacement)
+        return real_read(fd, size)
+
+    monkeypatch.setattr(tts_publish.os, "read", substitute_on_publication_digest)
+    with pytest.raises(TTSPublishError, match="^tts_durable_publication_failed$"):
+        _publish_one(tmp_path / "stage", destination)
+
+    assert substituted
+    if preexisting:
+        assert destination.read_bytes() == original_destination
+    else:
+        assert not destination.exists()
+    replacement_names = list(tmp_path.glob(".hermes-tts-publish-*"))
+    assert len(replacement_names) == 1
+    assert replacement_names[0].read_bytes() == replacement
+    assert moved.stat().st_size == 0
+
+
+@pytest.mark.parametrize(
+    "delivered_signal",
+    [signal.SIGINT, getattr(signal, "SIGUSR1", signal.SIGTERM)],
+)
+def test_real_signal_policy_transition_is_deferred_through_existing_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    delivered_signal: signal.Signals,
+):
+    """Dropping final publication signal deferral must fail this test."""
+
+    from tools import tts_publish
+
+    if not hasattr(signal, "pthread_sigmask"):
+        pytest.skip("pthread_sigmask unavailable")
+    destination = tmp_path / "voice.mp3"
+    destination.write_bytes(b"authorized-old")
+    prior_handler = signal.getsignal(delivered_signal)
+    prior_mask = signal.pthread_sigmask(signal.SIG_UNBLOCK, {delivered_signal})
+    events: list[str] = []
+    observation_count = 0
+    real_ever_ephemeral = PersistenceObservation.ever_ephemeral.fget
+    assert real_ever_ephemeral is not None
+
+    def transition_then_raise(_signum, _frame):
+        with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
+            events.append("handler")
+        raise _SignalCancellation()
+
+    def observe_then_signal(self):
+        nonlocal observation_count
+        observed = real_ever_ephemeral(self)
+        observation_count += 1
+        if observation_count < 3:
+            return observed
+        events.append("observation")
+        signal.pthread_kill(threading.get_ident(), delivered_signal)
+        events.append("returned")
+        return observed
+
+    signal.signal(delivered_signal, transition_then_raise)
+    monkeypatch.setattr(
+        PersistenceObservation,
+        "ever_ephemeral",
+        property(observe_then_signal),
+    )
+    try:
+        with pytest.raises(
+            TTSPublishUncertain,
+            match="^tts_durable_publication_uncertain$",
+        ):
+            _publish_one(tmp_path / "stage", destination)
+        assert events == ["observation", "returned", "handler"]
+        assert destination.read_bytes() == VALID_MP3
+    finally:
+        signal.signal(delivered_signal, signal.SIG_IGN)
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {delivered_signal})
+        signal.signal(delivered_signal, prior_handler)
+        signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
 
 
 @pytest.mark.parametrize("drift", ["mode", "hardlink", "inode", "symlink"])
@@ -673,23 +791,30 @@ def test_same_length_held_temp_mutation_after_fsync_fails_digest_check(
     )
 
 
-def test_same_length_temp_mutation_in_last_revalidation_fails_digest_check(
+def test_same_length_temp_mutation_during_digest_fails_before_final_revalidation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     from tools import tts_publish
 
     destination = tmp_path / "voice.mp3"
-    real_revalidate = tts_publish._revalidate_publication_temp
+    real_read = os.read
+    mutated = False
 
-    def revalidate_then_mutate(parent, temp, size):
-        real_revalidate(parent, temp, size)
-        os.pwrite(temp.fd, b"X", len(VALID_MP3) - 1)
+    def mutate_publication_temp_then_read(fd: int, size: int) -> bytes:
+        nonlocal mutated
+        names = list(tmp_path.glob(".hermes-tts-publish-*"))
+        if not mutated and len(names) == 1:
+            named = names[0].stat(follow_symlinks=False)
+            held = os.fstat(fd)
+            if (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino):
+                os.pwrite(fd, b"X", len(VALID_MP3) - 1)
+                mutated = True
+        return real_read(fd, size)
 
-    monkeypatch.setattr(
-        tts_publish, "_revalidate_publication_temp", revalidate_then_mutate
-    )
+    monkeypatch.setattr(tts_publish.os, "read", mutate_publication_temp_then_read)
     with pytest.raises(TTSPublishError):
         _publish_one(tmp_path / "stage", destination)
+    assert mutated
     assert not destination.exists()
     assert all(
         path.stat().st_size == 0
@@ -1599,7 +1724,11 @@ def test_missing_signal_mask_support_fails_before_materialization(
 ):
     from tools import tts_publish
 
-    monkeypatch.delattr(tts_publish.signal, "pthread_sigmask", raising=False)
+    monkeypatch.setattr(
+        tts_publish,
+        "signal",
+        SimpleNamespace(valid_signals=signal.valid_signals),
+    )
     with pytest.raises(TTSTransactionError, match="^tts_generation_failed$"):
         _publish_one(tmp_path / "stage", tmp_path / "voice.mp3")
     assert not list(tmp_path.glob(".hermes-tts-publish-*"))

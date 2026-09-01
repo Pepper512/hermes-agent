@@ -829,8 +829,6 @@ def _publish_one(
         _materialize_publication_temp(parent, temp)
         _copy_sealed_to_publication(stage, sealed, temp)
         _fsync_publication_file(temp.fd)
-        _revalidate_parent(parent)
-        _revalidate_publication_temp(parent, temp, sealed._size)
         if (
             _prepare_publication_call is not canonical_prepare
             or _verify_publication_digest is not canonical_verify
@@ -864,41 +862,48 @@ def _publish_one(
                 signature_is_plain = False
             if not signature_is_plain:
                 raise TTSPublishError(_PUBLISH_ERROR)
+        masker, catchable = _require_signal_deferral_support()
         outcome.status = "uncertain"
         temp.publication_armed = True
-        if publication_kind == "replace":
+        previous_mask = masker(signal.SIG_BLOCK, catchable)
+        try:
+            _revalidate_parent(parent)
+            _revalidate_publication_temp(parent, temp, sealed._size)
+            if publication_kind != "replace":
+                ctypes.set_errno(0)
             if (
                 observation.current_policy is not PersistencePolicy.DURABLE
                 or observation.ever_ephemeral
             ):
                 outcome.status = "failed"
                 raise TTSPublishError(_PUBLISH_ERROR)
-            native_result = native_callable(
-                source_name,
-                destination_name,
-                src_dir_fd=source_dir_fd,
-                dst_dir_fd=destination_dir_fd,
-            )
-        else:
-            ctypes.set_errno(0)
-            if (
-                observation.current_policy is not PersistencePolicy.DURABLE
-                or observation.ever_ephemeral
-            ):
+            if publication_kind == "replace":
+                native_result = native_callable(
+                    source_name,
+                    destination_name,
+                    src_dir_fd=source_dir_fd,
+                    dst_dir_fd=destination_dir_fd,
+                )
+            else:
+                native_result = native_callable(
+                    source_dir_fd,
+                    source_name,
+                    destination_dir_fd,
+                    destination_name,
+                    flags,
+                )
+            if publication_kind != "replace" and native_result != 0:
+                error = ctypes.get_errno() or errno.EIO
                 outcome.status = "failed"
-                raise TTSPublishError(_PUBLISH_ERROR)
-            native_result = native_callable(
-                source_dir_fd,
-                source_name,
-                destination_dir_fd,
-                destination_name,
-                flags,
-            )
-        if publication_kind != "replace" and native_result != 0:
-            error = ctypes.get_errno() or errno.EIO
-            outcome.status = "failed"
-            raise OSError(error, "durable publication unavailable")
-        temp.published = True
+                raise OSError(error, "durable publication unavailable")
+            temp.published = True
+        except Exception:
+            if not temp.published:
+                outcome.status = "failed"
+                temp.publication_armed = False
+            raise
+        finally:
+            masker(signal.SIG_SETMASK, previous_mask)
         _fsync_parent(parent.fd)
         outcome.status = "published"
     except AnonymousAudioScrubError:

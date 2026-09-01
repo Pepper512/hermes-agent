@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 
 import pytest
 
@@ -907,6 +909,277 @@ def test_close_failure_can_be_retried_without_path_cleanup(
     stage.scrub_and_close()
     with pytest.raises(OSError):
         os.fstat(held_fd)
+
+
+class _StageSignalCancellation(BaseException):
+    pass
+
+
+@pytest.mark.parametrize("owner_name", ["audio", "root", "parent"])
+@pytest.mark.parametrize(
+    "delivered_signal",
+    [signal.SIGINT, getattr(signal, "SIGUSR1", signal.SIGTERM)],
+)
+def test_stage_close_defers_real_signal_until_descriptor_is_retired(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    owner_name: str,
+    delivered_signal: signal.Signals,
+):
+    """Removing close-to-retire signal deferral must fail this test."""
+
+    if not hasattr(signal, "pthread_sigmask"):
+        pytest.skip("pthread_sigmask unavailable")
+    stage = _test_stage("mp3", 1024, tmp_path)
+    _write_valid(stage)
+    target_fd = {
+        "audio": stage._fd,
+        "root": stage._root_fd,
+        "parent": stage._parent_fd,
+    }[owner_name]
+    sentinel = tmp_path / f"sentinel-{owner_name}"
+    sentinel.write_bytes(b"unrelated")
+    sentinel_fd: int | None = None
+    real_close = os.close
+    prior_handler = signal.getsignal(delivered_signal)
+    prior_mask = signal.pthread_sigmask(signal.SIG_UNBLOCK, {delivered_signal})
+    delivered = False
+    close_injected = False
+
+    def reuse_then_raise(_signum, _frame):
+        nonlocal delivered, sentinel_fd
+        delivered = True
+        sentinel_fd = os.open(sentinel, os.O_RDWR)
+        assert sentinel_fd == target_fd
+        raise _StageSignalCancellation()
+
+    def close_then_signal(fd: int) -> None:
+        nonlocal close_injected
+        real_close(fd)
+        if fd == target_fd and not close_injected:
+            close_injected = True
+            signal.pthread_kill(threading.get_ident(), delivered_signal)
+            assert not delivered
+
+    signal.signal(delivered_signal, reuse_then_raise)
+    monkeypatch.setattr(os, "close", close_then_signal)
+    try:
+        with pytest.raises(_StageSignalCancellation):
+            stage.scrub_and_close()
+        assert delivered
+        stage.scrub_and_close()
+        assert sentinel_fd is not None
+        os.fstat(sentinel_fd)
+        assert os.pread(sentinel_fd, len(b"unrelated"), 0) == b"unrelated"
+        assert stage._fd == -1
+        assert stage._root_fd == -1
+        assert stage._parent_fd == -1
+    finally:
+        monkeypatch.setattr(os, "close", real_close)
+        try:
+            stage.scrub_and_close()
+        except BaseException:
+            pass
+        if sentinel_fd is not None:
+            try:
+                real_close(sentinel_fd)
+            except OSError:
+                pass
+        signal.signal(delivered_signal, signal.SIG_IGN)
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {delivered_signal})
+        signal.signal(delivered_signal, prior_handler)
+        signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+
+
+def test_concurrent_stage_scrub_never_closes_reused_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Removing serialized one-shot close custody must fail this test."""
+
+    stage = _test_stage("mp3", 1024, tmp_path)
+    _write_valid(stage)
+    target_fd = stage._fd
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_bytes(b"unrelated")
+    real_close = os.close
+    first_closed = threading.Event()
+    allow_first_return = threading.Event()
+    sentinel_fd: int | None = None
+    close_calls = 0
+    errors: list[BaseException] = []
+
+    def close_with_reuse(fd: int) -> None:
+        nonlocal close_calls, sentinel_fd
+        if fd != target_fd:
+            real_close(fd)
+            return
+        close_calls += 1
+        if close_calls == 1:
+            real_close(fd)
+            sentinel_fd = os.open(sentinel, os.O_RDWR)
+            assert sentinel_fd == target_fd
+            first_closed.set()
+            assert allow_first_return.wait(timeout=2)
+            return
+        real_close(fd)
+
+    def scrub() -> None:
+        try:
+            stage.scrub_and_close()
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(os, "close", close_with_reuse)
+    first = threading.Thread(target=scrub)
+    second = threading.Thread(target=scrub)
+    try:
+        first.start()
+        assert first_closed.wait(timeout=2)
+        second.start()
+        allow_first_return.set()
+        first.join(timeout=2)
+        second.join(timeout=2)
+        assert not first.is_alive() and not second.is_alive()
+        assert errors == []
+        assert close_calls == 1
+        assert sentinel_fd is not None
+        os.fstat(sentinel_fd)
+        assert os.pread(sentinel_fd, len(b"unrelated"), 0) == b"unrelated"
+    finally:
+        allow_first_return.set()
+        first.join(timeout=2)
+        second.join(timeout=2)
+        monkeypatch.setattr(os, "close", real_close)
+        if sentinel_fd is not None:
+            try:
+                real_close(sentinel_fd)
+            except OSError:
+                pass
+
+
+@pytest.mark.parametrize("owner_name", ["root", "parent"])
+def test_stage_retry_preserves_same_inode_reopened_on_interrupted_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    owner_name: str,
+):
+    stage = _test_stage("mp3", 1024, tmp_path)
+    _write_valid(stage)
+    root_path = next(tmp_path.glob("hermes-tts-*"))
+    if owner_name == "root":
+        (root_path / "preserve-root").touch(mode=0o600)
+    target_fd = stage._root_fd if owner_name == "root" else stage._parent_fd
+    reopen_path = root_path if owner_name == "root" else tmp_path
+    real_close = os.close
+    reopened_fd: int | None = None
+    injected = False
+
+    def close_reopen_then_stop(fd: int) -> None:
+        nonlocal injected, reopened_fd
+        real_close(fd)
+        if fd == target_fd and not injected:
+            injected = True
+            reopened_fd = os.open(reopen_path, os.O_RDONLY | os.O_DIRECTORY)
+            assert reopened_fd == target_fd
+            raise _StageSignalCancellation()
+
+    monkeypatch.setattr(os, "close", close_reopen_then_stop)
+    try:
+        with pytest.raises(_StageSignalCancellation):
+            stage.scrub_and_close()
+        monkeypatch.setattr(os, "close", real_close)
+        stage._close_root_descriptors()
+        assert reopened_fd is not None
+        reopened = os.fstat(reopened_fd)
+        original = reopen_path.stat()
+        assert (reopened.st_dev, reopened.st_ino) == (
+            original.st_dev,
+            original.st_ino,
+        )
+    finally:
+        monkeypatch.setattr(os, "close", real_close)
+        if reopened_fd is not None:
+            try:
+                real_close(reopened_fd)
+            except OSError:
+                pass
+
+
+def test_failed_creation_close_signal_uses_registered_one_shot_custody(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    if not hasattr(signal, "pthread_sigmask"):
+        pytest.skip("pthread_sigmask unavailable")
+    delivered_signal = getattr(signal, "SIGUSR1", signal.SIGTERM)
+    sentinel = tmp_path / "failed-creation-sentinel"
+    sentinel.write_bytes(b"unrelated")
+    sentinel_fd: int | None = None
+    target_fd: int | None = None
+    delivered = False
+    real_close = os.close
+    prior_handler = signal.getsignal(delivered_signal)
+    prior_mask = signal.pthread_sigmask(signal.SIG_UNBLOCK, {delivered_signal})
+
+    def fail_unlink(*_args, **_kwargs):
+        raise OSError("injected unlink failure")
+
+    def reopen_then_raise(_signum, _frame):
+        nonlocal delivered, sentinel_fd
+        delivered = True
+        sentinel_fd = os.open(sentinel, os.O_RDWR)
+        assert sentinel_fd == target_fd
+        raise _StageSignalCancellation()
+
+    def close_audio_then_signal(fd: int) -> None:
+        nonlocal target_fd
+        held = os.fstat(fd)
+        real_close(fd)
+        if target_fd is None and stat.S_ISREG(held.st_mode):
+            target_fd = fd
+            signal.pthread_kill(threading.get_ident(), delivered_signal)
+            assert not delivered
+
+    supported_dir_fd = set(os.supports_dir_fd)
+    supported_dir_fd.add(fail_unlink)
+    monkeypatch.setattr(os, "supports_dir_fd", supported_dir_fd)
+    monkeypatch.setattr(os, "unlink", fail_unlink)
+    monkeypatch.setattr(os, "close", close_audio_then_signal)
+    signal.signal(delivered_signal, reopen_then_raise)
+    try:
+        with pytest.raises(AnonymousAudioScrubError):
+            _test_stage("mp3", 1024, tmp_path)
+        assert delivered
+        assert sentinel_fd is not None
+        os.fstat(sentinel_fd)
+        assert os.pread(sentinel_fd, len(b"unrelated"), 0) == b"unrelated"
+    finally:
+        monkeypatch.setattr(os, "close", real_close)
+        if sentinel_fd is not None:
+            try:
+                real_close(sentinel_fd)
+            except OSError:
+                pass
+        signal.signal(delivered_signal, signal.SIG_IGN)
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {delivered_signal})
+        signal.signal(delivered_signal, prior_handler)
+        signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+
+
+def test_stage_close_restores_exact_prior_signal_mask(tmp_path: Path):
+    if not hasattr(signal, "pthread_sigmask") or not hasattr(signal, "SIGUSR2"):
+        pytest.skip("pthread signal masks unavailable")
+    prior = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR2})
+    try:
+        expected = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        stage = _test_stage("mp3", 1024, tmp_path)
+        _write_valid(stage)
+        stage.scrub_and_close()
+        actual = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        assert actual == expected
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, prior)
 
 
 def test_root_namespace_drift_preserves_all_unproved_names(tmp_path: Path):
