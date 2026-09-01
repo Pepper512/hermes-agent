@@ -15,6 +15,7 @@ import hashlib
 import os
 from pathlib import Path
 import secrets
+import signal
 import stat
 import sys
 import threading
@@ -110,6 +111,27 @@ class _PreparedPublicationCall:
     flags: int
     expected_argtypes: tuple[object, ...] | None = None
     expected_restype: object = None
+
+
+def _require_signal_deferral_support():
+    if sys.platform != "darwin" and not sys.platform.startswith("linux"):
+        raise TTSPublishError(_PUBLISH_ERROR)
+    masker = getattr(signal, "pthread_sigmask", None)
+    valid_signals = getattr(signal, "valid_signals", None)
+    if not callable(masker) or not callable(valid_signals):
+        raise TTSPublishError(_PUBLISH_ERROR)
+    excluded = {
+        candidate
+        for candidate in (
+            getattr(signal, "SIGKILL", None),
+            getattr(signal, "SIGSTOP", None),
+        )
+        if candidate is not None
+    }
+    catchable = frozenset(valid_signals()) - excluded
+    if not catchable:
+        raise TTSPublishError(_PUBLISH_ERROR)
+    return masker, catchable
 
 
 def _load_libc_symbol(name: str):
@@ -378,7 +400,12 @@ def _open_held_parent(
     if custody is not None:
         custody.parent = parent
     try:
-        parent.fd = os.open(destination.parent, flags)
+        masker, catchable = _require_signal_deferral_support()
+        previous_mask = masker(signal.SIG_BLOCK, catchable)
+        try:
+            parent.fd = os.open(destination.parent, flags)
+        finally:
+            masker(signal.SIG_SETMASK, previous_mask)
         held = os.fstat(parent.fd)
         parent.stat = held
         named = os.stat(destination.parent, follow_symlinks=False)
@@ -452,16 +479,28 @@ def _materialize_publication_temp(
     flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
+    masker, catchable = _require_signal_deferral_support()
     for _attempt in range(8):
         name = f".hermes-tts-publish-{secrets.token_hex(16)}"
         try:
-            fd = os.open(name, flags, 0o600, dir_fd=parent.fd)
+            previous_mask = masker(signal.SIG_BLOCK, catchable)
+            try:
+                temp.fd = os.open(name, flags, 0o600, dir_fd=parent.fd)
+                temp.name = name
+            finally:
+                masker(signal.SIG_SETMASK, previous_mask)
         except FileExistsError:
             continue
-        except OSError:
-            raise TTSPublishError(_PUBLISH_ERROR) from None
-        temp.fd = fd
-        temp.name = name
+        except BaseException as exc:
+            if temp.fd >= 0:
+                try:
+                    _scrub_and_close_owned_fd(temp)
+                except AnonymousAudioScrubError:
+                    raise
+            if isinstance(exc, OSError):
+                raise TTSPublishError(_PUBLISH_ERROR) from None
+            raise
+        fd = temp.fd
         try:
             temp.stat = os.fstat(fd)
             os.fchown(fd, os.getuid(), os.getgid())
@@ -648,6 +687,7 @@ def _same_owned_open_description(
 
 
 def _close_owned_fd(owner: _HeldParent | _PublicationTemp) -> None:
+    masker, catchable = _require_signal_deferral_support()
     with owner.close_lock:
         owns_attempt = False
         try:
@@ -667,8 +707,12 @@ def _close_owned_fd(owner: _HeldParent | _PublicationTemp) -> None:
             elif not _same_owned_open_description(owner):
                 owner.close_state = "released"
                 return
-            os.close(owner.fd)
-            owner.close_state = "released"
+            previous_mask = masker(signal.SIG_BLOCK, catchable)
+            try:
+                os.close(owner.fd)
+                owner.close_state = "released"
+            finally:
+                masker(signal.SIG_SETMASK, previous_mask)
         finally:
             if owns_attempt:
                 owner.close_active = False
