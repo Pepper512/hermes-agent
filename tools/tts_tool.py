@@ -40,13 +40,17 @@ import datetime
 import importlib.util
 import json
 import logging
+import math
 import os
 import queue
 import platform
 import re
+import signal
 import shlex
 import shutil
+import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -61,6 +65,19 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_constants import display_hermes_home
 
 logger = logging.getLogger(__name__)
+
+_COMMAND_SINK_LIFECYCLE_ERROR = "tts_command_sink_lifecycle_failed"
+_REVIEWED_POPEN_CLASS = next(
+    candidate
+    for candidate in subprocess.Popen.__mro__
+    if candidate.__module__ == "subprocess" and candidate.__name__ == "Popen"
+)
+
+
+class CommandSinkLifecycleError(RuntimeError):
+    """Fixed, command/transcript/output-free sink lifecycle failure."""
+
+
 def get_env_value(name, default=None):
     """Read env values through the live config module.
 
@@ -1119,6 +1136,206 @@ def _render_command_tts_template(
     return rendered
 
 
+def _descriptor_number_from_sink_path(sink_path: str) -> int:
+    """Return the fd encoded by a canonical anonymous-sink descriptor path.
+
+    This helper is part of the trusted command-launch boundary.  It accepts
+    only the two reviewed Darwin/Linux descriptor namespaces and never accepts
+    a caller destination or another filesystem path.
+    """
+    if not isinstance(sink_path, str):
+        raise ValueError("invalid anonymous TTS sink")
+    prefixes = ("/dev/fd/", "/proc/self/fd/")
+    prefix = next((item for item in prefixes if sink_path.startswith(item)), None)
+    if prefix is None:
+        raise ValueError("invalid anonymous TTS sink")
+    encoded = sink_path[len(prefix):]
+    if not encoded.isascii() or not encoded.isdecimal():
+        raise ValueError("invalid anonymous TTS sink")
+    descriptor = int(encoded)
+    if descriptor < 0 or str(descriptor) != encoded:
+        raise ValueError("invalid anonymous TTS sink")
+    return descriptor
+
+
+def _render_command_tts_sink_template(
+    command_template: str,
+    *,
+    input_path: str | None = None,
+    sink: "ProviderAudioSink",
+    voice: str,
+    model: str,
+    speed: str,
+) -> str:
+    """Render a command against the restricted sink contract.
+
+    This prepares the parallel Task 3 boundary only.  Process inheritance and
+    lifecycle ownership remain fail-closed until the Task 4 launcher supplies
+    ``pass_fds`` and full process-tree reaping.
+    """
+    from tools.tts_staging import _validate_provider_audio_sink
+
+    path, output_format, maximum_bytes = _validate_provider_audio_sink(sink)
+    if sys.platform == "darwin":
+        stdin_path = "/dev/fd/0"
+    elif sys.platform.startswith("linux"):
+        stdin_path = "/proc/self/fd/0"
+    else:
+        raise ValueError("tts_anonymous_sink_unsupported")
+    placeholders = {
+        # A pre-Task-4 caller may still pass ``input_path``.  It has no
+        # authority: descriptor stdin is the only rendered input location.
+        "input_path": stdin_path,
+        "text_path": stdin_path,
+        "output_path": path,
+        "format": output_format,
+        "maximum_bytes": str(maximum_bytes),
+        "voice": voice,
+        "model": model,
+        "speed": speed,
+    }
+    return _render_command_tts_template(command_template, placeholders)
+
+
+def _posix_process_group_exists(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)  # windows-footgun: ok - all callers require os.name == "posix"
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _stop_command_tts_process_group(
+    proc: subprocess.Popen,
+    owned_pgid: int | None,
+) -> None:
+    """Terminate and reap the launcher's entire owned process group.
+
+    The group id is captured at spawn and used even after the shell leader has
+    exited.  This is deliberately stdlib-only and idempotent.
+    """
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                stdin=subprocess.DEVNULL,
+            )
+        except BaseException:
+            try:
+                proc.kill()
+            except BaseException:
+                pass
+        try:
+            proc.wait(timeout=2)
+        except BaseException:
+            pass
+        return
+
+    if owned_pgid is None:
+        raise RuntimeError(_COMMAND_SINK_LIFECYCLE_ERROR)
+    try:
+        os.killpg(owned_pgid, signal.SIGTERM)  # windows-footgun: ok - Windows returned above
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        proc.wait(timeout=0.1)
+    except BaseException:
+        pass
+    deadline = time.monotonic() + 0.1
+    while _posix_process_group_exists(owned_pgid) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if _posix_process_group_exists(owned_pgid):
+        try:
+            os.killpg(owned_pgid, signal.SIGKILL)  # windows-footgun: ok - Windows returned above
+        except (ProcessLookupError, PermissionError):
+            pass
+        deadline = time.monotonic() + 0.1
+        while _posix_process_group_exists(owned_pgid) and time.monotonic() < deadline:
+            time.sleep(0.01)
+    try:
+        proc.wait(timeout=0.2)
+    except BaseException:
+        try:
+            proc.kill()
+        except BaseException:
+            pass
+        try:
+            proc.wait(timeout=0.2)
+        except BaseException:
+            pass
+    deadline = time.monotonic() + 0.1
+    while _posix_process_group_exists(owned_pgid) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if _posix_process_group_exists(owned_pgid):
+        raise RuntimeError("tts_provider_lifecycle_failed")
+
+
+def _fallback_stop_command_tts_process_group(
+    proc: subprocess.Popen,
+    owned_pgid: int | None,
+) -> None:
+    """Independent stdlib fallback when the primary group stop fails."""
+    failures = 0
+
+    def group_exists() -> bool | None:
+        nonlocal failures
+        if owned_pgid is None:
+            return False
+        try:
+            return _posix_process_group_exists(owned_pgid)
+        except BaseException:
+            failures += 1
+            return None
+
+    if os.name == "posix" and owned_pgid is not None:
+        try:
+            for sig in (signal.SIGTERM, signal.SIGKILL):  # windows-footgun: ok - guarded by os.name == "posix"
+                try:
+                    os.killpg(owned_pgid, sig)  # windows-footgun: ok - guarded by os.name == "posix"
+                except ProcessLookupError:
+                    break
+                except BaseException:
+                    failures += 1
+                deadline = time.monotonic() + 0.25
+                state = group_exists()
+                while state is True and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                    state = group_exists()
+                if state is False:
+                    break
+        except BaseException:
+            failures += 1
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+    except BaseException:
+        failures += 1
+    try:
+        proc.wait(timeout=0.5)
+    except BaseException:
+        failures += 1
+    final_group_state = (
+        group_exists() if os.name == "posix" and owned_pgid is not None else False
+    )
+    try:
+        child_alive = proc.poll() is None
+    except BaseException:
+        failures += 1
+        child_alive = True
+    if (
+        failures
+        or final_group_state is not False
+        or child_alive
+    ):
+        raise RuntimeError(_COMMAND_SINK_LIFECYCLE_ERROR)
+
+
 def _terminate_command_tts_process_tree(proc: subprocess.Popen) -> None:
     """Best-effort termination of a shell process and all of its children."""
     if proc.poll() is not None:
@@ -1189,12 +1406,28 @@ def _run_command_tts(
     command: str,
     timeout: float,
     env_passthrough: Optional[list] = None,
-) -> subprocess.CompletedProcess:
-    """Run a command-provider shell command with process-tree idle cleanup.
+    *,
+    inherited_sink_fd: int | None = None,
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess | None:
+    """Run either the unchanged named path or parallel anonymous-sink path."""
+    if inherited_sink_fd is not None or input_text is not None:
+        return _run_command_tts_sink_process(
+            command,
+            timeout,
+            env_passthrough,
+            inherited_sink_fd=inherited_sink_fd,
+            input_text=input_text,
+        )
+    return _run_command_tts_named_legacy(command, timeout, env_passthrough)
 
-    Child env is scrubbed of Hermes secrets (salvage of #56332) while still
-    propagating delegated-child lineage markers when applicable.
-    """
+
+def _run_command_tts_named_legacy(
+    command: str,
+    timeout: float,
+    env_passthrough: Optional[list] = None,
+) -> subprocess.CompletedProcess:
+    """Run the pre-existing named command path without Task 4 semantics."""
     from agent.delegation_context import delegated_child_subprocess_env
     from tools.environments.local import hermes_subprocess_env
 
@@ -1208,14 +1441,14 @@ def _run_command_tts(
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "text": True,
-        # Lossy UTF-8 decode — locale-mismatched bytes from the TTS command
-        # must not raise in the reader threads on non-UTF-8 Windows (#45099).
         "encoding": "utf-8",
         "errors": "replace",
         "env": delegated_child_subprocess_env(scrubbed),
     }
     if os.name == "nt":
-        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        popen_kwargs["creationflags"] = getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+        )
     else:
         popen_kwargs["start_new_session"] = True
 
@@ -1241,16 +1474,8 @@ def _run_command_tts(
             output_queue.put((name, None))
 
     readers = [
-        threading.Thread(
-            target=read_stream,
-            args=("stdout", proc.stdout),
-            daemon=True,
-        ),
-        threading.Thread(
-            target=read_stream,
-            args=("stderr", proc.stderr),
-            daemon=True,
-        ),
+        threading.Thread(target=read_stream, args=("stdout", proc.stdout), daemon=True),
+        threading.Thread(target=read_stream, args=("stderr", proc.stderr), daemon=True),
     ]
     for reader in readers:
         reader.start()
@@ -1295,23 +1520,478 @@ def _run_command_tts(
             raise subprocess.TimeoutExpired(command, timeout)
         except subprocess.TimeoutExpired as exc:
             raise subprocess.TimeoutExpired(
-                command,
-                timeout,
-                output=stdout,
-                stderr=stderr,
+                command, timeout, output=stdout, stderr=stderr
             ) from exc
 
     stdout = "".join(chunks["stdout"])
     stderr = "".join(chunks["stderr"])
-
     if proc.returncode:
         raise subprocess.CalledProcessError(
-            proc.returncode,
-            command,
-            output=stdout,
-            stderr=stderr,
+            proc.returncode, command, output=stdout, stderr=stderr
         )
     return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+
+
+def _emergency_cleanup_spawned_command_tts_process(proc: subprocess.Popen) -> None:
+    """Best-effort fixed-boundary cleanup for failures before lifecycle setup."""
+    candidate_pid: int | None = None
+    try:
+        observed_pid = getattr(proc, "pid", None)
+        child_created = getattr(proc, "_child_created", False) is True
+        candidate_pid = (
+            observed_pid
+            if child_created
+            and isinstance(observed_pid, int)
+            and not isinstance(observed_pid, bool)
+            and observed_pid > 0
+            else None
+        )
+        owned_pgid = (
+            candidate_pid
+            if os.name == "posix" and candidate_pid is not None
+            else None
+        )
+    except BaseException:
+        owned_pgid = None
+    try:
+        getattr(proc, "returncode", None)
+    except BaseException:
+        pass
+    cleanup_succeeded = False
+    if candidate_pid is not None:
+        try:
+            _stop_command_tts_process_group(proc, owned_pgid)
+            cleanup_succeeded = True
+        except BaseException:
+            try:
+                _fallback_stop_command_tts_process_group(proc, owned_pgid)
+                cleanup_succeeded = True
+            except BaseException:
+                pass
+    try:
+        liveness_uncertain = getattr(proc, "returncode", None) is None
+    except BaseException:
+        liveness_uncertain = True
+    if (
+        os.name == "posix"
+        and candidate_pid is not None
+        and (not cleanup_succeeded or liveness_uncertain)
+    ):
+        if owned_pgid is not None:
+            for sig in (signal.SIGTERM, signal.SIGKILL):  # windows-footgun: ok - guarded by os.name == "posix"
+                try:
+                    os.killpg(owned_pgid, sig)  # windows-footgun: ok - guarded by os.name == "posix"
+                except (ProcessLookupError, PermissionError):
+                    pass
+                except BaseException:
+                    pass
+        try:
+            os.kill(candidate_pid, signal.SIGKILL)  # windows-footgun: ok - guarded by os.name == "posix"
+        except (ProcessLookupError, PermissionError):
+            pass
+        except BaseException:
+            pass
+        try:
+            deadline = time.monotonic() + 0.5
+            while True:
+                try:
+                    waited_pid, status = os.waitpid(candidate_pid, os.WNOHANG)
+                except (ChildProcessError, ProcessLookupError):
+                    break
+                except BaseException:
+                    break
+                if waited_pid == candidate_pid:
+                    try:
+                        proc.returncode = os.waitstatus_to_exitcode(status)
+                    except BaseException:
+                        pass
+                    break
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.01)
+        except BaseException:
+            pass
+    for name in ("stdin", "stdout", "stderr"):
+        try:
+            stream = getattr(proc, name, None)
+        except BaseException:
+            continue
+        if stream is not None:
+            try:
+                stream.close()
+            except BaseException:
+                pass
+
+
+def _spawned_command_tts_process_needs_cleanup(proc: subprocess.Popen) -> bool:
+    """Fail closed when either the direct child or its owned group may live."""
+    for name in ("stdin", "stdout", "stderr"):
+        try:
+            stream = getattr(proc, name, None)
+            if stream is not None and not stream.closed:
+                return True
+        except BaseException:
+            return True
+    try:
+        child_alive = proc.poll() is None
+    except BaseException:
+        return True
+    if os.name != "posix":
+        return child_alive
+    try:
+        candidate_pid = getattr(proc, "pid", None)
+        if not isinstance(candidate_pid, int):
+            return True
+        group_alive = _posix_process_group_exists(candidate_pid)
+    except BaseException:
+        return True
+    return child_alive or group_alive
+
+
+def _run_command_tts_sink_process(
+    command: str,
+    timeout: float,
+    env_passthrough: Optional[list] = None,
+    *,
+    inherited_sink_fd: int | None,
+    input_text: str | None,
+) -> None:
+    """Fixed boundary which owns a spawned child before Python setup resumes."""
+    popen_class = subprocess.Popen
+    if not isinstance(popen_class, type) or not issubclass(
+        popen_class, _REVIEWED_POPEN_CLASS
+    ):
+        raise CommandSinkLifecycleError(_COMMAND_SINK_LIFECYCLE_ERROR) from None
+    ownership: list[subprocess.Popen | None] = [None]
+
+    try:
+        return _run_command_tts_sink_process_impl(
+            command,
+            timeout,
+            env_passthrough,
+            inherited_sink_fd=inherited_sink_fd,
+            input_text=input_text,
+            popen_class=popen_class,
+            ownership=ownership,
+        )
+    except CommandSinkLifecycleError:
+        spawned = ownership[0]
+        if spawned is not None and _spawned_command_tts_process_needs_cleanup(
+            spawned
+        ):
+            _emergency_cleanup_spawned_command_tts_process(spawned)
+        raise
+    except BaseException:
+        spawned = ownership[0]
+        if spawned is not None:
+            _emergency_cleanup_spawned_command_tts_process(spawned)
+        raise CommandSinkLifecycleError(_COMMAND_SINK_LIFECYCLE_ERROR) from None
+
+
+def _run_command_tts_sink_process_impl(
+    command: str,
+    timeout: float,
+    env_passthrough: Optional[list] = None,
+    *,
+    inherited_sink_fd: int | None,
+    input_text: str | None,
+    popen_class: type[subprocess.Popen],
+    ownership: list[subprocess.Popen | None],
+) -> None:
+    """Run one sink command within an absolute bounded lifecycle.
+
+    Child env is scrubbed of Hermes secrets (salvage of #56332) while still
+    propagating delegated-child lineage markers when applicable.
+    """
+    try:
+        if (
+            not isinstance(timeout, (int, float))
+            or isinstance(timeout, bool)
+            or not math.isfinite(float(timeout))
+            or timeout <= 0
+            or inherited_sink_fd is not None
+            and (
+                not isinstance(inherited_sink_fd, int)
+                or isinstance(inherited_sink_fd, bool)
+                or inherited_sink_fd < 0
+                or os.name != "posix"
+            )
+            or input_text is not None
+            and not isinstance(input_text, str)
+        ):
+            raise ValueError
+        absolute_deadline = time.monotonic() + float(timeout)
+        from agent.delegation_context import delegated_child_subprocess_env
+        from tools.environments.local import hermes_subprocess_env
+
+        scrubbed = hermes_subprocess_env(inherit_credentials=False)
+        for key in env_passthrough or []:
+            value = os.environ.get(key)
+            if value is not None:
+                scrubbed[key] = value
+        if time.monotonic() >= absolute_deadline:
+            raise TimeoutError
+        popen_kwargs: Dict[str, Any] = {
+            "shell": True,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "env": delegated_child_subprocess_env(scrubbed),
+            "close_fds": True,
+            "stdin": subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = getattr(
+                subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+            )
+        else:
+            popen_kwargs["start_new_session"] = True
+            popen_kwargs["pass_fds"] = (
+                (inherited_sink_fd,) if inherited_sink_fd is not None else ()
+            )
+        retained_sizes = {"stdout": 0, "stderr": 0}
+        lifecycle_lock = threading.Lock()
+        worker_failed = [False]
+        readers: list[threading.Thread] = []
+        writer: threading.Thread | None = None
+        started_threads: list[threading.Thread] = []
+        cleanup_failures = 0
+        proc = _REVIEWED_POPEN_CLASS.__new__(popen_class)
+        ownership[0] = proc
+        proc._child_created = False
+        proc.returncode = None
+        popen_class.__init__(proc, command, **popen_kwargs)
+    except BaseException:
+        raise CommandSinkLifecycleError(_COMMAND_SINK_LIFECYCLE_ERROR) from None
+
+    initialization_error: BaseException | None = None
+    try:
+        candidate_pid = getattr(proc, "pid", None)
+        owned_pgid = (
+            candidate_pid
+            if os.name == "posix" and isinstance(candidate_pid, int)
+            else None
+        )
+        if os.name == "posix" and owned_pgid is None:
+            raise RuntimeError(_COMMAND_SINK_LIFECYCLE_ERROR)
+    except BaseException as exc:
+        initialization_error = exc
+        owned_pgid = None
+    def retain(name: str, chunk: str) -> None:
+        with lifecycle_lock:
+            remaining = 65536 - retained_sizes[name]
+            if remaining <= 0:
+                return
+            encoded = chunk.encode("utf-8", errors="replace")[:remaining]
+            retained_sizes[name] += len(encoded)
+
+    def read_stream(name: str, stream: Any) -> None:
+        try:
+            encoding = getattr(stream, "encoding", None) or "utf-8"
+            read1 = getattr(getattr(stream, "buffer", None), "read1", None)
+            while True:
+                if read1 is None:
+                    chunk = stream.read(65536)
+                else:
+                    data = read1(65536)
+                    chunk = data.decode(encoding, errors="replace")
+                if not chunk:
+                    break
+                retain(name, chunk)
+        except (OSError, ValueError):
+            pass
+        except BaseException:
+            with lifecycle_lock:
+                worker_failed[0] = True
+
+    def write_input() -> None:
+        try:
+            stream = proc.stdin
+            if stream is None:
+                return
+            stream.write(input_text or "")
+            stream.flush()
+        except (AttributeError, BrokenPipeError, OSError, ValueError):
+            pass
+        except BaseException:
+            with lifecycle_lock:
+                worker_failed[0] = True
+        finally:
+            try:
+                if "stream" in locals() and stream is not None:
+                    stream.close()
+            except BaseException:
+                with lifecycle_lock:
+                    worker_failed[0] = True
+
+    def get_process_stream(name: str) -> Any:
+        nonlocal cleanup_failures
+        try:
+            return getattr(proc, name, None)
+        except BaseException:
+            cleanup_failures += 1
+            return None
+
+    pending_error: BaseException | None = initialization_error
+    try:
+        if pending_error is not None:
+            raise pending_error
+        readers = [
+            threading.Thread(
+                target=read_stream,
+                args=("stdout", proc.stdout),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=read_stream,
+                args=("stderr", proc.stderr),
+                daemon=True,
+            ),
+        ]
+        for reader in readers:
+            reader.start()
+            started_threads.append(reader)
+        if input_text is not None:
+            writer = threading.Thread(target=write_input, daemon=True)
+            writer.start()
+            started_threads.append(writer)
+        while True:
+            remaining = absolute_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            status = (
+                proc.poll()
+                if callable(getattr(proc, "poll", None))
+                else proc.returncode
+            )
+            if status is not None:
+                break
+            time.sleep(min(0.01, max(0.001, remaining)))
+    except BaseException as exc:
+        pending_error = exc
+    finally:
+        try:
+            _stop_command_tts_process_group(proc, owned_pgid)
+        except BaseException:
+            cleanup_failures += 1
+            try:
+                _fallback_stop_command_tts_process_group(proc, owned_pgid)
+            except BaseException:
+                cleanup_failures += 1
+        stdin_stream = get_process_stream("stdin")
+        if stdin_stream is not None:
+            try:
+                stdin_stream.close()
+            except BaseException:
+                cleanup_failures += 1
+        if writer is not None:
+            if writer in started_threads:
+                try:
+                    writer.join(timeout=2)
+                except BaseException:
+                    cleanup_failures += 1
+        for reader in readers:
+            if reader in started_threads:
+                try:
+                    reader.join(timeout=2)
+                except BaseException:
+                    cleanup_failures += 1
+        for stream in (
+            get_process_stream("stdout"),
+            get_process_stream("stderr"),
+        ):
+            if stream is not None:
+                try:
+                    close = getattr(stream, "close", None)
+                    if close is not None:
+                        close()
+                except BaseException:
+                    cleanup_failures += 1
+        for thread in started_threads:
+            try:
+                alive = thread.is_alive()
+            except BaseException:
+                cleanup_failures += 1
+                alive = True
+            if alive:
+                try:
+                    thread.join(timeout=1)
+                except BaseException:
+                    cleanup_failures += 1
+            try:
+                alive = thread.is_alive()
+            except BaseException:
+                cleanup_failures += 1
+                alive = True
+            if alive:
+                cleanup_failures += 1
+        if worker_failed[0]:
+            cleanup_failures += 1
+
+    try:
+        process_failed = bool(proc.returncode)
+    except BaseException:
+        process_failed = True
+    deadline_expired = time.monotonic() >= absolute_deadline
+    if pending_error is not None or cleanup_failures or process_failed or deadline_expired:
+        raise CommandSinkLifecycleError(_COMMAND_SINK_LIFECYCLE_ERROR) from None
+    return None
+
+
+def _run_command_tts_to_sink(
+    text: str,
+    sink: "ProviderAudioSink",
+    provider_name: str,
+    config: Dict[str, Any],
+    tts_config: Dict[str, Any],
+    *,
+    voice: str | None,
+    model: str | None,
+    speed: float | None,
+) -> None:
+    """Run the parallel descriptor-only command adapter.
+
+    This remains unreachable from public TTS until Task 7.  The transcript is
+    supplied only through stdin and all command output is treated as untrusted.
+    """
+    from tools.tts_staging import _validate_provider_audio_sink
+
+    sink_path, output_format, _ = _validate_provider_audio_sink(sink)
+    try:
+        if (
+            not isinstance(text, str)
+            or not isinstance(provider_name, str)
+            or not _is_command_provider_config(config)
+            or _get_command_tts_output_format(config) != output_format
+        ):
+            raise ValueError
+        command_template = config.get("command")
+        if type(command_template) is not str or not command_template.strip():
+            raise ValueError
+        sink_fd = _descriptor_number_from_sink_path(sink_path)
+        rendered = _render_command_tts_sink_template(
+            command_template,
+            sink=sink,
+            voice=str(voice if voice is not None else config.get("voice", "")),
+            model=str(model if model is not None else config.get("model", "")),
+            speed=str(
+                speed
+                if speed is not None
+                else config.get("speed", tts_config.get("speed", ""))
+            ),
+        )
+        _run_command_tts(
+            rendered,
+            _get_command_tts_timeout(config),
+            env_passthrough=_command_provider_env_passthrough(config),
+            inherited_sink_fd=sink_fd,
+            input_text=text,
+        )
+    except BaseException:
+        raise CommandSinkLifecycleError(_COMMAND_SINK_LIFECYCLE_ERROR) from None
+    return None
 
 
 def _configured_command_tts_output_path(path: Path, config: Dict[str, Any]) -> Path:
@@ -1390,6 +2070,26 @@ def _generate_command_tts(
             f"TTS provider '{provider_name}' produced no output at {output}"
         )
     return str(output)
+
+
+def _generate_command_tts_to_sink(
+    text: str,
+    sink: "ProviderAudioSink",
+    provider_name: str,
+    config: Dict[str, Any],
+    tts_config: Dict[str, Any],
+) -> None:
+    """Compatibility entry for the descriptor-only command lifecycle."""
+    return _run_command_tts_to_sink(
+        text,
+        sink,
+        provider_name,
+        config,
+        tts_config,
+        voice=None,
+        model=None,
+        speed=None,
+    )
 
 
 def _has_any_command_tts_provider(tts_config: Optional[Dict[str, Any]] = None) -> bool:
@@ -1513,10 +2213,18 @@ def _repair_ogg_container(file_str: str) -> str:
     if container in ("ogg", "unknown"):
         return file_str
 
-    logger.info(
-        "TTS wrote %s bytes into a .ogg path (%s) — transcoding to real Ogg/Opus",
-        container, file_str,
-    )
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        logger.info(
+            "TTS wrote %s bytes into an ephemeral .ogg payload — transcoding",
+            container,
+        )
+    else:
+        logger.info(
+            "TTS wrote %s bytes into a .ogg path (%s) — transcoding to real Ogg/Opus",
+            container, file_str,
+        )
     repaired = _ffmpeg_transcode_to_opus(file_str, file_str)
     if repaired:
         return repaired
@@ -1525,10 +2233,16 @@ def _repair_ogg_container(file_str: str) -> str:
     honest = file_str[:-4] + "." + container
     try:
         os.replace(file_str, honest)
-        logger.warning(
-            "Could not transcode %s to Ogg/Opus — renamed to %s so the "
-            "file is delivered with its real format", file_str, honest,
-        )
+        if persistence_disabled():
+            logger.warning(
+                "Could not transcode ephemeral TTS payload to Ogg/Opus; "
+                "using its detected container"
+            )
+        else:
+            logger.warning(
+                "Could not transcode %s to Ogg/Opus — renamed to %s so the "
+                "file is delivered with its real format", file_str, honest,
+            )
         return honest
     except OSError:
         return file_str
@@ -1751,6 +2465,50 @@ async def _generate_edge_tts(text: str, output_path: str, tts_config: Dict[str, 
     return output_path
 
 
+async def _generate_edge_tts_to_sink(
+    text: str,
+    sink_path: str,
+    tts_config: Dict[str, Any],
+    *,
+    output_format: str,
+    maximum_bytes: int,
+    voice: Optional[str] = None,
+    speed: Optional[float] = None,
+) -> str:
+    """Generate Edge MP3 directly into a descriptor path.
+
+    The legacy named helper above is intentionally unchanged until Task 7.
+    """
+    if output_format != "mp3" or maximum_bytes <= 0:
+        raise ValueError("unsupported anonymous Edge TTS sink")
+    _edge_tts = _import_edge_tts()
+    edge_config = tts_config.get("edge") or {}
+    selected_voice = voice or edge_config.get("voice", DEFAULT_EDGE_VOICE)
+    selected_speed = (
+        float(speed)
+        if speed is not None
+        else float(edge_config.get("speed", tts_config.get("speed", 1.0)))
+    )
+    kwargs: Dict[str, Any] = {"voice": selected_voice}
+    if selected_speed != 1.0:
+        pct = round((selected_speed - 1.0) * 100)
+        kwargs["rate"] = f"{pct:+d}%"
+    communicate = _edge_tts.Communicate(text, **kwargs)
+    total = 0
+    with open(sink_path, "wb") as output:
+        async for event in communicate.stream():
+            if not isinstance(event, dict) or event.get("type") != "audio":
+                continue
+            chunk = event.get("data")
+            if type(chunk) is not bytes:
+                raise ValueError("tts_anonymous_provider_failed")
+            if total + len(chunk) > maximum_bytes:
+                raise ValueError("tts_anonymous_provider_failed")
+            output.write(chunk)
+            total += len(chunk)
+    return sink_path
+
+
 # ===========================================================================
 # Provider: ElevenLabs (premium)
 # ===========================================================================
@@ -1797,6 +2555,49 @@ def _generate_elevenlabs(text: str, output_path: str, tts_config: Dict[str, Any]
     return output_path
 
 
+def _generate_elevenlabs_to_sink(
+    text: str,
+    sink_path: str,
+    tts_config: Dict[str, Any],
+    *,
+    output_format: str,
+    maximum_bytes: int,
+    voice: Optional[str] = None,
+    model: Optional[str] = None,
+) -> str:
+    """Stream ElevenLabs bytes to a descriptor path using explicit format."""
+    format_map = {
+        "mp3": "mp3_44100_128",
+        "ogg": "opus_48000_64",
+        "opus": "opus_48000_64",
+    }
+    provider_format = format_map.get(output_format)
+    if provider_format is None or maximum_bytes <= 0:
+        raise ValueError("unsupported anonymous ElevenLabs TTS sink")
+    api_key = (_resolve_provider_key("ELEVENLABS_API_KEY", "elevenlabs") or "")
+    if not api_key:
+        raise ValueError("ELEVENLABS_API_KEY not set. Get one at https://elevenlabs.io/")
+    el_config = tts_config.get("elevenlabs") or {}
+    voice_id = voice or el_config.get("voice_id", DEFAULT_ELEVENLABS_VOICE_ID)
+    model_id = model or el_config.get("model_id", DEFAULT_ELEVENLABS_MODEL_ID)
+    ElevenLabs = _import_elevenlabs()
+    client = ElevenLabs(api_key=api_key, **_elevenlabs_environment_kwargs(el_config))
+    audio_generator = client.text_to_speech.convert(
+        text=text,
+        voice_id=voice_id,
+        model_id=model_id,
+        output_format=provider_format,
+    )
+    total = 0
+    with open(sink_path, "wb") as output:
+        for chunk in audio_generator:
+            total += len(chunk)
+            if total > maximum_bytes:
+                raise ValueError("anonymous TTS output exceeds configured limit")
+            output.write(chunk)
+    return sink_path
+
+
 def _tts_response_format_from_path(output_path: str) -> str:
     """Pick an OpenAI-compatible TTS response format from the output extension."""
     if output_path.endswith(".ogg"):
@@ -1823,6 +2624,7 @@ def _generate_openai_tts(
     voice: Optional[str] = None,
     speed: Optional[float] = None,
     instructions: Optional[str] = None,
+    response_format_override: Optional[str] = None,
 ) -> str:
     """Generate audio via the OpenAI ``audio.speech.create`` SDK shape.
 
@@ -1898,7 +2700,7 @@ def _generate_openai_tts(
         )
         model = DEFAULT_OPENAI_MODEL
 
-    response_format = _tts_response_format_from_path(output_path)
+    response_format = response_format_override or _tts_response_format_from_path(output_path)
 
     OpenAIClient = _import_openai_client()
     client = OpenAIClient(api_key=api_key, base_url=base_url)
@@ -1937,7 +2739,13 @@ def _generate_openai_tts(
 # catalog is fetched without a patch.
 
 
-def _generate_deepinfra_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+def _generate_deepinfra_tts(
+    text: str,
+    output_path: str,
+    tts_config: Dict[str, Any],
+    *,
+    response_format_override: Optional[str] = None,
+) -> str:
     """Resolve DeepInfra credentials/model, then delegate to the OpenAI handler.
 
     DeepInfra's audio endpoint is OpenAI-compatible, so there's no need
@@ -1981,6 +2789,7 @@ def _generate_deepinfra_tts(text: str, output_path: str, tts_config: Dict[str, A
         model=model,
         voice=di_config.get("voice", DEFAULT_DEEPINFRA_TTS_VOICE),
         speed=float(di_config.get("speed", tts_config.get("speed", 1.0))),
+        response_format_override=response_format_override,
     )
 
 
@@ -2097,7 +2906,13 @@ def _apply_xai_auto_speech_tags(text: str) -> str:
         return local
 
 
-def _generate_xai_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+def _generate_xai_tts(
+    text: str,
+    output_path: str,
+    tts_config: Dict[str, Any],
+    *,
+    output_format_override: Optional[str] = None,
+) -> str:
     """
     Generate audio using xAI TTS.
 
@@ -2170,7 +2985,7 @@ def _generate_xai_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -
 
     # Match the documented minimal POST /v1/tts shape by default. Only send
     # output_format when Hermes actually needs a non-default format/override.
-    codec = "wav" if output_path.endswith(".wav") else "mp3"
+    codec = output_format_override or ("wav" if output_path.endswith(".wav") else "mp3")
     payload: Dict[str, Any] = {
         "text": text,
         "voice_id": voice_id,
@@ -2362,7 +3177,13 @@ def _generate_minimax_tts(text: str, output_path: str, tts_config: Dict[str, Any
 # ===========================================================================
 # Provider: Mistral (Voxtral TTS)
 # ===========================================================================
-def _generate_mistral_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+def _generate_mistral_tts(
+    text: str,
+    output_path: str,
+    tts_config: Dict[str, Any],
+    *,
+    response_format_override: Optional[str] = None,
+) -> str:
     """Generate audio using Mistral Voxtral TTS API.
 
     The API returns base64-encoded audio; this function decodes it
@@ -2380,7 +3201,9 @@ def _generate_mistral_tts(text: str, output_path: str, tts_config: Dict[str, Any
     # base_url. The Mistral SDK calls it server_url.
     base_url = mi_config.get("base_url")
 
-    if output_path.endswith(".ogg"):
+    if response_format_override is not None:
+        response_format = response_format_override
+    elif output_path.endswith(".ogg"):
         response_format = "opus"
     elif output_path.endswith(".wav"):
         response_format = "wav"
@@ -2605,7 +3428,13 @@ def _compose_gemini_tts_prompt(
     return f"{preamble}\n\n{persona_prompt}\n\n#### TRANSCRIPT\n{transcript}".strip()
 
 
-def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+def _generate_gemini_tts(
+    text: str,
+    output_path: str,
+    tts_config: Dict[str, Any],
+    *,
+    output_format_override: Optional[str] = None,
+) -> str:
     """Generate audio using Google Gemini TTS.
 
     Gemini's generateContent endpoint with responseModalities=["AUDIO"] returns
@@ -2729,9 +3558,41 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]
     wav_bytes = _wrap_pcm_as_wav(pcm_bytes)
 
     # Fast path: caller wants WAV directly, just write.
-    if output_path.lower().endswith(".wav"):
+    requested_format = output_format_override or (
+        "wav" if output_path.lower().endswith(".wav") else
+        "ogg" if output_path.lower().endswith(".ogg") else "mp3"
+    )
+    if requested_format == "wav":
         with open(output_path, "wb") as f:
             f.write(wav_bytes)
+        return output_path
+
+    if output_format_override is not None:
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise RuntimeError("anonymous Gemini conversion unavailable")
+        codec_args = (
+            ["-acodec", "libopus", "-ac", "1", "-b:a", "48k"]
+            if requested_format in {"ogg", "opus"}
+            else ["-f", requested_format]
+        )
+        with open(output_path, "wb") as output:
+            result = subprocess.run(
+                [
+                    ffmpeg,
+                    "-f", "wav", "-i", "pipe:0",
+                    *codec_args,
+                    "-loglevel", "error", "pipe:1",
+                ],
+                input=wav_bytes,
+                stdout=output,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+                check=False,
+                creationflags=windows_hide_flags(),
+            )
+        if result.returncode != 0:
+            raise RuntimeError("anonymous Gemini conversion failed")
         return output_path
 
     # Otherwise write WAV to a temp file and ffmpeg-convert to the target
@@ -3139,6 +4000,304 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
 # ===========================================================================
 # Main tool function
 # ===========================================================================
+
+_EPHEMERAL_TTS_MAX_BYTES = 25 * 1024 * 1024
+_EPHEMERAL_AUDIO_MIME_TYPES = (
+    ("mp3", "audio/mpeg"),
+    ("wav", "audio/wav"),
+    ("ogg", "audio/ogg"),
+    ("flac", "audio/flac"),
+    ("m4a", "audio/mp4"),
+    ("aac", "audio/aac"),
+    ("amr", "audio/amr"),
+    ("opus", "audio/ogg"),
+)
+
+
+def _anonymous_adapter_for_provider(
+    provider: str,
+    tts_config: Dict[str, Any],
+):
+    """Resolve exactly one reviewed anonymous-sink adapter."""
+    from tools.tts_adapters import builtin_adapter, command_adapter, plugin_adapter
+
+    key = provider.lower().strip()
+    command_config = _resolve_command_provider_config(key, tts_config)
+    if command_config is not None:
+        return command_adapter(key, command_config, tts_config)
+    if key in BUILTIN_TTS_PROVIDERS:
+        return builtin_adapter(key, tts_config)
+    try:
+        from agent.tts_registry import get_provider
+        from hermes_cli.plugins import _ensure_plugins_discovered
+
+        _ensure_plugins_discovered()
+        selected = get_provider(key)
+        if selected is None:
+            _ensure_plugins_discovered(force=True)
+            selected = get_provider(key)
+    except Exception:
+        selected = None
+    if selected is None:
+        raise ValueError("tts_anonymous_sink_unsupported")
+    return plugin_adapter(selected)
+
+
+def _generate_builtin_tts_to_sink(
+    provider: str,
+    request: Any,
+    sink_path: str,
+    tts_config: Dict[str, Any],
+    *,
+    output_format: str,
+    maximum_bytes: int,
+) -> str:
+    """Invoke one built-in with a copied descriptor path and explicit format."""
+    if (
+        provider not in BUILTIN_TTS_PROVIDERS
+        or provider in {"neutts", "piper", "kittentts", "edge", "elevenlabs"}
+        or output_format not in COMMAND_TTS_OUTPUT_FORMATS
+        or not isinstance(maximum_bytes, int)
+        or isinstance(maximum_bytes, bool)
+        or maximum_bytes <= 0
+    ):
+        raise ValueError("tts_anonymous_sink_unsupported")
+    response_format = "opus" if output_format in {"ogg", "opus"} else output_format
+    if provider == "openai":
+        result = _generate_openai_tts(
+            request.text,
+            sink_path,
+            tts_config,
+            model=request.model,
+            voice=request.voice,
+            speed=request.speed,
+            instructions=request.instructions,
+            response_format_override=response_format,
+        )
+    elif provider == "deepinfra":
+        result = _generate_deepinfra_tts(
+            request.text,
+            sink_path,
+            tts_config,
+            response_format_override=response_format,
+        )
+    elif provider == "xai":
+        if output_format not in {"mp3", "wav"}:
+            raise ValueError("tts_anonymous_sink_unsupported")
+        result = _generate_xai_tts(
+            request.text,
+            sink_path,
+            tts_config,
+            output_format_override=output_format,
+        )
+    elif provider == "minimax":
+        if output_format != "mp3":
+            raise ValueError("tts_anonymous_sink_unsupported")
+        result = _generate_minimax_tts(request.text, sink_path, tts_config)
+    elif provider == "mistral":
+        result = _generate_mistral_tts(
+            request.text,
+            sink_path,
+            tts_config,
+            response_format_override=response_format,
+        )
+    elif provider == "gemini":
+        result = _generate_gemini_tts(
+            request.text,
+            sink_path,
+            tts_config,
+            output_format_override=output_format,
+        )
+    else:
+        raise ValueError("tts_anonymous_sink_unsupported")
+    sink_fd = _descriptor_number_from_sink_path(sink_path)
+    if os.fstat(sink_fd).st_size > maximum_bytes:
+        raise ValueError("tts_anonymous_provider_failed")
+    return result
+
+
+def _anonymous_output_format(
+    provider: str,
+    tts_config: Dict[str, Any],
+) -> str:
+    command_config = _resolve_command_provider_config(provider, tts_config)
+    if command_config is not None:
+        return _get_command_tts_output_format(command_config)
+    configured = tts_config.get("output_format")
+    if isinstance(configured, str) and configured.lower() in {
+        "mp3", "wav", "ogg", "flac", "m4a", "aac", "amr", "opus"
+    }:
+        return configured.lower()
+    return "mp3"
+
+
+class _TTSDestinationError(ValueError):
+    """Fixed path-free durable destination preflight failure."""
+
+
+def _ensure_tts_destination_allowed(destination: Path) -> None:
+    from agent.file_safety import is_write_approval_required, is_write_denied
+
+    try:
+        denied = is_write_denied(str(destination))
+        approval_required = is_write_approval_required(str(destination))
+    except (OSError, TypeError, ValueError):
+        raise _TTSDestinationError("TTS destination is invalid") from None
+    if denied or approval_required:
+        raise _TTSDestinationError(
+            "TTS destination targets a protected credential or system location"
+        )
+
+
+def _preflight_tts_destination(
+    output_path: object,
+    provider: str,
+    tts_config: Dict[str, Any],
+    *,
+    timestamp_format: str,
+) -> tuple[Path | None, str]:
+    """Select policy before inspecting a caller-controlled destination."""
+    from hermes_cli.persistence import PersistencePolicy, current_persistence_policy
+
+    output_format = _anonymous_output_format(provider, tts_config)
+    if current_persistence_policy() is PersistencePolicy.EPHEMERAL:
+        return None, output_format
+
+    command_config = _resolve_command_provider_config(provider, tts_config)
+    if output_path is None:
+        destination = Path(DEFAULT_OUTPUT_DIR) / (
+            "tts_" + datetime.datetime.now().strftime(timestamp_format)
+            + f".{output_format}"
+        )
+    else:
+        if type(output_path) is not str or not output_path or "\x00" in output_path:
+            raise _TTSDestinationError("TTS destination is invalid")
+        from tools.path_security import has_traversal_component
+
+        if has_traversal_component(output_path):
+            raise _TTSDestinationError(
+                "TTS destination contains a traversal component"
+            )
+        destination = Path(output_path).expanduser()
+        _ensure_tts_destination_allowed(destination)
+        requested_format = destination.suffix.lower().lstrip(".")
+        if (
+            requested_format not in COMMAND_TTS_OUTPUT_FORMATS
+            or destination.name in {"", ".", ".."}
+        ):
+            raise _TTSDestinationError("TTS destination is invalid")
+        if command_config is not None:
+            destination = _configured_command_tts_output_path(
+                destination, command_config
+            )
+            output_format = _get_command_tts_output_format(command_config)
+        else:
+            output_format = requested_format
+
+    _ensure_tts_destination_allowed(destination)
+    return destination, output_format
+
+
+def _anonymous_voice_compatible(provider: str, tts_config: Dict[str, Any]) -> bool:
+    command_config = _resolve_command_provider_config(provider, tts_config)
+    if command_config is not None:
+        return _is_command_tts_voice_compatible(command_config)
+    return _plugin_provider_is_voice_compatible(provider)
+
+
+def _generate_anonymous_tts(
+    chunks: List[str],
+    *,
+    provider: str,
+    tts_config: Dict[str, Any],
+    speed: Optional[float],
+    instructions: Optional[str],
+    aggregate_cap: int,
+    output_format: str | None = None,
+    durable_consumer: Optional[Callable[[Any], Any]] = None,
+):
+    """GENERATE and SEAL every chunk, then perform exactly one decision."""
+    from tools.tts_adapters import ProviderRequest, generate_and_seal
+    from tools.tts_staging import AnonymousAudioStage
+    from tools.tts_transaction import TTSTransaction
+
+    if output_format is None:
+        output_format = _anonymous_output_format(provider, tts_config)
+    adapter = _anonymous_adapter_for_provider(provider, tts_config)
+    provider_config = tts_config.get(provider)
+    if not isinstance(provider_config, dict):
+        provider_config = {}
+    voice = provider_config.get("voice") or provider_config.get("voice_id")
+    model = provider_config.get("model") or provider_config.get("model_id")
+    if voice is None:
+        voice = tts_config.get("voice")
+    if model is None:
+        model = tts_config.get("model")
+    request_speed = speed if speed is not None else tts_config.get("speed")
+    if not isinstance(request_speed, (int, float)) or isinstance(request_speed, bool):
+        request_speed = None
+
+    with TTSTransaction.begin(aggregate_cap) as transaction:
+        for chunk in chunks:
+            stage = AnonymousAudioStage.create(output_format, aggregate_cap)
+            request = ProviderRequest(
+                text=chunk,
+                voice=voice if isinstance(voice, str) else None,
+                model=model if isinstance(model, str) else None,
+                speed=float(request_speed) if request_speed is not None else None,
+                instructions=instructions,
+            )
+            sealed = generate_and_seal(adapter, request, stage)
+            transaction.add_sealed(stage, sealed)
+        decision = transaction.decide()
+        from tools.tts_transaction import DurablePublicationPermit
+
+        if type(decision) is DurablePublicationPermit:
+            if durable_consumer is None:
+                raise ValueError("tts_generation_failed")
+            decision = durable_consumer(decision)
+        return decision, output_format
+
+
+def _ephemeral_audio_mime_type(output_format: object) -> str:
+    """Map one trusted sealed format to its closed canonical media type."""
+    if type(output_format) is not str:
+        raise ValueError("tts_generation_failed")
+    for candidate, mime_type in _EPHEMERAL_AUDIO_MIME_TYPES:
+        if output_format == candidate:
+            return mime_type
+    raise ValueError("tts_generation_failed")
+
+
+def _ephemeral_tts_result(
+    chunks: tuple[bytes, ...],
+    provider: str,
+    output_format: object,
+    *,
+    public: bool,
+) -> str:
+    mime_type = _ephemeral_audio_mime_type(output_format)
+    audio_parts = [
+        f"data:{mime_type};base64," + base64.b64encode(chunk).decode("ascii")
+        for chunk in chunks
+    ]
+    payload: Dict[str, Any] = {
+        "success": True,
+        "audio": audio_parts[0],
+        "provider": provider,
+        "voice_compatible": False,
+    }
+    if public:
+        payload.update({
+            "audio_parts": audio_parts,
+            "chunk_count": len(chunks),
+            "delivery_file_count": len(chunks),
+            "combined_chunks": False,
+        })
+    return json.dumps(payload, ensure_ascii=False)
+
+
+# Task 7 cutover entry preserving the public/internal call signature.
 def _text_to_speech_single(
     text: str,
     output_path: Optional[str] = None,
@@ -3148,349 +4307,60 @@ def _text_to_speech_single(
     provider: Optional[str] = None,
     tts_config_override: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Synthesize one provider-safe text chunk and return one final-encoded file.
-
-    The public :func:`text_to_speech_tool` wrapper owns long-form splitting,
-    delivery packing, and post-encoding size enforcement.
-    """
     if not text or not text.strip():
         return tool_error("Text is required", success=False)
-
-    # The wrapper already normalizes text via prepare_spoken_text; the inner
-    # function should not re-normalize or truncate.
-    tts_config = (
-        tts_config_override
-        if tts_config_override is not None
-        else _load_tts_config()
-    )
-
-    # When the model supplies a speed parameter, inject it into the config
-    # so all downstream provider functions pick it up uniformly.
-    if speed is not None:
-        clamped = max(0.25, min(4.0, float(speed)))
-        tts_config = dict(tts_config)  # shallow copy to avoid mutating the cache
-        tts_config["speed"] = clamped
-
-    # Allow per-call provider override; fall back to the configured default.
-    if provider:
-        provider = provider.lower().strip()
-    else:
-        provider = _get_provider(tts_config)
-
-    # User-declared command provider (type: command under tts.providers.<name>)
-    # resolves BEFORE the built-in dispatch. Built-in names short-circuit here
-    # so a user's ``tts.providers.openai.command`` can't override the real
-    # OpenAI handler.
-    command_provider_config = _resolve_command_provider_config(provider, tts_config)
-
-    # The wrapper splits text into provider-safe chunks before calling this
-    # function. If text exceeds the cap here, it means the caller bypassed
-    # the wrapper — log a warning but don't silently truncate.
-    max_len = _resolve_max_text_length(provider, tts_config)
-    if len(text) > max_len:
-        logger.warning(
-            "TTS text exceeds provider %s cap (%d > %d chars) — "
-            "use text_to_speech_tool() for automatic chunking",
-            provider, len(text), max_len,
+    try:
+        tts_config = dict(tts_config_override or _load_tts_config())
+        selected = provider.lower().strip() if provider else _get_provider(tts_config)
+        destination, output_format = _preflight_tts_destination(
+            output_path,
+            selected,
+            tts_config,
+            timestamp_format="%Y%m%d_%H%M%S_%f",
         )
 
-    # Detect platform from gateway env var to choose the best output format.
-    # Several platforms deliver native voice bubbles only for Ogg/Opus
-    # (Telegram, Matrix, Feishu/Lark, WhatsApp, Signal); OpenAI and
-    # ElevenLabs can produce Opus natively (no ffmpeg needed). Edge TTS
-    # always outputs MP3 and needs ffmpeg for conversion.
-    from gateway.session_context import get_session_env
-    platform = get_session_env("HERMES_SESSION_PLATFORM", "").lower()
-    want_opus = platform in OPUS_VOICE_PLATFORMS
+        def publish_one(permit: Any):
+            from tools.tts_publish import publish_durable
 
-    # Determine output path
-    if output_path:
-        # Reject '..' traversal components in the user-supplied path. An
-        # explicit absolute path is fine (the agent legitimately writes
-        # audio to user-specified locations), but a path that uses ``..``
-        # to escape its declared base is almost always either a bug or
-        # prompt-injection-controlled — e.g.
-        # ``output_path="audio/../../etc/cron.d/x"``. The terminal tool
-        # can still write anywhere with approval; this just keeps the
-        # unattended TTS surface from materializing files via traversal.
-        from tools.path_security import has_traversal_component
-        if has_traversal_component(output_path):
-            return json.dumps({
-                "success": False,
-                "error": (
-                    f"output_path contains '..' traversal component: "
-                    f"{output_path}. Use an absolute path or one relative "
-                    "to the current directory without '..'."
-                ),
-            }, ensure_ascii=False)
-        file_path = Path(output_path).expanduser()
-        if command_provider_config is not None:
-            # Respect caller-supplied path but align the extension with the
-            # provider's configured output_format so the command writes to a
-            # path the caller actually expects.
-            file_path = _configured_command_tts_output_path(
-                file_path, command_provider_config
-            )
-        from agent.file_safety import is_write_approval_required, is_write_denied
+            if destination is None:
+                raise ValueError("tts_generation_failed")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            return publish_durable(permit, destination)
 
-        if is_write_denied(str(file_path)) or is_write_approval_required(str(file_path)):
-            return json.dumps({
-                "success": False,
-                "error": (
-                    f"output_path targets a protected credential or system path: "
-                    f"{file_path}. Choose a normal audio output location."
-                ),
-            }, ensure_ascii=False)
-    else:
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        out_dir = Path(DEFAULT_OUTPUT_DIR)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        if command_provider_config is not None:
-            fmt = _get_command_tts_output_format(command_provider_config)
-            file_path = out_dir / f"tts_{timestamp}.{fmt}"
-        # Use .ogg for Telegram with providers that support native Opus output,
-        # otherwise fall back to .mp3 (Edge TTS will attempt ffmpeg conversion later).
-        elif want_opus and provider in {"openai", "elevenlabs", "mistral", "gemini"}:
-            file_path = out_dir / f"tts_{timestamp}.ogg"
-        else:
-            file_path = out_dir / f"tts_{timestamp}.mp3"
+        decision, output_format = _generate_anonymous_tts(
+            [text],
+            provider=selected,
+            tts_config=tts_config,
+            speed=speed,
+            instructions=instructions,
+            aggregate_cap=_EPHEMERAL_TTS_MAX_BYTES,
+            output_format=output_format,
+            durable_consumer=publish_one,
+        )
+        from tools.tts_transaction import EphemeralDelivery
 
-    # Ensure parent directory exists
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    file_str = str(file_path)
-
-    try:
-        # Generate audio with the configured provider
-        if command_provider_config is not None:
-            logger.info(
-                "Generating speech with command TTS provider '%s'...", provider,
-            )
-            file_str = _generate_command_tts(
-                text, file_str, provider, command_provider_config, tts_config,
+        if type(decision) is EphemeralDelivery:
+            return _ephemeral_tts_result(
+                decision.chunks,
+                selected,
+                output_format,
+                public=False,
             )
 
-        # Plugin-registered TTS backend (issue #30398). Fires when the
-        # configured provider is neither a built-in nor a command-type
-        # entry, AND a plugin is registered under that name. The walrus
-        # binds `_plugin_path` only when the dispatcher returns a path
-        # (i.e. a plugin was actually found); a None return falls
-        # through to the built-in elif chain so unknown names hit the
-        # Edge TTS default at the bottom. The dispatcher itself enforces
-        # built-ins-always-win + command-wins-over-plugin defensively.
-        elif provider not in BUILTIN_TTS_PROVIDERS and (
-            _plugin_path := _dispatch_to_plugin_provider(
-                text, file_str, provider, tts_config,
-            )
-        ) is not None:
-            file_str = _plugin_path
-
-        elif provider == "elevenlabs":
-            try:
-                _import_elevenlabs()
-            except ImportError:
-                return json.dumps({
-                    "success": False,
-                    "error": "ElevenLabs provider selected but 'elevenlabs' package not installed. Run: pip install elevenlabs"
-                }, ensure_ascii=False)
-            logger.info("Generating speech with ElevenLabs...")
-            _generate_elevenlabs(text, file_str, tts_config)
-
-        elif provider == "openai":
-            try:
-                _import_openai_client()
-            except ImportError:
-                return json.dumps({
-                    "success": False,
-                    "error": "OpenAI provider selected but 'openai' package not installed."
-                }, ensure_ascii=False)
-            logger.info("Generating speech with OpenAI TTS...")
-            _generate_openai_tts(text, file_str, tts_config, instructions=instructions)
-
-        elif provider == "deepinfra":
-            try:
-                _import_openai_client()
-            except ImportError:
-                return json.dumps({
-                    "success": False,
-                    "error": "DeepInfra TTS uses the 'openai' SDK but it isn't installed."
-                }, ensure_ascii=False)
-            logger.info("Generating speech with DeepInfra TTS...")
-            _generate_deepinfra_tts(text, file_str, tts_config)
-
-        elif provider == "minimax":
-            logger.info("Generating speech with MiniMax TTS...")
-            _generate_minimax_tts(text, file_str, tts_config)
-
-        elif provider == "xai":
-            logger.info("Generating speech with xAI TTS...")
-            _generate_xai_tts(text, file_str, tts_config)
-
-        elif provider == "mistral":
-            try:
-                _import_mistral_client()
-            except ImportError:
-                return json.dumps({
-                    "success": False,
-                    "error": "Mistral provider selected but 'mistralai' package not installed. "
-                             "Run `hermes setup` to install Mistral support."
-                }, ensure_ascii=False)
-            logger.info("Generating speech with Mistral Voxtral TTS...")
-            _generate_mistral_tts(text, file_str, tts_config)
-
-        elif provider == "gemini":
-            logger.info("Generating speech with Google Gemini TTS...")
-            _generate_gemini_tts(text, file_str, tts_config)
-
-        elif provider == "neutts":
-            if not _check_neutts_available():
-                return json.dumps({
-                    "success": False,
-                    "error": "NeuTTS provider selected but neutts is not installed. "
-                             "Run hermes setup and choose NeuTTS, or install espeak-ng and run python -m pip install -U neutts[all]."
-                }, ensure_ascii=False)
-            logger.info("Generating speech with NeuTTS (local)...")
-            _generate_neutts(text, file_str, tts_config)
-
-        elif provider == "kittentts":
-            try:
-                _import_kittentts()
-            except ImportError:
-                return json.dumps({
-                    "success": False,
-                    "error": "KittenTTS provider selected but 'kittentts' package not installed. "
-                             "Run 'hermes setup tts' and choose KittenTTS, or install manually: "
-                             "pip install https://github.com/KittenML/KittenTTS/releases/download/0.8.1/kittentts-0.8.1-py3-none-any.whl"
-                }, ensure_ascii=False)
-            logger.info("Generating speech with KittenTTS (local, ~25MB)...")
-            _generate_kittentts(text, file_str, tts_config)
-
-        elif provider == "piper":
-            try:
-                _import_piper()
-            except ImportError:
-                return json.dumps({
-                    "success": False,
-                    "error": "Piper provider selected but 'piper-tts' package not installed. "
-                             "Run 'hermes tools' and select Piper under TTS, or install manually: "
-                             "pip install piper-tts",
-                }, ensure_ascii=False)
-            logger.info("Generating speech with Piper (local)...")
-            _generate_piper_tts(text, file_str, tts_config)
-
-        else:
-            # Default: Edge TTS (free), with NeuTTS as local fallback
-            edge_available = True
-            try:
-                _import_edge_tts()
-            except ImportError:
-                edge_available = False
-
-            if edge_available:
-                logger.info("Generating speech with Edge TTS...")
-                try:
-                    import concurrent.futures
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                        pool.submit(
-                            lambda: asyncio.run(_generate_edge_tts(text, file_str, tts_config))
-                        ).result(timeout=60)
-                except RuntimeError:
-                    asyncio.run(_generate_edge_tts(text, file_str, tts_config))
-            elif _check_neutts_available():
-                logger.info("Edge TTS not available, falling back to NeuTTS (local)...")
-                provider = "neutts"
-                _generate_neutts(text, file_str, tts_config)
-            else:
-                return json.dumps({
-                    "success": False,
-                    "error": "No TTS provider available. Install edge-tts (pip install edge-tts) "
-                             "or set up NeuTTS for local synthesis."
-                }, ensure_ascii=False)
-
-        # Check the file was actually created
-        if not os.path.exists(file_str) or os.path.getsize(file_str) == 0:
-            return json.dumps({
-                "success": False,
-                "error": f"TTS generation produced no output (provider: {provider})"
-            }, ensure_ascii=False)
-
-        # Class-level container repair: several backends silently write
-        # MP3/WAV bytes into a .ogg output path (Edge, Piper, xAI,
-        # OpenAI-compatible servers without opus support), which platforms
-        # like Telegram render as broken 0-second voice bubbles. Sniff the
-        # magic bytes once here — covering every current and future
-        # provider — and transcode in place when they don't match.
-        file_str = _repair_ogg_container(file_str)
-
-        # Try Opus conversion for Telegram compatibility.
-        # Edge TTS outputs MP3, NeuTTS/KittenTTS output WAV. Keep those native
-        # formats for local/CLI playback and only convert when the current
-        # platform actually needs Opus voice delivery.
-        voice_compatible = False
-        if command_provider_config is not None:
-            # Command providers are documents by default. Voice-bubble
-            # delivery only kicks in when the user explicitly opts in
-            # via ``voice_compatible: true`` in their provider config.
-            if _is_command_tts_voice_compatible(command_provider_config):
-                if not file_str.endswith(".ogg"):
-                    opus_path = _convert_to_opus(file_str)
-                    if opus_path:
-                        file_str = opus_path
-                voice_compatible = file_str.endswith(".ogg")
-        elif provider not in BUILTIN_TTS_PROVIDERS:
-            # Plugin-registered provider (issue #30398). Voice-bubble
-            # delivery opts in via ``TTSProvider.voice_compatible``
-            # (mirrors the command-provider opt-in). Plugins that
-            # already write Opus skip the ffmpeg conversion.
-            plugin_voice_compatible = _plugin_provider_is_voice_compatible(provider)
-            if plugin_voice_compatible:
-                if not file_str.endswith(".ogg"):
-                    opus_path = _convert_to_opus(file_str)
-                    if opus_path:
-                        file_str = opus_path
-                voice_compatible = file_str.endswith(".ogg")
-        elif (
-            want_opus
-            and provider in {"edge", "neutts", "minimax", "xai", "kittentts", "piper"}
-            and not file_str.endswith(".ogg")
-        ):
-            opus_path = _convert_to_opus(file_str)
-            if opus_path:
-                file_str = opus_path
-                voice_compatible = True
-        elif provider in {"elevenlabs", "openai", "mistral", "gemini"}:
-            voice_compatible = want_opus and file_str.endswith(".ogg")
-
-        file_size = os.path.getsize(file_str)
-        logger.info("TTS audio saved: %s (%s bytes, provider: %s)", file_str, f"{file_size:,}", provider)
-
-        # Build response with MEDIA tag for platform delivery
-        media_tag = f"MEDIA:{file_str}"
-        if voice_compatible:
-            media_tag = f"[[audio_as_voice]]\n{media_tag}"
-
+        file_str = str(decision.path)
         return json.dumps({
             "success": True,
             "file_path": file_str,
-            "media_tag": media_tag,
-            "provider": provider,
-            "voice_compatible": voice_compatible,
+            "media_tag": f"MEDIA:{file_str}",
+            "provider": selected,
+            "voice_compatible": False,
         }, ensure_ascii=False)
-
-    except ValueError as e:
-        # Configuration errors (missing API keys, etc.)
-        error_msg = f"TTS configuration error ({provider}): {e}"
-        logger.error("%s", error_msg)
-        return tool_error(error_msg, success=False)
-    except FileNotFoundError as e:
-        # Missing dependencies or files
-        error_msg = f"TTS dependency missing ({provider}): {e}"
-        logger.error("%s", error_msg, exc_info=True)
-        return tool_error(error_msg, success=False)
-    except Exception as e:
-        # Unexpected errors
-        error_msg = f"TTS generation failed ({provider}): {e}"
-        logger.error("%s", error_msg, exc_info=True)
-        return tool_error(error_msg, success=False)
+    except _TTSDestinationError as exc:
+        return tool_error(str(exc), success=False)
+    except asyncio.CancelledError:
+        raise
+    except BaseException:
+        return tool_error("TTS generation failed", success=False)
 
 
 def text_to_speech_tool(
@@ -3500,163 +4370,95 @@ def text_to_speech_tool(
     instructions: Optional[str] = None,
     provider: Optional[str] = None,
 ) -> str:
-    """Convert text to speech audio with long-form chunking.
-
-    Long text is normalized, split into provider-safe chunks, synthesized
-    sequentially, and packed against destination platform upload limits.
-    Each provider request is encoded to its final format before files are
-    packed. Multi-chunk voice output is re-encoded when combined; failed
-    combines preserve separate valid files, and no over-limit final artifact
-    is returned.
-
-    On messaging platforms, the returned MEDIA:<path> tag is intercepted
-    by the send pipeline and delivered as a native voice message.
-    In CLI mode, the file is saved to ~/voice-memos/.
-
-    Args:
-        text: The text to convert to speech. Provider-specific per-request
-            character caps apply automatically (OpenAI 4096, xAI 15000,
-            MiniMax 10000, ElevenLabs 5k-40k depending on model); longer
-            input is split into ordered chunks without silent truncation.
-        output_path: Optional custom save path.
-        speed: Optional playback speed multiplier (0.25-4.0).
-        instructions: Optional voice-design guidance (tone, emotion, pacing).
-        provider: Optional TTS provider override.
-
-    Returns:
-        str: JSON result with success, file_path, file_paths, and MEDIA tag.
-    """
+    """Generate every chunk anonymously and cross one common decision gate."""
     if not text or not text.strip():
         return tool_error("Text is required", success=False)
-
-    # Normalize text via the shared cleaner: markdown, emoji, think blocks,
-    # verifier footer, units, newline flattening.
     try:
-        from tools.tts_text_normalize import prepare_spoken_text
-        text = prepare_spoken_text(text, max_chars=None)
-    except Exception:
-        text = text.strip()
-    if not text:
-        return tool_error("Text is empty after TTS cleanup", success=False)
+        try:
+            from tools.tts_text_normalize import prepare_spoken_text
 
-    tts_config = _load_tts_config()
+            normalized = prepare_spoken_text(text, max_chars=None)
+        except Exception:
+            normalized = text.strip()
+        if not normalized:
+            return tool_error("Text is empty after TTS cleanup", success=False)
 
-    # When the model supplies a speed parameter, inject it into the config
-    # so all downstream provider functions pick it up uniformly.
-    if speed is not None:
-        clamped = max(0.25, min(4.0, float(speed)))
-        tts_config = dict(tts_config)  # shallow copy to avoid mutating the cache
-        tts_config["speed"] = clamped
-
-    # Allow per-call provider override; fall back to the configured default.
-    if provider:
-        provider = provider.lower().strip()
-    else:
-        provider = _get_provider(tts_config)
-
-    command_provider_config = _resolve_command_provider_config(provider, tts_config)
-    max_len = _resolve_max_text_length(provider, tts_config)
-    chunks = _split_text_for_tts(text, max_len)
-    if not chunks:
-        return tool_error("Text is required", success=False)
-    if len(chunks) > 1:
-        logger.info(
-            "TTS text for provider %s split into %d chunks (input=%d chars, cap=%d)",
-            provider,
-            len(chunks),
-            len(text),
-            max_len,
+        tts_config = _load_tts_config()
+        if speed is not None:
+            tts_config = dict(tts_config)
+            tts_config["speed"] = max(0.25, min(4.0, float(speed)))
+        selected = provider.lower().strip() if provider else _get_provider(tts_config)
+        validated_output_path, output_format = _preflight_tts_destination(
+            output_path,
+            selected,
+            tts_config,
+            timestamp_format="%Y%m%d_%H%M%S_%f",
         )
+        chunks = _split_text_for_tts(
+            normalized, _resolve_max_text_length(selected, tts_config)
+        )
+        if not chunks:
+            return tool_error("Text is required", success=False)
 
-    from gateway.session_context import get_session_env
-    platform = get_session_env("HERMES_SESSION_PLATFORM", "").lower()
-    want_opus = platform in OPUS_VOICE_PLATFORMS
-    delivery_profile = _resolve_audio_delivery_profile(platform, tts_config)
+        from gateway.session_context import get_session_env
 
-    # Determine output path (single-chunk short-circuit uses the final path).
-    if output_path:
-        from tools.path_security import has_traversal_component
-        if has_traversal_component(output_path):
-            return json.dumps({
-                "success": False,
-                "error": (
-                    f"output_path contains '..' traversal component: {output_path}. "
-                    "Use an absolute path or one relative to the current directory "
-                    "without '..'."
-                ),
-            }, ensure_ascii=False)
-        base_path = Path(output_path).expanduser()
-        if command_provider_config is not None:
-            base_path = _configured_command_tts_output_path(
-                base_path, command_provider_config,
-            )
-        from agent.file_safety import is_write_approval_required, is_write_denied
-        if is_write_denied(str(base_path)) or is_write_approval_required(str(base_path)):
-            return json.dumps({
-                "success": False,
-                "error": (
-                    f"output_path targets a protected credential or system path: "
-                    f"{base_path}. Choose a normal audio output location."
-                ),
-            }, ensure_ascii=False)
-    else:
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        out_dir = Path(DEFAULT_OUTPUT_DIR)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        if command_provider_config is not None:
-            fmt = _get_command_tts_output_format(command_provider_config)
-            base_path = out_dir / f"tts_{timestamp}.{fmt}"
-        elif want_opus and provider in {"openai", "elevenlabs", "mistral", "gemini"}:
-            base_path = out_dir / f"tts_{timestamp}.ogg"
+        platform_name = get_session_env("HERMES_SESSION_PLATFORM", "").lower()
+        delivery_profile = _resolve_audio_delivery_profile(platform_name, tts_config)
+        base_path = validated_output_path
+        if base_path is None:
+            destinations: tuple[Path, ...] = ()
+        elif len(chunks) == 1:
+            destinations = (base_path,)
         else:
-            base_path = out_dir / f"tts_{timestamp}.mp3"
-    base_path.parent.mkdir(parents=True, exist_ok=True)
-
-    generated_artifacts: set[str] = set()
-    final_paths: List[str] = []
-    chunk_results: List[Dict[str, Any]] = []
-    try:
-        encoded_paths: List[str] = []
-        for index, chunk in enumerate(chunks, start=1):
-            if len(chunks) == 1:
-                chunk_path = base_path
-            else:
-                chunk_path = base_path.with_name(
+            destinations = tuple(
+                base_path.with_name(
                     f"{base_path.stem}.chunk{index:03d}{base_path.suffix}"
                 )
-            generated_artifacts.add(str(chunk_path))
-            raw_result = _text_to_speech_single(
-                text=chunk,
-                output_path=str(chunk_path),
-                speed=speed,
-                instructions=instructions,
-                provider=provider,
-                tts_config_override=tts_config,
+                for index in range(1, len(chunks) + 1)
             )
-            try:
-                chunk_result = json.loads(raw_result)
-            except (json.JSONDecodeError, TypeError):
-                raise RuntimeError(
-                    f"TTS chunk {index} returned invalid JSON: {str(raw_result)[:200]}"
-                )
-            if not chunk_result.get("success"):
-                error_msg = chunk_result.get("error", "unknown error")
-                return tool_error(
-                    f"TTS chunk {index} failed ({provider}): {error_msg}",
-                    success=False,
-                )
-            actual_path = str(chunk_result.get("file_path") or chunk_path)
-            if not os.path.isfile(actual_path) or os.path.getsize(actual_path) <= 0:
-                raise RuntimeError(
-                    f"TTS chunk {index} produced no final audio: {actual_path}"
-                )
-            generated_artifacts.add(actual_path)
-            encoded_paths.append(actual_path)
-            chunk_results.append(chunk_result)
 
-        voice_compatible = bool(chunk_results) and all(
-            bool(result.get("voice_compatible")) for result in chunk_results
+        def publish_all(permit: Any):
+            from tools.tts_publish import publish_durable_many
+
+            if base_path is None:
+                raise ValueError("tts_generation_failed")
+            base_path.parent.mkdir(parents=True, exist_ok=True)
+            return publish_durable_many(permit, destinations)
+
+        decision, output_format = _generate_anonymous_tts(
+            chunks,
+            provider=selected,
+            tts_config=tts_config,
+            speed=speed,
+            instructions=instructions,
+            aggregate_cap=min(
+                _EPHEMERAL_TTS_MAX_BYTES, delivery_profile.max_file_bytes
+            ),
+            output_format=output_format,
+            durable_consumer=publish_all,
         )
+
+        from tools.tts_transaction import EphemeralDelivery
+
+        if type(decision) is EphemeralDelivery:
+            return _ephemeral_tts_result(
+                decision.chunks,
+                selected,
+                output_format,
+                public=True,
+            )
+
+        if base_path is None:
+            raise ValueError("tts_generation_failed")
+        encoded_paths = [str(item.path) for item in decision]
+        voice_compatible = _anonymous_voice_compatible(selected, tts_config)
+        if platform_name in OPUS_VOICE_PLATFORMS and (
+            selected == "edge" or voice_compatible
+        ):
+            converted = [_convert_to_opus(path) for path in encoded_paths]
+            if all(isinstance(path, str) and path for path in converted):
+                encoded_paths = [str(path) for path in converted]
+                voice_compatible = True
         delivery_base = base_path.with_suffix(Path(encoded_paths[0]).suffix)
         final_paths, combined_chunks = _build_audio_delivery_files(
             encoded_paths,
@@ -3664,24 +4466,15 @@ def text_to_speech_tool(
             delivery_profile,
             voice_compatible=voice_compatible,
         )
-
-        for path in final_paths:
-            logger.info(
-                "TTS audio saved: %s (%s bytes, provider: %s)",
-                path,
-                f"{os.path.getsize(path):,}",
-                provider,
-            )
         media_tag = "\n".join(f"MEDIA:{path}" for path in final_paths)
         if voice_compatible:
             media_tag = f"[[audio_as_voice]]\n{media_tag}"
-
         return json.dumps({
             "success": True,
             "file_path": final_paths[0],
             "file_paths": final_paths,
             "media_tag": media_tag,
-            "provider": chunk_results[0].get("provider", provider),
+            "provider": selected,
             "voice_compatible": voice_compatible,
             "chunk_count": len(chunks),
             "delivery_file_count": len(final_paths),
@@ -3692,28 +4485,14 @@ def text_to_speech_tool(
                 "target_file_bytes": delivery_profile.target_file_bytes,
             },
         }, ensure_ascii=False)
-    except ValueError as exc:
-        error_msg = f"TTS delivery error ({provider}): {exc}"
-        logger.error("%s", error_msg)
-        return tool_error(error_msg, success=False)
-    except Exception as exc:
-        error_msg = f"TTS long-form generation failed ({provider}): {exc}"
-        logger.error("%s", error_msg, exc_info=True)
-        return tool_error(error_msg, success=False)
-    finally:
-        final_absolute = {os.path.abspath(path) for path in final_paths}
-        for artifact in generated_artifacts:
-            if os.path.abspath(artifact) in final_absolute:
-                continue
-            try:
-                os.unlink(artifact)
-            except OSError:
-                pass
+    except _TTSDestinationError as exc:
+        return tool_error(str(exc), success=False)
+    except asyncio.CancelledError:
+        raise
+    except BaseException:
+        return tool_error("TTS generation failed", success=False)
 
 
-# ===========================================================================
-# Requirements check
-# ===========================================================================
 def check_tts_requirements() -> bool:
     """Return whether the explicitly resolved TTS provider can run.
 

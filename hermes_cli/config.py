@@ -963,6 +963,23 @@ def ensure_hermes_home():
     # the deleted-profile guard.
     from hermes_constants import assert_named_profile_home_live
     assert_named_profile_home_live(home)
+    # Invocation-scoped ephemeral one-shot mode may read existing config, but
+    # it must not create the normal persistence tree (sessions, logs, memory,
+    # caches, or a seeded SOUL.md).  The policy is bound before any config or
+    # plugin helper runs, so every indirect load_config() call inherits this
+    # fail-closed filesystem boundary.
+    try:
+        from hermes_cli.persistence import (
+            PersistencePolicy,
+            current_persistence_policy,
+        )
+
+        if current_persistence_policy() is PersistencePolicy.EPHEMERAL:
+            return
+    except ImportError:
+        # Bootstrap/install contexts may load config before the CLI policy
+        # module is importable; preserve the longstanding durable behavior.
+        pass
     if key in _HERMES_HOME_ENSURED and home.is_dir():
         return
     if is_managed():

@@ -1,0 +1,62 @@
+name: Task 12 Linux proof
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  linux-proof:
+    name: Exact batch delete and maintenance
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout the reviewed source revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: 79ef4f81798b53a6137cba73e46bf366dc42b7df
+
+      - name: Verify host and reviewed revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Linux
+          test "$(git rev-parse HEAD)" = 79ef4f81798b53a6137cba73e46bf366dc42b7df
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.11
+
+      - name: Install locked test dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
+
+      - name: Run the approved Linux exact-delete gate
+        shell: bash
+        env:
+          HERMES_TEST_FILE_RETRIES: "0"
+          HERMES_TEST_WORKERS: "4"
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: |
+          set -euo pipefail
+          scripts/run_tests.sh \
+            tests/test_session_exact_batch_delete.py \
+            tests/test_session_delete_profile_isolation.py \
+            tests/test_session_maintenance_lock.py \
+            tests/test_profile_mutation_boundary_audit.py \
+            -q

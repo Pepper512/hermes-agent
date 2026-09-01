@@ -126,6 +126,10 @@ def _db_path():
 
 
 def _connect() -> sqlite3.Connection:
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        raise RuntimeError("persistence disabled for this invocation")
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=10)

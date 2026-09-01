@@ -678,6 +678,10 @@ def _store_full_text(url: str, content: str) -> Optional[str]:
     page through the complete text on any backend. Returns None on failure
     (storage is best-effort; truncated content is still returned to the model).
     """
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return None
     try:
         import hashlib
         from urllib.parse import urlparse

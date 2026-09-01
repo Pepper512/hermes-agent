@@ -168,6 +168,21 @@ class TestABCContract:
         with pytest.raises(NotImplementedError, match="does not implement streaming"):
             next(p.stream("hello"))
 
+    def test_sink_synthesis_default_rejects_without_calling_legacy_method(self):
+        calls = []
+        p = _FakeProvider(
+            name="cartesia",
+            synthesize_impl=lambda *args, **kwargs: calls.append((args, kwargs)),
+        )
+        with pytest.raises(NotImplementedError, match="anonymous sink"):
+            p.synthesize_to_sink(
+                "hello",
+                "/dev/fd/19",
+                format="mp3",
+                maximum_bytes=4096,
+            )
+        assert calls == []
+
 
 
 

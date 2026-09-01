@@ -1438,6 +1438,10 @@ def _apply_pre_transcription_hook(
     their existing config/env language resolution when no hook overrides
     it.
     """
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return model, None, prompt
     try:
         from hermes_cli.plugins import has_hook, invoke_hook
 

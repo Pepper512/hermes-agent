@@ -2244,7 +2244,13 @@ def _start_cleanup_thread():
     with _env_lock:
         if _cleanup_thread is None or not _cleanup_thread.is_alive():
             _cleanup_running = True
-            _cleanup_thread = threading.Thread(target=_cleanup_thread_worker, daemon=True)
+            import contextvars
+
+            _cleanup_thread = threading.Thread(
+                target=contextvars.copy_context().run,
+                args=(_cleanup_thread_worker,),
+                daemon=True,
+            )
             _cleanup_thread.start()
 
 

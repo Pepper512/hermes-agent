@@ -65,6 +65,10 @@ def _db_path() -> Path:
 
 
 def _connect() -> sqlite3.Connection:
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        raise RuntimeError("verification evidence unavailable in ephemeral mode")
     from hermes_state import apply_wal_with_fallback
 
     path = _db_path()
@@ -570,6 +574,11 @@ def record_terminal_result(
 ) -> Optional[dict[str, Any]]:
     """Record a foreground terminal result when it is verification evidence."""
 
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return None
+
     evidence = classify_verification_command(
         command,
         cwd=cwd,
@@ -604,6 +613,10 @@ def record_verify_run(
     so the recorded workspace root matches what :func:`verification_status`
     derives when the stop guard later looks the evidence up.
     """
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return None
     try:
         from agent.coding_context import project_facts_for
 
@@ -627,8 +640,12 @@ def record_verify_run(
     return _insert_evidence(evidence)
 
 
-def _insert_evidence(evidence: VerificationEvidence) -> dict[str, Any]:
+def _insert_evidence(evidence: VerificationEvidence) -> Optional[dict[str, Any]]:
     """Insert a classified evidence row and repoint the workspace state."""
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return None
     created_at = _utc_now()
     with _DB_LOCK:
         with _transaction() as conn:
@@ -682,6 +699,11 @@ def mark_workspace_edited(
 ) -> Optional[dict[str, Any]]:
     """Mark verification evidence stale after a successful file edit."""
 
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return None
+
     try:
         from agent.coding_context import project_facts_for
 
@@ -734,6 +756,11 @@ def verification_status(
     cwd: str | Path | None,
 ) -> dict[str, Any]:
     """Return the best known verification state for a session/workspace."""
+
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return {"status": "not_applicable", "evidence": None}
 
     try:
         from agent.coding_context import project_facts_for

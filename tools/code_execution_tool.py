@@ -164,6 +164,10 @@ def _spill_full_stdout(stdout_text: str) -> Optional[str]:
     coalesce; the directory rides the same remote bind-mount list as
     cache/web (credential_files._CACHE_DIRS) if present there.
     """
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return None
     try:
         import hashlib
         from hermes_constants import get_hermes_dir

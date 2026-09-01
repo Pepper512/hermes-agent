@@ -105,6 +105,18 @@ def test_bump_view_increments_and_timestamps(skills_home):
     assert rec["last_viewed_at"] is not None
 
 
+def test_ephemeral_bump_use_creates_no_usage_or_lock_file(skills_home):
+    from hermes_cli.persistence import PersistencePolicy, bind_persistence_policy
+    from tools.skill_usage import bump_use
+
+    with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
+        bump_use("private-selected-skill", task_id="private-task")
+
+    skills_dir = skills_home / "skills"
+    assert not (skills_dir / ".usage.json").exists()
+    assert not (skills_dir / ".usage.json.lock").exists()
+
+
 def test_skill_reuse_and_post_patch_reuse_are_derived_atomically(
     skills_home,
     monkeypatch,

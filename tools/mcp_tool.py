@@ -108,6 +108,7 @@ import random
 import re
 import shutil
 import sys
+import tempfile
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -197,6 +198,16 @@ def _get_mcp_stderr_log() -> Any:
     machinery wires the child's stderr directly to that fd.  Falls back to
     ``/dev/null`` if opening the log file fails.
     """
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        try:
+            return tempfile.TemporaryFile(
+                mode="w+", encoding="utf-8", errors="replace"
+            )
+        except Exception:
+            return open(os.devnull, "w", encoding="utf-8")
+
     global _mcp_stderr_log_fh
     with _mcp_stderr_log_lock:
         if _mcp_stderr_log_fh is not None:
@@ -231,6 +242,10 @@ def _write_stderr_log_header(server_name: str) -> None:
     ``mcp-stderr.log`` file without needing per-line prefixes (which would
     require a pipe + reader thread and complicate shutdown).
     """
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return
     fh = _get_mcp_stderr_log()
     try:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -3284,6 +3299,9 @@ class MCPServerTask:
         # (FastMCP banners, slack-mcp startup JSON, etc.) don't dump onto
         # the user's TTY and corrupt the TUI.  Preserves debuggability via
         # ~/.hermes/logs/mcp-stderr.log.
+        from hermes_cli.persistence import persistence_disabled
+
+        _ephemeral_errlog = persistence_disabled()
         _write_stderr_log_header(self.name)
         _errlog = _get_mcp_stderr_log()
         try:
@@ -3379,6 +3397,11 @@ class MCPServerTask:
                     # consistency with _run_http.
                     return await self._wait_for_lifecycle_event()
         finally:
+            if _ephemeral_errlog:
+                try:
+                    _errlog.close()
+                except Exception:
+                    pass
             # Runs on clean exit, exceptions, AND asyncio cancellation.
             # If any of the spawned PIDs are still alive, the SDK's
             # teardown failed (common when the task is cancelled mid-way

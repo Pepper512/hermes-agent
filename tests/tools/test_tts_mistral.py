@@ -113,7 +113,9 @@ class TestTtsDispatcherMistral:
 
         monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
         mock_mistral_module.audio.speech.complete.return_value = MagicMock(
-            audio_data=base64.b64encode(b"audio").decode()
+            audio_data=base64.b64encode(
+                b"ID3\x04\x00\x00\x00\x00\x00\x00private-audio"
+            ).decode()
         )
 
         output_path = str(tmp_path / "out.mp3")
@@ -138,7 +140,7 @@ class TestTtsDispatcherMistral:
             )
 
         assert result["success"] is False
-        assert "mistralai" in result["error"]
+        assert result["error"] == "TTS generation failed"
 
 
 class TestCheckTtsRequirementsMistral:

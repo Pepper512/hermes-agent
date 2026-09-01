@@ -41,6 +41,10 @@ def _traces_enabled_and_dir() -> Optional[Path]:
     a cache-MISS MoA turn, i.e. once per user turn, not per tool iteration).
     ``moa.trace_dir`` overrides the default ``<hermes_home>/moa-traces/``.
     """
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return None
     try:
         from hermes_cli.config import load_config
 
@@ -135,6 +139,10 @@ def save_moa_turn(
     that resolved text was unavailable, it falls back to None and the record
     points at the session store via ``output_location``.
     """
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return
     base = _traces_enabled_and_dir()
     if base is None:
         return

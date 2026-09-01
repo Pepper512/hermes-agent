@@ -2745,8 +2745,11 @@ def _start_browser_cleanup_thread():
     with _cleanup_lock:
         if _cleanup_thread is None or not _cleanup_thread.is_alive():
             _cleanup_running = True
+            import contextvars
+
             _cleanup_thread = threading.Thread(
-                target=_browser_cleanup_thread_worker,
+                target=contextvars.copy_context().run,
+                args=(_browser_cleanup_thread_worker,),
                 daemon=True,
                 name="browser-cleanup"
             )
@@ -4037,6 +4040,10 @@ def _store_full_snapshot(snapshot_text: str) -> Optional[str]:
     None on failure (storage is best-effort; the truncated view is still
     returned to the model).
     """
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return None
     try:
         import hashlib
         from hermes_constants import get_hermes_dir
@@ -5288,6 +5295,10 @@ def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
 
 def _maybe_start_recording(task_id: str):
     """Start recording if browser.record_sessions is enabled in config."""
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return
     with _cleanup_lock:
         if task_id in _recording_sessions:
             return
@@ -5320,6 +5331,12 @@ def _maybe_start_recording(task_id: str):
 
 def _maybe_stop_recording(task_id: str):
     """Stop recording if one is active for this session."""
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        with _cleanup_lock:
+            _recording_sessions.discard(task_id)
+        return
     with _cleanup_lock:
         if task_id not in _recording_sessions:
             return
@@ -5410,6 +5427,37 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
 
 
 def browser_vision(question: str, annotate: bool = False, task_id: Optional[str] = None) -> Union[str, Dict[str, Any]]:
+    """Capture browser pixels without retaining a profile file in ephemeral mode."""
+    if _is_camofox_mode():
+        from tools.browser_camofox import camofox_vision
+
+        return camofox_vision(question, annotate, task_id)
+
+    from hermes_cli.persistence import persistence_disabled
+
+    if not persistence_disabled():
+        return _browser_vision_impl(question, annotate, task_id)
+
+    # agent-browser's screenshot command is path-based. Keep that required
+    # transport invocation-local and remove it on every return/exception.
+    with tempfile.TemporaryDirectory(prefix="hermes-browser-vision-") as temp_dir:
+        return _browser_vision_impl(
+            question,
+            annotate,
+            task_id,
+            _screenshots_dir=Path(temp_dir),
+            _ephemeral=True,
+        )
+
+
+def _browser_vision_impl(
+    question: str,
+    annotate: bool = False,
+    task_id: Optional[str] = None,
+    *,
+    _screenshots_dir: Optional[Path] = None,
+    _ephemeral: bool = False,
+) -> Union[str, Dict[str, Any]]:
     """
     Take a screenshot of the current page for visual inspection.
 
@@ -5432,14 +5480,25 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         A JSON string with vision analysis results and screenshot_path, or a
         multimodal tool-result envelope carrying the screenshot and metadata.
     """
-    if _is_camofox_mode():
-        from tools.browser_camofox import camofox_vision
-        return camofox_vision(question, annotate, task_id)
+    from hermes_cli.persistence import persistence_disabled
 
+    if persistence_disabled() and not _ephemeral:
+        with tempfile.TemporaryDirectory(prefix="hermes-browser-vision-") as temp_dir:
+            return _browser_vision_impl(
+                question,
+                annotate,
+                task_id,
+                _screenshots_dir=Path(temp_dir),
+                _ephemeral=True,
+            )
     import base64
     import uuid as uuid_mod
-    from hermes_constants import get_hermes_dir
-    screenshots_dir = get_hermes_dir("cache/screenshots", "browser_screenshots")
+    if _screenshots_dir is None:
+        from hermes_constants import get_hermes_dir
+
+        screenshots_dir = get_hermes_dir("cache/screenshots", "browser_screenshots")
+    else:
+        screenshots_dir = _screenshots_dir
     screenshot_path = screenshots_dir / f"browser_screenshot_{uuid_mod.uuid4().hex}.png"
     effective_task_id = _last_session_key(task_id or "default")
 
@@ -5497,8 +5556,10 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
             _lp_fallback_warning = fb_result.get("fallback_warning")
             fb_path = fb_result.get("data", {}).get("path", "")
             if fb_path and os.path.exists(fb_path):
-                from hermes_constants import get_hermes_dir
-                screenshots_dir = get_hermes_dir("cache/screenshots", "browser_screenshots")
+                if _screenshots_dir is None:
+                    from hermes_constants import get_hermes_dir
+
+                    screenshots_dir = get_hermes_dir("cache/screenshots", "browser_screenshots")
                 screenshots_dir.mkdir(parents=True, exist_ok=True)
                 import shutil as _shutil_vision
                 persistent_path = screenshots_dir / f"browser_screenshot_{uuid_mod.uuid4().hex}.png"
@@ -5554,7 +5615,11 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
             )
 
         if not result.get("success"):
-            error_detail = result.get("error", "Unknown error")
+            error_detail = (
+                "capture failed"
+                if _ephemeral
+                else result.get("error", "Unknown error")
+            )
             _cp = _get_cloud_provider()
             mode = "local" if _cp is None else f"cloud ({_cp.provider_name()})"
             error_response = {
@@ -5564,21 +5629,26 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
             return json.dumps(_copy_fallback_warning(error_response, result), ensure_ascii=False)
 
         actual_screenshot_path = result.get("data", {}).get("path")
-        if actual_screenshot_path:
+        if actual_screenshot_path and not _ephemeral:
             screenshot_path = Path(actual_screenshot_path)
 
         # Check if screenshot file was created
         if not screenshot_path.exists():
             _cp = _get_cloud_provider()
             mode = "local" if _cp is None else f"cloud ({_cp.provider_name()})"
+            missing_detail = (
+                "Screenshot capture produced no image."
+                if _ephemeral
+                else (
+                    f"Screenshot file was not created at {screenshot_path} ({mode} mode). "
+                    "This may indicate a socket path issue (macOS /var/folders/), "
+                    "a missing Chromium install ('agent-browser install'), "
+                    "or a stale daemon process."
+                )
+            )
             return json.dumps({
                 "success": False,
-                "error": (
-                    f"Screenshot file was not created at {screenshot_path} ({mode} mode). "
-                    f"This may indicate a socket path issue (macOS /var/folders/), "
-                    f"a missing Chromium install ('agent-browser install'), "
-                    f"or a stale daemon process."
-                ),
+                "error": missing_detail,
             }, ensure_ascii=False)
 
         # NOTE: the full-resolution base64 encode is deliberately deferred.
@@ -5618,21 +5688,25 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
                 force_jpeg=True,
             )
             native_result = _build_native_vision_tool_result(
-                image_url=str(screenshot_path),
+                image_url="" if _ephemeral else str(screenshot_path),
                 question=question,
                 image_data_url=data_url,
                 image_size_bytes=screenshot_path.stat().st_size,
             )
             meta = native_result.setdefault("meta", {})
-            meta["screenshot_path"] = str(screenshot_path)
+            if _ephemeral:
+                meta.pop("image_url", None)
+            else:
+                meta["screenshot_path"] = str(screenshot_path)
             if _lp_fallback_warning:
                 meta["fallback_warning"] = _lp_fallback_warning
             if annotate and result.get("data", {}).get("annotations"):
                 meta["annotations"] = result["data"]["annotations"]
-            native_result["text_summary"] = (
-                f"{native_result.get('text_summary', '')} "
-                f"Screenshot path: {screenshot_path}"
-            ).strip()
+            if not _ephemeral:
+                native_result["text_summary"] = (
+                    f"{native_result.get('text_summary', '')} "
+                    f"Screenshot path: {screenshot_path}"
+                ).strip()
             return native_result
 
         vision_prompt = (
@@ -5719,8 +5793,9 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         response_data = {
             "success": True,
             "analysis": analysis or "Vision analysis returned no content.",
-            "screenshot_path": str(screenshot_path),
         }
+        if not _ephemeral:
+            response_data["screenshot_path"] = str(screenshot_path)
         _copy_fallback_warning(response_data, result)
         # Include annotation data if annotated screenshot was taken
         if annotate and result.get("data", {}).get("annotations"):
@@ -5732,9 +5807,13 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         # in the LLM vision analysis, not the capture.  Deleting a valid
         # screenshot loses evidence the user might need.  The 24-hour cleanup
         # in _cleanup_old_screenshots prevents unbounded disk growth.
-        logger.warning("browser_vision failed: %s", e, exc_info=True)
-        error_info = {"success": False, "error": f"Error during vision analysis: {str(e)}"}
-        if screenshot_path.exists():
+        if _ephemeral:
+            logger.warning("browser_vision failed during ephemeral analysis")
+            error_info = {"success": False, "error": "Error during vision analysis"}
+        else:
+            logger.warning("browser_vision failed: %s", e, exc_info=True)
+            error_info = {"success": False, "error": f"Error during vision analysis: {str(e)}"}
+        if not _ephemeral and screenshot_path.exists():
             error_info["screenshot_path"] = str(screenshot_path)
             error_info["note"] = "Screenshot was captured but vision analysis failed. You can still share it via MEDIA:<path>."
         _copy_fallback_warning(error_info, result if 'result' in locals() else {})

@@ -21,11 +21,12 @@ import os
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 import cli as cli_mod
+from hermes_cli.persistence import PersistencePolicy
 
 
 @pytest.fixture(autouse=True)
@@ -196,6 +197,34 @@ class TestOneShotDurableFlush:
                 assert db.get_messages(agent.session_id) == []
             finally:
                 db.close()
+
+    @pytest.mark.parametrize(
+        "ambient_policy",
+        [PersistencePolicy.EPHEMERAL, PersistencePolicy.DURABLE],
+    )
+    def test_flush_uses_typed_ephemeral_policy_when_legacy_boolean_is_false(
+        self, ambient_policy
+    ):
+        from hermes_cli.persistence import bind_persistence_policy
+
+        db = MagicMock()
+        agent = SimpleNamespace(
+            persistence_policy=PersistencePolicy.EPHEMERAL,
+            _persist_disabled=False,
+            session_id="private-session",
+            _session_messages=[{"role": "user", "content": "private"}],
+            _persist_session=MagicMock(),
+            _session_db=db,
+        )
+
+        # The owner policy remains fail-closed even if teardown has rebound the
+        # ambient context to durable and the legacy compatibility flag is false.
+        with bind_persistence_policy(ambient_policy):
+            cli_mod._flush_one_shot_session_store(_fake_cli(agent))
+
+        agent._persist_session.assert_not_called()
+        db.flush_token_counts.assert_not_called()
+        db.end_session.assert_not_called()
 
     def test_flush_survives_missing_agent(self):
         cli_mod._flush_one_shot_session_store(SimpleNamespace(agent=None))

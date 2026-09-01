@@ -108,6 +108,10 @@ def write_cache_entry(
     ``tools/list`` result (2026-07-28 servers). ``written_at`` anchors TTL
     expiry in :func:`get_cached_entry`.
     """
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return
     entry = {
         "fingerprint": fingerprint,
         "tools": tools,
@@ -133,6 +137,10 @@ def write_cache_entry(
 
 
 def clear_cache_entry(server_name: str) -> None:
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return
     with _cache_lock:
         data = _load_all()
         if server_name in data:

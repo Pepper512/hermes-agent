@@ -469,11 +469,14 @@ class ProcessRegistry:
         self.completion_queue: _queue_mod.Queue = _queue_mod.Queue()
         # Rehydrate durable delegation completions only at registry startup.
         # Consumers still inject them as fresh turns through this existing rail.
-        try:
-            from tools.async_delegation import restore_undelivered_completions
-            restore_undelivered_completions(self.completion_queue)
-        except Exception as exc:
-            logger.warning("Could not restore async delegation completions: %s", exc)
+        from hermes_cli.persistence import persistence_disabled
+
+        if not persistence_disabled():
+            try:
+                from tools.async_delegation import restore_undelivered_completions
+                restore_undelivered_completions(self.completion_queue)
+            except Exception as exc:
+                logger.warning("Could not restore async delegation completions: %s", exc)
 
         # Track sessions whose completion was already consumed by the agent
         # via wait/log.  Drain loops AND gateway/tui watchers skip notifications
@@ -1130,9 +1133,11 @@ class ProcessRegistry:
                 session._pty = pty_proc
 
                 # PTY reader thread
+                import contextvars
+
                 reader = threading.Thread(
-                    target=self._pty_reader_loop,
-                    args=(session,),
+                    target=contextvars.copy_context().run,
+                    args=(self._pty_reader_loop, session),
                     daemon=True,
                     name=f"proc-pty-reader-{session.id}",
                 )
@@ -1236,9 +1241,11 @@ class ProcessRegistry:
 
         try:
             # Start output reader thread
+            import contextvars
+
             reader = threading.Thread(
-                target=self._reader_loop,
-                args=(session,),
+                target=contextvars.copy_context().run,
+                args=(self._reader_loop, session),
                 daemon=True,
                 name=f"proc-reader-{session.id}",
             )
@@ -1365,9 +1372,11 @@ class ProcessRegistry:
 
         if not session.exited:
             # Start a poller thread that periodically reads the log file
+            import contextvars
+
             reader = threading.Thread(
-                target=self._env_poller_loop,
-                args=(session, env, log_path, pid_path, exit_path),
+                target=contextvars.copy_context().run,
+                args=(self._env_poller_loop, session, env, log_path, pid_path, exit_path),
                 daemon=True,
                 name=f"proc-poller-{session.id}",
             )
@@ -2797,6 +2806,10 @@ class ProcessRegistry:
         extra_entries: Optional[List[Dict[str, Any]]] = None,
     ):
         """Write running process metadata to checkpoint file atomically."""
+        from hermes_cli.persistence import persistence_disabled
+
+        if persistence_disabled():
+            return
         try:
             with self._lock:
                 entries = []
@@ -2857,7 +2870,9 @@ class ProcessRegistry:
 
         Returns the number of processes recovered as detached.
         """
-        if not CHECKPOINT_PATH.exists():
+        from hermes_cli.persistence import persistence_disabled
+
+        if persistence_disabled() or not CHECKPOINT_PATH.exists():
             return 0
 
         try:

@@ -2045,9 +2045,15 @@ def _build_child_agent(
     # the child's transcript into the launch profile's db, breaking
     # parent_session_id lineage and session_search. AsyncSessionDB wrappers
     # (gateway) forward .db_path via __getattr__, so this works through them.
+    from hermes_cli.persistence import PersistencePolicy, coerce_persistence_policy
+
+    child_persistence_policy = coerce_persistence_policy(
+        vars(parent_agent).get("persistence_policy", PersistencePolicy.DURABLE)
+    )
+    child_ephemeral = child_persistence_policy is PersistencePolicy.EPHEMERAL
     child_session_db = None
     parent_session_db = getattr(parent_agent, "_session_db", None)
-    if parent_session_db is not None:
+    if not child_ephemeral and parent_session_db is not None:
         try:
             from hermes_state import SessionDB
 
@@ -2093,6 +2099,7 @@ def _build_child_agent(
                 clarify_callback=None,
                 thinking_callback=child_thinking_cb,
                 session_db=child_session_db,
+                persistence_policy=child_persistence_policy,
                 parent_session_id=getattr(parent_agent, "session_id", None),
                 providers_allowed=child_providers_allowed,
                 providers_ignored=child_providers_ignored,
@@ -2230,6 +2237,10 @@ def _dump_subagent_timeout_diagnostic(
 
     Returns the absolute path to the diagnostic file, or None on failure.
     """
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled(child):
+        return None
     try:
         from hermes_constants import get_hermes_home
         import datetime as _dt
@@ -2525,6 +2536,9 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
     blowing the parent context and (on rate-limited providers) triggering a
     compression/429 death spiral.
     """
+    from hermes_cli.persistence import persistence_disabled
+
+    ephemeral = persistence_disabled(parent_agent)
     summaries = [
         r for r in results if isinstance(r, dict) and isinstance(r.get("summary"), str) and r["summary"]
     ]
@@ -2550,9 +2564,13 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
         if len(summary) <= cap:
             continue
         original_len = len(summary)
-        model_text, spill_path = _trim_summary_with_footer(
-            summary, cap, entry.get("task_index", -1)
-        )
+        if ephemeral:
+            model_text = summary[:cap]
+            spill_path = None
+        else:
+            model_text, spill_path = _trim_summary_with_footer(
+                summary, cap, entry.get("task_index", -1)
+            )
         entry["summary"] = model_text
         entry["summary_truncated"] = True
         if spill_path:
@@ -2949,8 +2967,14 @@ def _run_single_child(
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
+            from hermes_cli.persistence import bind_persistence_policy
 
-            with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+            with (
+                delegated_child_context(str(getattr(child, "session_id", "") or "")),
+                bind_persistence_policy(
+                    vars(child).get("persistence_policy", "durable")
+                ),
+            ):
                 return child.run_conversation(
                     user_message=goal,
                     task_id=child_task_id,
@@ -3116,11 +3140,16 @@ def _run_single_child(
                 _schema_retries = 1
                 _retry_result = None
                 try:
-                    _retry_result = child.run_conversation(
-                        user_message=build_retry_message(_schema_errors),
-                        task_id=child_task_id,
-                        stream_callback=_relay_child_text,
-                    )
+                    from hermes_cli.persistence import bind_persistence_policy
+
+                    with bind_persistence_policy(
+                        vars(child).get("persistence_policy", "durable")
+                    ):
+                        _retry_result = child.run_conversation(
+                            user_message=build_retry_message(_schema_errors),
+                            task_id=child_task_id,
+                            stream_callback=_relay_child_text,
+                        )
                 except Exception as _retry_exc:
                     logger.warning(
                         "Subagent %d schema-retry turn failed: %s",
@@ -3622,10 +3651,16 @@ def _finalize_child_results(
 ) -> None:
     """Apply host-owned summary, memory, hook, and cost contracts once."""
     with _parent_finalization_lock(parent_agent):
+        from hermes_cli.persistence import persistence_disabled
+
         _apply_summary_budget(results, parent_agent)
         child_by_index = {index: child for index, _task, child in children}
 
-        if parent_agent and getattr(parent_agent, "_memory_manager", None):
+        if (
+            parent_agent
+            and not persistence_disabled(parent_agent)
+            and getattr(parent_agent, "_memory_manager", None)
+        ):
             for entry in results:
                 try:
                     task_index = entry.get("task_index", -1)
@@ -3645,10 +3680,12 @@ def _finalize_child_results(
                     pass
 
         parent_session_id = getattr(parent_agent, "session_id", None)
-        try:
-            from hermes_cli.plugins import invoke_hook as invoke_hook
-        except Exception:
-            invoke_hook = None
+        invoke_hook = None
+        if not persistence_disabled(parent_agent):
+            try:
+                from hermes_cli.lifecycle import invoke_hook
+            except Exception:
+                invoke_hook = None
 
         children_cost_total = 0.0
         for entry in results:

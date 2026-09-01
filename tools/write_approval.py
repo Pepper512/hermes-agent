@@ -139,6 +139,10 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
         "created_at": time.time(),
         "payload": payload,
     }
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return record
     try:
         d = _pending_dir(subsystem)
         d.mkdir(parents=True, exist_ok=True)

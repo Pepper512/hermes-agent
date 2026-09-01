@@ -346,6 +346,14 @@ def maybe_persist_tool_result(
 
     filename = _safe_result_filename(tool_use_id)
     preview, has_more = generate_preview(content, max_chars=config.preview_size)
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return (
+            f"{preview}\n\n"
+            f"[Truncated: tool response was {len(content):,} chars. "
+            "Full output was not saved in ephemeral mode.]"
+        )
 
     # Always persist host-side first: $HERMES_HOME/cache/spillover is the
     # single canonical home for spilled results (with the other Hermes-owned

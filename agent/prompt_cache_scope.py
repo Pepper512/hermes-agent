@@ -38,6 +38,8 @@ rotate, so they hit the memo forever and behave byte-identically to before.
 import logging
 from typing import Any, Optional
 
+from hermes_cli.persistence import persistence_disabled
+
 logger = logging.getLogger(__name__)
 
 _MEMO_ATTR = "_prompt_cache_scope_memo"
@@ -97,7 +99,7 @@ def resolve_prompt_cache_scope(agent: Any) -> str:
     if (
         root is not None
         or db is None
-        or getattr(agent, "_persist_disabled", False)
+        or persistence_disabled(agent)
     ):
         try:
             setattr(agent, _MEMO_ATTR, (key, scope))

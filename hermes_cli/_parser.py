@@ -13,6 +13,8 @@ because its dispatch is tightly coupled to module-level ``cmd_*`` functions.
 import argparse
 from functools import lru_cache
 
+from hermes_cli.persistence import PersistencePolicy
+
 
 # `--profile` / `-p` is consumed by ``main._apply_profile_override`` before
 # argparse runs (it sets ``HERMES_HOME`` and strips itself from ``sys.argv``),
@@ -145,10 +147,22 @@ def build_top_level_parser():
         description="Hermes Agent - AI assistant with tool-calling capabilities",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=_EPILOGUE,
+        allow_abbrev=False,
     )
 
     parser.add_argument(
         "--version", "-V", action="store_true", help="Show version and exit"
+    )
+    parser.add_argument(
+        "--ephemeral-session",
+        dest="persistence_policy",
+        action="store_const",
+        const=PersistencePolicy.EPHEMERAL,
+        default=PersistencePolicy.DURABLE,
+        help=(
+            "For one-shot mode only: keep the prompt, response, usage, memory, "
+            "hooks, and session artifacts invocation-local and discard them on exit."
+        ),
     )
     parser.add_argument(
         "-z",
@@ -348,6 +362,7 @@ def build_top_level_parser():
         "chat",
         help="Interactive chat with the agent",
         description="Start an interactive chat session with Hermes Agent",
+        allow_abbrev=False,
     )
     _query_group = chat_parser.add_mutually_exclusive_group()
     _query_group.add_argument(
@@ -381,6 +396,17 @@ def build_top_level_parser():
             "With -q/--query-file: answer the query and exit (legacy "
             "single-query behavior) instead of seeding an interactive "
             "session. Implied on non-TTY stdio and by -Q/--quiet."
+        ),
+    )
+    chat_parser.add_argument(
+        "--ephemeral-session",
+        dest="persistence_policy",
+        action="store_const",
+        const=PersistencePolicy.EPHEMERAL,
+        default=argparse.SUPPRESS,
+        help=(
+            "With --oneshot and exactly one text query: disable all durable "
+            "session, memory, usage, log, and hook transcript effects."
         ),
     )
     chat_parser.add_argument(
