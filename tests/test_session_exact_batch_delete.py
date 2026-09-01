@@ -177,24 +177,37 @@ def test_exact_batch_refuses_delegate_added_after_expected_snapshot(db, exact_de
     _assert_sessions_present(db._conn, (*roots, "late-delegate"))
 
 
-def test_exact_batch_refuses_delegate_removed_after_expected_snapshot(db, exact_delete):
+def test_exact_batch_refuses_delegate_root_removed_after_expected_snapshot(
+    db, exact_delete
+):
     roots = _create_exact_pair(db)
-    db.create_session(
-        "removed-delegate",
-        "cli",
-        parent_session_id="root-a",
-        model_config={"_delegate_from": "root-a"},
-    )
     expected = {
-        "root-a": ("root-a", "removed-delegate"),
+        "root-a": ("root-a",),
         "root-b": ("root-b",),
     }
-    db._conn.execute("DELETE FROM sessions WHERE id = ?", ("removed-delegate",))
+    assert db.get_session_delete_targets("root-a") == ["root-a"]
+    assert db.get_session_delete_targets("root-b") == ["root-b"]
+
+    db._conn.execute(
+        "UPDATE sessions SET parent_session_id = ?, model_config = ? WHERE id = ?",
+        ("root-a", '{"_delegate_from":"root-a"}', "root-b"),
+    )
+    db._conn.execute("DELETE FROM messages WHERE session_id = ?", ("root-b",))
+    db._conn.execute("DELETE FROM sessions WHERE id = ?", ("root-b",))
     db._conn.commit()
 
-    _call_rejected(exact_delete, db._conn, roots, expected)
-
-    _assert_sessions_present(db._conn, roots)
+    db._conn.execute("BEGIN EXCLUSIVE")
+    with pytest.raises(ValueError, match=f"^{_REFUSAL}$"):
+        exact_delete(db._conn, roots, expected)
+    assert db._conn.in_transaction is True
+    _assert_sessions_present(db._conn, ("root-a",))
+    assert (
+        db._conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?", ("root-a",)
+        ).fetchone()[0]
+        == 1
+    )
+    db._conn.rollback()
 
 
 def test_exact_batch_refuses_branch_child(db, exact_delete):
