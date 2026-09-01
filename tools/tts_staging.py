@@ -232,13 +232,39 @@ def _validate_request(output_format: str, maximum_bytes: int) -> None:
         raise AnonymousAudioStageError(_STAGE_ERROR)
 
 
-def _require_host_capabilities(platform: str) -> None:
+def _current_posix_identity() -> tuple[int, int] | None:
+    """Return the current numeric owner only when both POSIX APIs are usable."""
+
+    get_uid = getattr(os, "getuid", None)
+    get_gid = getattr(os, "getgid", None)
+    if not callable(get_uid) or not callable(get_gid):
+        return None
+    try:
+        uid = get_uid()
+        gid = get_gid()
+    except (OSError, TypeError, ValueError):
+        return None
+    if (
+        type(uid) is not int
+        or uid < 0
+        or type(gid) is not int
+        or gid < 0
+    ):
+        return None
+    return uid, gid
+
+
+def _require_host_capabilities(platform: str) -> tuple[int, int]:
     _descriptor_path_for_platform(0, platform)
     required_flags = ("O_DIRECTORY", "O_NOFOLLOW")
     if os.name != "posix" or any(not hasattr(os, name) for name in required_flags):
         raise AnonymousAudioStageUnsupported(_UNSUPPORTED_ERROR)
     if os.open not in os.supports_dir_fd or os.unlink not in os.supports_dir_fd:
         raise AnonymousAudioStageUnsupported(_UNSUPPORTED_ERROR)
+    identity = _current_posix_identity()
+    if identity is None:
+        raise AnonymousAudioStageUnsupported(_UNSUPPORTED_ERROR)
+    return identity
 
 
 def _valid_format_signature(
@@ -444,7 +470,7 @@ class AnonymousAudioStage:
         _sink_issuer,
     ) -> "AnonymousAudioStage":
         _validate_request(output_format, maximum_bytes)
-        _require_host_capabilities(platform)
+        owner_uid, owner_gid = _require_host_capabilities(platform)
 
         try:
             parent_path = (
@@ -470,7 +496,7 @@ class AnonymousAudioStage:
                 tempfile.mkdtemp(prefix="hermes-tts-", dir=parent_path)
             ).name
             root_fd = os.open(root_basename, parent_flags, dir_fd=parent_fd)
-            os.fchown(root_fd, os.getuid(), os.getgid())
+            os.fchown(root_fd, owner_uid, owner_gid)
             os.fchmod(root_fd, 0o700)
             root_stat = os.fstat(root_fd)
             named_root = os.stat(
@@ -484,7 +510,7 @@ class AnonymousAudioStage:
             audio_basename = f"audio-{secrets.token_hex(16)}"
             audio_flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW
             audio_fd = os.open(audio_basename, audio_flags, 0o600, dir_fd=root_fd)
-            os.fchown(audio_fd, os.getuid(), os.getgid())
+            os.fchown(audio_fd, owner_uid, owner_gid)
             os.fchmod(audio_fd, 0o600)
             file_stat = os.fstat(audio_fd)
             if not cls._valid_held_file(file_stat, require_unlinked=False):
@@ -530,22 +556,30 @@ class AnonymousAudioStage:
 
     @staticmethod
     def _valid_root_identity(held: os.stat_result, named: os.stat_result) -> bool:
+        identity = _current_posix_identity()
+        if identity is None:
+            return False
+        owner_uid, owner_gid = identity
         return (
             stat.S_ISDIR(held.st_mode)
             and stat.S_IMODE(held.st_mode) == 0o700
-            and held.st_uid == os.getuid()
-            and held.st_gid == os.getgid()
+            and held.st_uid == owner_uid
+            and held.st_gid == owner_gid
             and held.st_dev == named.st_dev
             and held.st_ino == named.st_ino
         )
 
     @staticmethod
     def _valid_held_file(held: os.stat_result, *, require_unlinked: bool) -> bool:
+        identity = _current_posix_identity()
+        if identity is None:
+            return False
+        owner_uid, owner_gid = identity
         return (
             stat.S_ISREG(held.st_mode)
             and stat.S_IMODE(held.st_mode) == 0o600
-            and held.st_uid == os.getuid()
-            and held.st_gid == os.getgid()
+            and held.st_uid == owner_uid
+            and held.st_gid == owner_gid
             and (held.st_nlink == 0 if require_unlinked else held.st_nlink == 1)
         )
 

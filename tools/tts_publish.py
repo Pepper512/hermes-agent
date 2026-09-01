@@ -29,6 +29,7 @@ from tools.tts_staging import (
     AnonymousAudioScrubError,
     AnonymousAudioStage,
     SealedAudio,
+    _current_posix_identity,
 )
 from tools.tts_transaction import DurablePublicationPermit
 
@@ -476,6 +477,10 @@ def _materialize_publication_temp(
     parent: _HeldParent,
     temp: _PublicationTemp,
 ) -> None:
+    identity = _current_posix_identity()
+    if identity is None:
+        raise TTSPublishError(_PUBLISH_ERROR)
+    owner_uid, owner_gid = identity
     flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
@@ -503,7 +508,7 @@ def _materialize_publication_temp(
         fd = temp.fd
         try:
             temp.stat = os.fstat(fd)
-            os.fchown(fd, os.getuid(), os.getgid())
+            os.fchown(fd, owner_uid, owner_gid)
             os.fchmod(fd, 0o600)
             held = os.fstat(fd)
             named = os.stat(name, dir_fd=parent.fd, follow_symlinks=False)
@@ -531,14 +536,18 @@ def _same_temp(
     *,
     require_size: int,
 ) -> bool:
+    identity = _current_posix_identity()
+    if identity is None:
+        return False
+    owner_uid, owner_gid = identity
     return (
         stat.S_ISREG(held.st_mode)
         and stat.S_ISREG(named.st_mode)
         and stat.S_IMODE(held.st_mode) == 0o600
         and stat.S_IMODE(named.st_mode) == 0o600
-        and held.st_uid == os.getuid()
+        and held.st_uid == owner_uid
         and named.st_uid == held.st_uid
-        and held.st_gid == os.getgid()
+        and held.st_gid == owner_gid
         and named.st_gid == held.st_gid
         and held.st_nlink == 1
         and named.st_nlink == 1

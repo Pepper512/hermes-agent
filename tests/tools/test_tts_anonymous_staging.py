@@ -204,6 +204,24 @@ def test_unsupported_platform_rejects_before_root_creation(tmp_path: Path):
     assert set(tmp_path.iterdir()) == before
 
 
+def test_missing_posix_identity_api_rejects_before_root_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    before = set(tmp_path.iterdir())
+    monkeypatch.setattr(os, "getuid", None)
+
+    with pytest.raises(AnonymousAudioStageUnsupported) as exc_info:
+        _create_anonymous_audio_stage_for_test(
+            output_format="mp3",
+            maximum_bytes=1024,
+            parent=tmp_path,
+            platform=sys.platform,
+        )
+
+    assert str(exc_info.value) == "tts_anonymous_stage_unsupported"
+    assert set(tmp_path.iterdir()) == before
+
+
 def test_production_temp_root_resolution_failure_is_fixed_and_path_free(
     monkeypatch: pytest.MonkeyPatch,
 ):

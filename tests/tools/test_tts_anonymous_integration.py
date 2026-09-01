@@ -14,6 +14,17 @@ from tools.tts_staging import _create_anonymous_audio_stage_for_test
 
 VALID_MP3 = b"ID3\x04\x00\x00\x00\x00\x00\x00private-audio"
 
+EPHEMERAL_AUDIO_MIME_TYPES = {
+    "mp3": "audio/mpeg",
+    "wav": "audio/wav",
+    "ogg": "audio/ogg",
+    "flac": "audio/flac",
+    "m4a": "audio/mp4",
+    "aac": "audio/aac",
+    "amr": "audio/amr",
+    "opus": "audio/ogg",
+}
+
 
 class RecordingAdapter:
     def __init__(self, seen: list[str]) -> None:
@@ -97,6 +108,185 @@ def test_public_ephemeral_multichunk_uses_one_path_free_transaction(
     assert len(seen) == 2
     assert all(path.startswith(("/dev/fd/", "/proc/self/fd/")) for path in seen)
     assert (tmp_path / "caller.mp3").exists() is False
+
+
+@pytest.mark.parametrize(
+    ("output_format", "mime_type"), EPHEMERAL_AUDIO_MIME_TYPES.items()
+)
+@pytest.mark.parametrize(
+    ("public", "chunks"),
+    [
+        (False, (b"one",)),
+        (False, (b"one", b"two")),
+        (True, (b"one",)),
+        (True, (b"one", b"two")),
+    ],
+)
+def test_ephemeral_result_labels_only_the_trusted_explicit_format(
+    output_format: str,
+    mime_type: str,
+    public: bool,
+    chunks: tuple[bytes, ...],
+) -> None:
+    from tools import tts_tool
+
+    raw = tts_tool._ephemeral_tts_result(
+        chunks,
+        "edge",
+        output_format,
+        public=public,
+    )
+    result = json.loads(raw)
+    expected_parts = [
+        f"data:{mime_type};base64," + base64.b64encode(chunk).decode("ascii")
+        for chunk in chunks
+    ]
+
+    assert result["audio"] == expected_parts[0]
+    if public:
+        assert result["audio_parts"] == expected_parts
+        assert set(result) == {
+            "success",
+            "audio",
+            "provider",
+            "voice_compatible",
+            "audio_parts",
+            "chunk_count",
+            "delivery_file_count",
+            "combined_chunks",
+        }
+    else:
+        assert set(result) == {
+            "success", "audio", "provider", "voice_compatible"
+        }
+    assert "file_path" not in result
+    assert "MEDIA:" not in raw
+    assert "/dev/fd/" not in raw
+    assert "/proc/self/fd/" not in raw
+
+
+@pytest.mark.parametrize("output_format", [None, "webm"])
+@pytest.mark.parametrize("public", [False, True])
+def test_ephemeral_result_rejects_missing_or_unknown_format(
+    output_format: object, public: bool
+) -> None:
+    from tools import tts_tool
+
+    with pytest.raises(ValueError, match="^tts_generation_failed$"):
+        tts_tool._ephemeral_tts_result(
+            (b"private-audio",),
+            "edge",
+            output_format,
+            public=public,
+        )
+
+
+@pytest.mark.parametrize(
+    ("output_format", "mime_type"), EPHEMERAL_AUDIO_MIME_TYPES.items()
+)
+@pytest.mark.parametrize(
+    ("entry", "delivery_chunks", "expected_cap"),
+    [
+        ("single", (b"one",), 25 * 1024 * 1024),
+        ("public", (b"one", b"two"), 10 * 1024 * 1024),
+    ],
+)
+def test_ephemeral_entry_binds_result_to_transaction_output_format(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    output_format: str,
+    mime_type: str,
+    entry: str,
+    delivery_chunks: tuple[bytes, ...],
+    expected_cap: int,
+) -> None:
+    from tools import tts_tool, tts_transaction
+
+    class Delivery:
+        def __init__(self, chunks: tuple[bytes, ...]) -> None:
+            self.chunks = chunks
+
+    observed: dict[str, object] = {}
+
+    def generate(_chunks, **kwargs):
+        observed.update(kwargs)
+        return Delivery(delivery_chunks), output_format
+
+    monkeypatch.setattr(tts_transaction, "EphemeralDelivery", Delivery)
+    monkeypatch.setattr(tts_tool, "_generate_anonymous_tts", generate)
+    monkeypatch.setattr(
+        tts_tool,
+        "_load_tts_config",
+        lambda: {"provider": "edge", "output_format": output_format},
+    )
+    monkeypatch.setattr(
+        tts_tool,
+        "_split_text_for_tts",
+        lambda *_args: ["one", "two"],
+    )
+    caller_path = tmp_path / "caller.webm"
+
+    with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
+        if entry == "single":
+            raw = tts_tool._text_to_speech_single(
+                "private speech", str(caller_path), provider="edge"
+            )
+        else:
+            raw = tts_tool.text_to_speech_tool(
+                "private speech", str(caller_path), provider="edge"
+            )
+
+    result = json.loads(raw)
+    expected_prefix = f"data:{mime_type};base64,"
+    assert result["success"] is True, result
+    assert result["audio"].startswith(expected_prefix)
+    if entry == "public":
+        assert len(result["audio_parts"]) == 2
+        assert all(part.startswith(expected_prefix) for part in result["audio_parts"])
+    assert observed["output_format"] == output_format
+    assert observed["aggregate_cap"] == expected_cap
+    assert str(caller_path) not in raw
+    assert "file_path" not in result
+    assert "MEDIA:" not in raw
+    assert caller_path.exists() is False
+
+
+@pytest.mark.parametrize("output_format", [None, "webm"])
+@pytest.mark.parametrize("entry", ["single", "public"])
+def test_ephemeral_entry_stops_on_missing_or_unknown_transaction_format(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    output_format: object,
+    entry: str,
+) -> None:
+    from tools import tts_tool, tts_transaction
+
+    class Delivery:
+        chunks = (b"private-audio",)
+
+    monkeypatch.setattr(tts_transaction, "EphemeralDelivery", Delivery)
+    monkeypatch.setattr(
+        tts_tool,
+        "_generate_anonymous_tts",
+        lambda *_args, **_kwargs: (Delivery(), output_format),
+    )
+    monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: {"provider": "edge"})
+    caller_path = tmp_path / "caller.mp3"
+
+    with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
+        raw = (
+            tts_tool._text_to_speech_single(
+                "private speech", str(caller_path), provider="edge"
+            )
+            if entry == "single"
+            else tts_tool.text_to_speech_tool(
+                "private speech", str(caller_path), provider="edge"
+            )
+        )
+
+    assert json.loads(raw) == {"success": False, "error": "TTS generation failed"}
+    assert str(caller_path) not in raw
+    assert caller_path.exists() is False
 
 
 @pytest.mark.parametrize("provider", ["neutts", "piper", "kittentts"])

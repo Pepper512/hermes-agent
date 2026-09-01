@@ -1199,7 +1199,7 @@ def _render_command_tts_sink_template(
 
 def _posix_process_group_exists(pgid: int) -> bool:
     try:
-        os.killpg(pgid, 0)
+        os.killpg(pgid, 0)  # windows-footgun: ok - all callers require os.name == "posix"
     except ProcessLookupError:
         return False
     except PermissionError:
@@ -1239,7 +1239,7 @@ def _stop_command_tts_process_group(
     if owned_pgid is None:
         raise RuntimeError(_COMMAND_SINK_LIFECYCLE_ERROR)
     try:
-        os.killpg(owned_pgid, signal.SIGTERM)
+        os.killpg(owned_pgid, signal.SIGTERM)  # windows-footgun: ok - Windows returned above
     except (ProcessLookupError, PermissionError):
         pass
     try:
@@ -1251,7 +1251,7 @@ def _stop_command_tts_process_group(
         time.sleep(0.01)
     if _posix_process_group_exists(owned_pgid):
         try:
-            os.killpg(owned_pgid, signal.SIGKILL)
+            os.killpg(owned_pgid, signal.SIGKILL)  # windows-footgun: ok - Windows returned above
         except (ProcessLookupError, PermissionError):
             pass
         deadline = time.monotonic() + 0.1
@@ -1294,9 +1294,9 @@ def _fallback_stop_command_tts_process_group(
 
     if os.name == "posix" and owned_pgid is not None:
         try:
-            for sig in (signal.SIGTERM, signal.SIGKILL):
+            for sig in (signal.SIGTERM, signal.SIGKILL):  # windows-footgun: ok - guarded by os.name == "posix"
                 try:
-                    os.killpg(owned_pgid, sig)
+                    os.killpg(owned_pgid, sig)  # windows-footgun: ok - guarded by os.name == "posix"
                 except ProcessLookupError:
                     break
                 except BaseException:
@@ -1578,15 +1578,15 @@ def _emergency_cleanup_spawned_command_tts_process(proc: subprocess.Popen) -> No
         and (not cleanup_succeeded or liveness_uncertain)
     ):
         if owned_pgid is not None:
-            for sig in (signal.SIGTERM, signal.SIGKILL):
+            for sig in (signal.SIGTERM, signal.SIGKILL):  # windows-footgun: ok - guarded by os.name == "posix"
                 try:
-                    os.killpg(owned_pgid, sig)
+                    os.killpg(owned_pgid, sig)  # windows-footgun: ok - guarded by os.name == "posix"
                 except (ProcessLookupError, PermissionError):
                     pass
                 except BaseException:
                     pass
         try:
-            os.kill(candidate_pid, signal.SIGKILL)
+            os.kill(candidate_pid, signal.SIGKILL)  # windows-footgun: ok - guarded by os.name == "posix"
         except (ProcessLookupError, PermissionError):
             pass
         except BaseException:
@@ -4002,6 +4002,16 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
 # ===========================================================================
 
 _EPHEMERAL_TTS_MAX_BYTES = 25 * 1024 * 1024
+_EPHEMERAL_AUDIO_MIME_TYPES = (
+    ("mp3", "audio/mpeg"),
+    ("wav", "audio/wav"),
+    ("ogg", "audio/ogg"),
+    ("flac", "audio/flac"),
+    ("m4a", "audio/mp4"),
+    ("aac", "audio/aac"),
+    ("amr", "audio/amr"),
+    ("opus", "audio/ogg"),
+)
 
 
 def _anonymous_adapter_for_provider(
@@ -4249,11 +4259,26 @@ def _generate_anonymous_tts(
         return decision, output_format
 
 
+def _ephemeral_audio_mime_type(output_format: object) -> str:
+    """Map one trusted sealed format to its closed canonical media type."""
+    if type(output_format) is not str:
+        raise ValueError("tts_generation_failed")
+    for candidate, mime_type in _EPHEMERAL_AUDIO_MIME_TYPES:
+        if output_format == candidate:
+            return mime_type
+    raise ValueError("tts_generation_failed")
+
+
 def _ephemeral_tts_result(
-    chunks: tuple[bytes, ...], provider: str, *, public: bool
+    chunks: tuple[bytes, ...],
+    provider: str,
+    output_format: object,
+    *,
+    public: bool,
 ) -> str:
+    mime_type = _ephemeral_audio_mime_type(output_format)
     audio_parts = [
-        "data:audio/mpeg;base64," + base64.b64encode(chunk).decode("ascii")
+        f"data:{mime_type};base64," + base64.b64encode(chunk).decode("ascii")
         for chunk in chunks
     ]
     payload: Dict[str, Any] = {
@@ -4315,7 +4340,12 @@ def _text_to_speech_single(
         from tools.tts_transaction import EphemeralDelivery
 
         if type(decision) is EphemeralDelivery:
-            return _ephemeral_tts_result(decision.chunks, selected, public=False)
+            return _ephemeral_tts_result(
+                decision.chunks,
+                selected,
+                output_format,
+                public=False,
+            )
 
         file_str = str(decision.path)
         return json.dumps({
@@ -4411,7 +4441,12 @@ def text_to_speech_tool(
         from tools.tts_transaction import EphemeralDelivery
 
         if type(decision) is EphemeralDelivery:
-            return _ephemeral_tts_result(decision.chunks, selected, public=True)
+            return _ephemeral_tts_result(
+                decision.chunks,
+                selected,
+                output_format,
+                public=True,
+            )
 
         if base_path is None:
             raise ValueError("tts_generation_failed")
