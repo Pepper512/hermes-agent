@@ -13,6 +13,8 @@ import json
 from pathlib import Path
 import re
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 AUDIT_PATH = (
@@ -62,16 +64,16 @@ CRITICAL_BOUNDARY_CONTRACTS = {
         "profile_domains": ["caller_connection_profile"],
         "lease_span": "caller_owned_execute_write_or_exact_cleanup_transaction_through_root_delegate_prompt_deletion",
         "permitted_callers": [
-            "SessionDB.delete_session._do",
-            "_delete_session_roots_exact_on",
+            "hermes_state.py::SessionDB.delete_session._do",
+            "hermes_state.py::_delete_session_roots_exact_on",
         ],
     },
     "hermes_state.py::_delete_unreferenced_system_prompts_on": {
         "profile_domains": ["caller_connection_profile"],
         "lease_span": "caller_owned_canonical_deletion_transaction_through_prompt_cleanup",
         "permitted_callers": [
-            "SessionDB._delete_unreferenced_system_prompts",
-            "_delete_session_root_on",
+            "hermes_state.py::SessionDB._delete_unreferenced_system_prompts",
+            "hermes_state.py::_delete_session_root_on",
         ],
     },
     "hermes_state.py::SessionDB.purge_stale_tool_call_markers": {
@@ -220,12 +222,12 @@ OPTIMIZER_OWNED_MULTIPHASE_LEAVES = {
 
 CANONICAL_DELETION_LEAF_CALLERS = {
     "_delete_session_root_on": {
-        "SessionDB.delete_session._do",
-        "_delete_session_roots_exact_on",
+        ("hermes_state.py", "SessionDB.delete_session._do"),
+        ("hermes_state.py", "_delete_session_roots_exact_on"),
     },
     "_delete_unreferenced_system_prompts_on": {
-        "SessionDB._delete_unreferenced_system_prompts",
-        "_delete_session_root_on",
+        ("hermes_state.py", "SessionDB._delete_unreferenced_system_prompts"),
+        ("hermes_state.py", "_delete_session_root_on"),
     },
 }
 
@@ -478,8 +480,8 @@ def _coordinator_for(
     return None
 
 
-def _discover_profile_mutation_boundaries(root: Path) -> set[str]:
-    sources = [
+def _audited_python_sources(root: Path) -> list[Path]:
+    return [
         root / "hermes_state.py",
         root / "hermes_state_schema.py",
         *sorted(root.glob("hermes_state_search*.py")),
@@ -489,6 +491,18 @@ def _discover_profile_mutation_boundaries(root: Path) -> set[str]:
         *sorted((root / "gateway").rglob("*.py")),
         *sorted((root / "tui_gateway").rglob("*.py")),
     ]
+
+
+def _audited_source_texts(root: Path) -> list[tuple[str, str]]:
+    return [
+        (path.relative_to(root).as_posix(), path.read_text(encoding="utf-8"))
+        for path in _audited_python_sources(root)
+        if path.exists()
+    ]
+
+
+def _discover_profile_mutation_boundaries(root: Path) -> set[str]:
+    sources = _audited_python_sources(root)
     discovered: set[str] = set()
     for path in sources:
         if not path.exists():
@@ -543,6 +557,130 @@ def _owned_leaf_callers(source: str, leaf_names: set[str]) -> set[tuple[str, str
 
 def _optimizer_owned_leaf_callers(source: str) -> set[tuple[str, str]]:
     return _owned_leaf_callers(source, OPTIMIZER_OWNED_MULTIPHASE_LEAVES)
+
+
+def _nearest_import_scope(
+    node: ast.AST,
+    parents: dict[ast.AST, ast.AST],
+    module: ast.Module,
+) -> ast.AST:
+    cursor: ast.AST | None = parents.get(node)
+    while cursor is not None:
+        if isinstance(
+            cursor, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            return cursor
+        cursor = parents.get(cursor)
+    return module
+
+
+def _visible_import_scopes(
+    node: ast.AST,
+    parents: dict[ast.AST, ast.AST],
+    module: ast.Module,
+) -> list[ast.AST]:
+    scopes: list[ast.AST] = []
+    cursor: ast.AST | None = parents.get(node)
+    has_function_scope = False
+    while cursor is not None:
+        if isinstance(cursor, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            scopes.append(cursor)
+            has_function_scope = True
+        elif isinstance(cursor, ast.ClassDef) and not has_function_scope:
+            scopes.append(cursor)
+        elif isinstance(cursor, ast.Module):
+            scopes.append(cursor)
+            break
+        cursor = parents.get(cursor)
+    if not scopes:
+        scopes.append(module)
+    return scopes
+
+
+def _canonical_deletion_leaf_callers(
+    sources: list[tuple[str, str]],
+) -> set[tuple[str, str, str]]:
+    leaf_names = set(CANONICAL_DELETION_LEAF_CALLERS)
+    callers: set[tuple[str, str, str]] = set()
+    for relative, source in sources:
+        if not any(leaf_name in source for leaf_name in leaf_names):
+            continue
+        tree = ast.parse(source, filename=relative)
+        parents: dict[ast.AST, ast.AST] = {}
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                parents[child] = node
+
+        imported_leaves: dict[ast.AST, dict[str, str]] = {}
+        imported_modules: dict[ast.AST, set[str]] = {}
+        for node in ast.walk(tree):
+            scope = _nearest_import_scope(node, parents, tree)
+            if isinstance(node, ast.ImportFrom) and node.module == "hermes_state":
+                for alias in node.names:
+                    if alias.name in leaf_names:
+                        imported_leaves.setdefault(scope, {})[
+                            alias.asname or alias.name
+                        ] = alias.name
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "hermes_state":
+                        imported_modules.setdefault(scope, set()).add(
+                            alias.asname or alias.name
+                        )
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            scopes = _visible_import_scopes(node, parents, tree)
+            leaf: str | None = None
+            if (
+                relative == "hermes_state.py"
+                and isinstance(node.func, ast.Name)
+                and node.func.id in leaf_names
+            ):
+                leaf = node.func.id
+            elif isinstance(node.func, ast.Name):
+                for scope in scopes:
+                    leaf = imported_leaves.get(scope, {}).get(node.func.id)
+                    if leaf is not None:
+                        break
+            elif (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in leaf_names
+                and isinstance(node.func.value, ast.Name)
+            ):
+                for scope in scopes:
+                    if node.func.value.id in imported_modules.get(scope, set()):
+                        leaf = node.func.attr
+                        break
+            if leaf is None:
+                continue
+
+            cursor: ast.AST | None = parents.get(node)
+            while cursor is not None and not isinstance(
+                cursor, (ast.FunctionDef, ast.AsyncFunctionDef)
+            ):
+                cursor = parents.get(cursor)
+            caller = (
+                _qualified_name(cursor, parents) if cursor is not None else "<module>"
+            )
+            callers.add((leaf, relative, caller))
+    return callers
+
+
+def _assert_canonical_deletion_leaf_callers(
+    sources: list[tuple[str, str]],
+) -> None:
+    expected = {
+        (leaf, relative, caller)
+        for leaf, permitted_callers in CANONICAL_DELETION_LEAF_CALLERS.items()
+        for relative, caller in permitted_callers
+    }
+    actual = _canonical_deletion_leaf_callers(sources)
+    assert actual == expected, (
+        "canonical_deletion_leaf_callers_changed: "
+        f"unexpected={sorted(actual - expected)!r}, missing={sorted(expected - actual)!r}"
+    )
 
 
 def test_static_gate_rejects_unleased_profile_writer() -> None:
@@ -644,29 +782,46 @@ def test_canonical_deletion_leaves_and_exact_callers_are_frozen() -> None:
     }
     assert required <= AUDITED_DIRECT_BOUNDARIES
 
-    callers = _owned_leaf_callers(
-        (REPO_ROOT / "hermes_state.py").read_text(encoding="utf-8"),
-        set(CANONICAL_DELETION_LEAF_CALLERS),
-    )
-    assert callers == {
-        (leaf, caller)
-        for leaf, permitted_callers in CANONICAL_DELETION_LEAF_CALLERS.items()
-        for caller in permitted_callers
-    }
+    _assert_canonical_deletion_leaf_callers(_audited_source_texts(REPO_ROOT))
 
+
+def test_imported_outside_module_deletion_leaf_caller_fails_gate() -> None:
     synthetic_outside_calls = """
+from hermes_state import _delete_session_root_on as remove_root
+import hermes_state as state
+
 def new_root_delete(connection):
-    _delete_session_root_on(connection, "root")
+    remove_root(connection, "root")
 
 def new_prompt_cleanup(connection):
-    _delete_unreferenced_system_prompts_on(connection)
+    state._delete_unreferenced_system_prompts_on(connection)
+
+def unrelated_terminal_name(service, connection):
+    service._delete_session_root_on(connection, "unrelated")
 """
-    assert _owned_leaf_callers(
-        synthetic_outside_calls, set(CANONICAL_DELETION_LEAF_CALLERS)
-    ) == {
-        ("_delete_session_root_on", "new_root_delete"),
-        ("_delete_unreferenced_system_prompts_on", "new_prompt_cleanup"),
+    injected = [("gateway/injected_delete.py", synthetic_outside_calls)]
+    assert _canonical_deletion_leaf_callers(injected) == {
+        (
+            "_delete_session_root_on",
+            "gateway/injected_delete.py",
+            "new_root_delete",
+        ),
+        (
+            "_delete_unreferenced_system_prompts_on",
+            "gateway/injected_delete.py",
+            "new_prompt_cleanup",
+        ),
     }
+    with pytest.raises(
+        AssertionError, match="^canonical_deletion_leaf_callers_changed:"
+    ):
+        _assert_canonical_deletion_leaf_callers([
+            (
+                "hermes_state.py",
+                (REPO_ROOT / "hermes_state.py").read_text(encoding="utf-8"),
+            ),
+            *injected,
+        ])
 
 
 def test_audit_artifact_freezes_every_boundary() -> None:
