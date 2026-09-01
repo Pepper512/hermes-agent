@@ -16,14 +16,14 @@ jobs:
       - name: Checkout the reviewed source revision
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: fa1aaebee42fc1501440bd68742d75f3c0bc22ae
+          ref: 79ef4f81798b53a6137cba73e46bf366dc42b7df
 
       - name: Verify host and reviewed revision
         shell: bash
         run: |
           set -euo pipefail
           test "$(uname -s)" = Linux
-          test "$(git rev-parse HEAD)" = fa1aaebee42fc1501440bd68742d75f3c0bc22ae
+          test "$(git rev-parse HEAD)" = 79ef4f81798b53a6137cba73e46bf366dc42b7df
 
       - name: Install uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
