@@ -167,6 +167,28 @@ def _close_owned_descriptor(owner: _OwnedDescriptor) -> None:
                 owner.close_active = False
 
 
+def _owned_descriptor_for_destructive_cleanup(
+    owner: _OwnedDescriptor,
+) -> int | None:
+    """Return the exact held fd only while its custody proof remains valid."""
+
+    with owner.lock:
+        if owner.close_active or owner.state in ("empty", "released"):
+            return None
+        if owner.state == "open":
+            if owner.stat is None:
+                owner.stat = os.fstat(owner.fd)
+            proof = (1 << 30) | secrets.randbits(30)
+            os.lseek(owner.fd, proof, os.SEEK_SET)
+            owner.close_proof = proof
+            owner.state = "attempted"
+        if not _same_owned_open_description(owner):
+            owner.state = "released"
+            owner.fd = -1
+            return None
+        return owner.fd
+
+
 def _create_provider_audio_sink_boundary():
     """Create the stage-only sink issuer and read-only validation boundary."""
 
@@ -500,6 +522,7 @@ class AnonymousAudioStage:
     __slots__ = (
         "_audio_owner",
         "_authority",
+        "_cleanup_active",
         "_cleanup_lock",
         "_closed",
         "_fd",
@@ -534,6 +557,7 @@ class AnonymousAudioStage:
             raise AnonymousAudioStageError(_STAGE_ERROR)
         self._audio_owner = audio_owner
         self._authority = object()
+        self._cleanup_active = False
         self._cleanup_lock = threading.RLock()
         self._closed = False
         self._fd = audio_owner.fd
@@ -879,49 +903,66 @@ class AnonymousAudioStage:
 
     def scrub_and_close(self) -> None:
         with self._cleanup_lock:
-            failed = False
-            first_stop: BaseException | None = None
-            if self._audio_owner.state not in ("empty", "released"):
-                try:
-                    os.ftruncate(self._audio_owner.fd, 0)
-                except OSError:
-                    failed = True
-                except BaseException as exc:
-                    first_stop = exc
-                try:
-                    os.fsync(self._audio_owner.fd)
-                except OSError:
-                    failed = True
-                except BaseException as exc:
-                    if first_stop is None:
-                        first_stop = exc
-                try:
-                    _close_owned_descriptor(self._audio_owner)
-                except OSError:
-                    failed = True
-                except BaseException as exc:
-                    if first_stop is None:
-                        first_stop = exc
+            if self._cleanup_active:
+                return
+            self._cleanup_active = True
+            try:
+                self._scrub_and_close_owned_descriptors()
+            finally:
+                self._cleanup_active = False
 
-            self._sync_descriptor_fields()
+    def _scrub_and_close_owned_descriptors(self) -> None:
+        failed = False
+        first_stop: BaseException | None = None
+        if self._audio_owner.state not in ("empty", "released"):
             try:
-                self._teardown_exact_empty_root()
+                audio_fd = _owned_descriptor_for_destructive_cleanup(
+                    self._audio_owner
+                )
+                if audio_fd is not None:
+                    os.ftruncate(audio_fd, 0)
+            except OSError:
+                failed = True
             except BaseException as exc:
-                if first_stop is None:
-                    first_stop = exc
+                first_stop = exc
             try:
-                self._close_root_descriptors()
-            except AnonymousAudioScrubError:
+                audio_fd = _owned_descriptor_for_destructive_cleanup(
+                    self._audio_owner
+                )
+                if audio_fd is not None:
+                    os.fsync(audio_fd)
+            except OSError:
                 failed = True
             except BaseException as exc:
                 if first_stop is None:
                     first_stop = exc
-            self._sync_descriptor_fields()
+            try:
+                _close_owned_descriptor(self._audio_owner)
+            except OSError:
+                failed = True
+            except BaseException as exc:
+                if first_stop is None:
+                    first_stop = exc
 
-            if failed:
-                raise AnonymousAudioScrubError(_SCRUB_ERROR)
-            if first_stop is not None:
-                raise first_stop
+        self._sync_descriptor_fields()
+        try:
+            self._teardown_exact_empty_root()
+        except BaseException as exc:
+            if first_stop is None:
+                first_stop = exc
+        try:
+            self._close_root_descriptors()
+        except AnonymousAudioScrubError:
+            failed = True
+        except BaseException as exc:
+            if first_stop is None:
+                first_stop = exc
+        self._sync_descriptor_fields()
+
+        if failed:
+            raise AnonymousAudioScrubError(_SCRUB_ERROR)
+        if first_stop is not None:
+            raise first_stop
 
     def _sync_descriptor_fields(self) -> None:
         self._fd = self._audio_owner.fd

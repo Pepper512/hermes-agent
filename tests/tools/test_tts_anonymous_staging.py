@@ -915,6 +915,185 @@ class _StageSignalCancellation(BaseException):
     pass
 
 
+@pytest.mark.parametrize("same_inode", [False, True], ids=["different-inode", "same-inode"])
+def test_audio_scrub_retry_proves_attempted_custody_before_destructive_io(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    same_inode: bool,
+):
+    """Retry must not truncate an fd reused after close released custody."""
+
+    stage = _test_stage("mp3", 1024, tmp_path)
+    _write_valid(stage)
+    target_fd = stage._fd
+    real_close = os.close
+    replacement_path = tmp_path / "reused-audio-fd"
+    replacement_path.write_bytes(b"unrelated")
+    if same_inode:
+        real_close(target_fd)
+        target_fd = os.open(replacement_path, os.O_RDWR)
+        assert target_fd == stage._fd
+        stage._audio_owner.fd = target_fd
+        stage._audio_owner.stat = os.fstat(target_fd)
+        stage._audio_owner.state = "open"
+    reopened_fd: int | None = None
+    injected = False
+
+    def close_reopen_then_raise(fd: int) -> None:
+        nonlocal injected, reopened_fd
+        real_close(fd)
+        if fd == target_fd and not injected:
+            injected = True
+            reopened_fd = os.open(replacement_path, os.O_RDWR)
+            assert reopened_fd == target_fd
+            os.ftruncate(reopened_fd, 0)
+            os.write(reopened_fd, b"unrelated")
+            os.lseek(reopened_fd, 0, os.SEEK_SET)
+            raise _StageSignalCancellation()
+
+    monkeypatch.setattr(os, "close", close_reopen_then_raise)
+    try:
+        with pytest.raises(_StageSignalCancellation):
+            stage.scrub_and_close()
+        monkeypatch.setattr(os, "close", real_close)
+        stage.scrub_and_close()
+        assert reopened_fd is not None
+        assert os.pread(reopened_fd, len(b"unrelated"), 0) == b"unrelated"
+    finally:
+        monkeypatch.setattr(os, "close", real_close)
+        try:
+            stage.scrub_and_close()
+        except BaseException:
+            pass
+        if reopened_fd is not None:
+            try:
+                real_close(reopened_fd)
+            except OSError:
+                pass
+
+
+def test_reentrant_signal_scrub_cannot_take_attempted_audio_custody(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A restored signal handler cannot scrub an fd reused after close."""
+
+    if not hasattr(signal, "pthread_sigmask"):
+        pytest.skip("pthread_sigmask unavailable")
+    delivered_signal = getattr(signal, "SIGUSR1", signal.SIGTERM)
+    stage = _test_stage("mp3", 1024, tmp_path)
+    _write_valid(stage)
+    target_fd = stage._fd
+    replacement_path = tmp_path / "reentrant-reused-audio-fd"
+    replacement_path.write_bytes(b"unrelated")
+    real_close = os.close
+    reopened_fd: int | None = None
+    injected = False
+    prior_handler = signal.getsignal(delivered_signal)
+    prior_mask = signal.pthread_sigmask(signal.SIG_UNBLOCK, {delivered_signal})
+
+    def reenter_scrub_then_raise(_signum, _frame):
+        stage.scrub_and_close()
+        raise _StageSignalCancellation()
+
+    def close_reopen_then_signal(fd: int) -> None:
+        nonlocal injected, reopened_fd
+        real_close(fd)
+        if fd == target_fd and not injected:
+            injected = True
+            reopened_fd = os.open(replacement_path, os.O_RDWR)
+            assert reopened_fd == target_fd
+            signal.pthread_kill(threading.get_ident(), delivered_signal)
+
+    signal.signal(delivered_signal, reenter_scrub_then_raise)
+    monkeypatch.setattr(os, "close", close_reopen_then_signal)
+    try:
+        with pytest.raises(_StageSignalCancellation):
+            stage.scrub_and_close()
+        monkeypatch.setattr(os, "close", real_close)
+        stage.scrub_and_close()
+        assert reopened_fd is not None
+        assert os.pread(reopened_fd, len(b"unrelated"), 0) == b"unrelated"
+    finally:
+        monkeypatch.setattr(os, "close", real_close)
+        try:
+            stage.scrub_and_close()
+        except BaseException:
+            pass
+        if reopened_fd is not None:
+            try:
+                real_close(reopened_fd)
+            except OSError:
+                pass
+        signal.signal(delivered_signal, signal.SIG_IGN)
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {delivered_signal})
+        signal.signal(delivered_signal, prior_handler)
+        signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+
+
+def test_signal_reentrant_during_truncate_cannot_transfer_cleanup_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A handler interrupting truncate cannot run the stage cleanup itself."""
+
+    if not hasattr(signal, "pthread_sigmask"):
+        pytest.skip("pthread_sigmask unavailable")
+    delivered_signal = getattr(signal, "SIGUSR1", signal.SIGTERM)
+    stage = _test_stage("mp3", 1024, tmp_path)
+    _write_valid(stage)
+    target_fd = stage._fd
+    real_ftruncate = os.ftruncate
+    real_close = os.close
+    prior_handler = signal.getsignal(delivered_signal)
+    prior_mask = signal.pthread_sigmask(signal.SIG_UNBLOCK, {delivered_signal})
+    injected = False
+    in_handler = False
+    handler_closed_audio = False
+
+    def reenter_scrub_then_raise(_signum, _frame):
+        nonlocal in_handler
+        in_handler = True
+        try:
+            stage.scrub_and_close()
+        finally:
+            in_handler = False
+        raise _StageSignalCancellation()
+
+    def truncate_then_signal(fd: int, length: int) -> None:
+        nonlocal injected
+        if fd == target_fd and not injected:
+            injected = True
+            signal.pthread_kill(threading.get_ident(), delivered_signal)
+        real_ftruncate(fd, length)
+
+    def record_close(fd: int) -> None:
+        nonlocal handler_closed_audio
+        if fd == target_fd and in_handler:
+            handler_closed_audio = True
+        real_close(fd)
+
+    signal.signal(delivered_signal, reenter_scrub_then_raise)
+    monkeypatch.setattr(os, "ftruncate", truncate_then_signal)
+    monkeypatch.setattr(os, "close", record_close)
+    try:
+        with pytest.raises(_StageSignalCancellation):
+            stage.scrub_and_close()
+        assert not handler_closed_audio
+        assert stage._fd == -1
+    finally:
+        monkeypatch.setattr(os, "ftruncate", real_ftruncate)
+        monkeypatch.setattr(os, "close", real_close)
+        try:
+            stage.scrub_and_close()
+        except BaseException:
+            pass
+        signal.signal(delivered_signal, signal.SIG_IGN)
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {delivered_signal})
+        signal.signal(delivered_signal, prior_handler)
+        signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+
+
 @pytest.mark.parametrize("owner_name", ["audio", "root", "parent"])
 @pytest.mark.parametrize(
     "delivered_signal",
