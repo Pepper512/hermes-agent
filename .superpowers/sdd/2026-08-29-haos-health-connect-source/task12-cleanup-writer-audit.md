@@ -1,7 +1,9 @@
 # Task 12 Hermes profile-state mutation-boundary audit
 
-**Source frozen:** `ef05af5c7824a875693bc13e472195323d40e257`
+**Source frozen:** Task 1 at `ef05af5c7824a875693bc13e472195323d40e257`;
+Task 4 canonical deletion leaves at `fa1aaebee42fc1501440bd68742d75f3c0bc22ae`
 **Scope:** Task 1 of the approved exact-cleanup maintenance plan (`ace1017`)
+plus the approved Task 4 deletion-leaf audit correction
 **Result:** inventory only; no production, live profile, service, database, or
 network mutation was performed.
 
@@ -55,6 +57,8 @@ writers/deleters below.
 | `hermes_state.py::quarantine_zeroed_state_db` | Fixed `state.db` path and adjacent quarantine name. | Shared span across zeroed-file revalidation, no-replace quarantine publication, directory durability, and error cleanup. |
 | `hermes_state.py::_run_repair_strategies` | Explicit `db_path`; profile is `db_path.parent`. | Caller-owned repair span across FTS rebuild, `REINDEX`, writable-schema repair, `VACUUM`, and closes. |
 | `hermes_state.py::_restore_journal_mode_after_repair` | Explicit `db_path`; profile is `db_path.parent`. | Caller-owned repair span across journal-mode restoration and validation. |
+| `hermes_state.py::_delete_session_root_on` | Profile authority belongs to the supplied connection's owning coordinator; the leaf cannot infer or acquire authority from a connection alone. | Caller-owned canonical deletion leaf. Only `SessionDB.delete_session._do` inside `_execute_write` and `_delete_session_roots_exact_on` inside the cleanup's already-open exclusive transaction may call it. The owning coordinator retains authority through delegate/root/message/FK-dependent deletion and prompt cleanup. Any additional caller is a review STOP. |
+| `hermes_state.py::_delete_unreferenced_system_prompts_on` | Same caller-owned profile authority as the supplied connection. | Caller-owned canonical deletion leaf. Only `_delete_session_root_on` and the legacy `SessionDB._delete_unreferenced_system_prompts` wrapper may call it. The enclosing deletion transaction retains authority through prompt cleanup. Any additional caller is a review STOP. |
 | `hermes_state.py::SessionDB._remove_session_files` | `sessions_dir` is supplied by the outer deletion API and must resolve to the same profile as `self.db_path.parent`. | Never lease independently. It must execute inside the outer delete/prune span and cover no-follow inventory/revalidation plus every JSON, legacy JSONL, and request-dump removal. |
 | `hermes_state.py::SessionDB.delete_session` | `self.db_path.parent`; optional `sessions_dir` must be proven same-profile. | One shared span across canonical delegate discovery, database transaction, commit, and all root/delegate sidecar removals. |
 | `hermes_state.py::SessionDB.delete_session_if_empty` | Same as `delete_session`. | One shared span across empty revalidation, transaction, commit, and sidecar removal. |
@@ -92,7 +96,10 @@ They must stay dynamically enclosed by either `SessionDB.__init__`,
   `_ensure_fts_cjk_schema`, `_drop_fts_triggers`, `_ensure_fts_schema`,
   `_check_transcript_write_guards`, `_insert_message_rows`, and
   `_record_model_usage`;
-- `_delete_delegate_children`;
+- `_delete_delegate_children`, `_delete_session_root_on`, and
+  `_delete_unreferenced_system_prompts_on`. The latter two are frozen as
+  caller-owned canonical deletion leaves with exact permitted caller sets in
+  the static gate and machine-readable contracts below;
 - every mutation helper in `hermes_state_schema.py`; and
 - every callback-scoped FTS mutation helper in `hermes_state_search.py` that
   is dynamically passed to `_execute_write`. The six direct/multi-phase
@@ -112,6 +119,9 @@ They must stay dynamically enclosed by either `SessionDB.__init__`,
 - SessionDB connection creation is centralized by `_connect_tracked_db` for
   ordinary state; `_connect_repair_durable` is limited to repair/probe paths.
   Read pools and statistics use URI `mode=ro` and are excluded.
+- Canonical root/prompt deletion leaves accept an already-open connection and
+  never acquire authority independently. The static guard freezes their exact
+  current callers so a new out-of-coordinator call is a review STOP.
 - Schema mutation is concentrated in `hermes_state_schema.py` during writable
   construction or an already-admitted write callback. FTS background mutation
   is mostly routed through `_execute_write`; the static guard now identifies
@@ -215,6 +225,22 @@ mentions elsewhere do not satisfy the contract gate.
   "hermes_cli/update_cmd.py::_restore_state_db_from_snapshot": {
     "profile_domains": ["proven_live_state_db_profile"],
     "lease_span": "before_holder_check_through_sidecar_unlink_copy2_integrity_verification"
+  },
+  "hermes_state.py::_delete_session_root_on": {
+    "profile_domains": ["caller_connection_profile"],
+    "lease_span": "caller_owned_execute_write_or_exact_cleanup_transaction_through_root_delegate_prompt_deletion",
+    "permitted_callers": [
+      "SessionDB.delete_session._do",
+      "_delete_session_roots_exact_on"
+    ]
+  },
+  "hermes_state.py::_delete_unreferenced_system_prompts_on": {
+    "profile_domains": ["caller_connection_profile"],
+    "lease_span": "caller_owned_canonical_deletion_transaction_through_prompt_cleanup",
+    "permitted_callers": [
+      "SessionDB._delete_unreferenced_system_prompts",
+      "_delete_session_root_on"
+    ]
   },
   "hermes_state.py::SessionDB.purge_stale_tool_call_markers": {
     "profile_domains": ["session_db_profile"],

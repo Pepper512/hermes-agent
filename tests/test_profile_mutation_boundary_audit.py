@@ -58,6 +58,22 @@ CRITICAL_BOUNDARY_CONTRACTS = {
         "profile_domains": ["proven_live_state_db_profile"],
         "lease_span": "before_holder_check_through_sidecar_unlink_copy2_integrity_verification",
     },
+    "hermes_state.py::_delete_session_root_on": {
+        "profile_domains": ["caller_connection_profile"],
+        "lease_span": "caller_owned_execute_write_or_exact_cleanup_transaction_through_root_delegate_prompt_deletion",
+        "permitted_callers": [
+            "SessionDB.delete_session._do",
+            "_delete_session_roots_exact_on",
+        ],
+    },
+    "hermes_state.py::_delete_unreferenced_system_prompts_on": {
+        "profile_domains": ["caller_connection_profile"],
+        "lease_span": "caller_owned_canonical_deletion_transaction_through_prompt_cleanup",
+        "permitted_callers": [
+            "SessionDB._delete_unreferenced_system_prompts",
+            "_delete_session_root_on",
+        ],
+    },
     "hermes_state.py::SessionDB.purge_stale_tool_call_markers": {
         "profile_domains": ["session_db_profile"],
         "lease_span": "before_affected_row_admission_through_vacuum_into_update_commit_and_result",
@@ -119,6 +135,8 @@ AUDITED_DIRECT_BOUNDARIES = {
     "hermes_state.py::_connect_repair_durable",
     "hermes_state.py::_connect_tracked_db",
     "hermes_state.py::_copy_database_snapshot",
+    "hermes_state.py::_delete_session_root_on",
+    "hermes_state.py::_delete_unreferenced_system_prompts_on",
     "hermes_state.py::_live_writer_holds_db",
     "hermes_state.py::_exclusive_repair_db_guard",
     "hermes_state.py::_prune_malformed_backups",
@@ -198,6 +216,17 @@ CANONICAL_FILE_WRITERS = {
 OPTIMIZER_OWNED_MULTIPHASE_LEAVES = {
     "_demote_legacy_fts_to_trash",
     "_fts_cjk_reset_if_stale",
+}
+
+CANONICAL_DELETION_LEAF_CALLERS = {
+    "_delete_session_root_on": {
+        "SessionDB.delete_session._do",
+        "_delete_session_roots_exact_on",
+    },
+    "_delete_unreferenced_system_prompts_on": {
+        "SessionDB._delete_unreferenced_system_prompts",
+        "_delete_session_root_on",
+    },
 }
 
 
@@ -491,7 +520,7 @@ def _discover_profile_mutation_boundaries(root: Path) -> set[str]:
     return discovered
 
 
-def _optimizer_owned_leaf_callers(source: str) -> set[tuple[str, str]]:
+def _owned_leaf_callers(source: str, leaf_names: set[str]) -> set[tuple[str, str]]:
     tree = ast.parse(source)
     parents: dict[ast.AST, ast.AST] = {}
     for node in ast.walk(tree):
@@ -500,9 +529,7 @@ def _optimizer_owned_leaf_callers(source: str) -> set[tuple[str, str]]:
 
     callers: set[tuple[str, str]] = set()
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or _call_name(node) not in (
-            OPTIMIZER_OWNED_MULTIPHASE_LEAVES
-        ):
+        if not isinstance(node, ast.Call) or _call_name(node) not in leaf_names:
             continue
         cursor: ast.AST | None = parents.get(node)
         while cursor is not None and not isinstance(
@@ -512,6 +539,10 @@ def _optimizer_owned_leaf_callers(source: str) -> set[tuple[str, str]]:
         caller = _qualified_name(cursor, parents) if cursor is not None else "<module>"
         callers.add((_call_name(node), caller))
     return callers
+
+
+def _optimizer_owned_leaf_callers(source: str) -> set[tuple[str, str]]:
+    return _owned_leaf_callers(source, OPTIMIZER_OWNED_MULTIPHASE_LEAVES)
 
 
 def test_static_gate_rejects_unleased_profile_writer() -> None:
@@ -603,6 +634,38 @@ class SessionSearchMixin:
 """
     assert _optimizer_owned_leaf_callers(synthetic_outside_call) == {
         ("_fts_cjk_reset_if_stale", "SessionSearchMixin.new_public_writer")
+    }
+
+
+def test_canonical_deletion_leaves_and_exact_callers_are_frozen() -> None:
+    required = {
+        "hermes_state.py::_delete_session_root_on",
+        "hermes_state.py::_delete_unreferenced_system_prompts_on",
+    }
+    assert required <= AUDITED_DIRECT_BOUNDARIES
+
+    callers = _owned_leaf_callers(
+        (REPO_ROOT / "hermes_state.py").read_text(encoding="utf-8"),
+        set(CANONICAL_DELETION_LEAF_CALLERS),
+    )
+    assert callers == {
+        (leaf, caller)
+        for leaf, permitted_callers in CANONICAL_DELETION_LEAF_CALLERS.items()
+        for caller in permitted_callers
+    }
+
+    synthetic_outside_calls = """
+def new_root_delete(connection):
+    _delete_session_root_on(connection, "root")
+
+def new_prompt_cleanup(connection):
+    _delete_unreferenced_system_prompts_on(connection)
+"""
+    assert _owned_leaf_callers(
+        synthetic_outside_calls, set(CANONICAL_DELETION_LEAF_CALLERS)
+    ) == {
+        ("_delete_session_root_on", "new_root_delete"),
+        ("_delete_unreferenced_system_prompts_on", "new_prompt_cleanup"),
     }
 
 
