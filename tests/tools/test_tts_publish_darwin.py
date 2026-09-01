@@ -43,7 +43,6 @@ def test_darwin_absent_uses_renameatx_np_required_flags(
 ):
     if sys.platform != "darwin":
         pytest.skip("Darwin runtime required")
-    destination = tmp_path / "voice.mp3"
     calls: list[tuple[int, bytes, int, bytes, int]] = []
     real = tts_publish._darwin_renameatx_np
 
@@ -52,7 +51,20 @@ def test_darwin_absent_uses_renameatx_np_required_flags(
         return real(src_fd, src, dst_fd, dst, flags)
 
     monkeypatch.setattr(tts_publish, "_darwin_renameatx_np", record)
-    _publish(tmp_path, destination)
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        source_fd = os.open(
+            "source",
+            os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        os.close(source_fd)
+        tts_publish._rename_absent_darwin(
+            parent_fd, "source", parent_fd, "voice.mp3"
+        )
+    finally:
+        os.close(parent_fd)
     assert len(calls) == 1
     assert calls[0][4] == (
         tts_publish.RENAME_EXCL
@@ -72,22 +84,44 @@ def test_darwin_missing_flag_fails_closed_before_materialization(
     assert not list(tmp_path.glob(".hermes-tts-publish-*"))
 
 
-def test_darwin_existing_uses_replace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_darwin_ctypes_conversion_hook_is_rejected_before_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    if sys.platform != "darwin":
+        pytest.skip("Darwin runtime required")
+    symbol = tts_publish._DARWIN_RENAMEATX_NP
+    assert symbol is not None
+
+    class PolicyHook:
+        @classmethod
+        def from_param(cls, value):
+            with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
+                pass
+            return value
+
+    monkeypatch.setattr(
+        symbol,
+        "argtypes",
+        [
+            PolicyHook,
+            tts_publish.ctypes.c_char_p,
+            tts_publish.ctypes.c_int,
+            tts_publish.ctypes.c_char_p,
+            tts_publish.ctypes.c_uint,
+        ],
+    )
+    destination = tmp_path / "voice.mp3"
+    with pytest.raises(TTSPublishError):
+        _publish(tmp_path, destination)
+    assert not destination.exists()
+
+
+def test_darwin_existing_uses_replace(tmp_path: Path):
     if sys.platform != "darwin":
         pytest.skip("Darwin runtime required")
     destination = tmp_path / "voice.mp3"
     destination.write_bytes(b"old")
-    used = False
-    real = os.replace
-
-    def record(*args, **kwargs):
-        nonlocal used
-        used = True
-        return real(*args, **kwargs)
-
-    monkeypatch.setattr(tts_publish.os, "replace", record)
     _publish(tmp_path, destination)
-    assert used is True
     assert destination.read_bytes() == VALID_MP3
 
 

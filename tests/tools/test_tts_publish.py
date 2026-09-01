@@ -61,8 +61,6 @@ def test_absent_destination_is_no_replace_and_parent_fsynced(
     real_copy = tts_publish._copy_sealed_to_publication
     real_file_fsync = tts_publish._fsync_publication_file
     real_parent_fsync = tts_publish._fsync_parent
-    real_final = tts_publish._final_policy_allows_publication
-    real_absent = tts_publish._rename_absent_for_host
 
     def record_copy(*args, **kwargs):
         events.append("copy")
@@ -76,54 +74,24 @@ def test_absent_destination_is_no_replace_and_parent_fsynced(
         events.append("parent-fsync")
         return real_parent_fsync(fd)
 
-    def record_final(observation):
-        events.append("final-policy")
-        return real_final(observation)
-
-    def record_absent(*args, **kwargs):
-        events.append("rename-noreplace")
-        return real_absent(*args, **kwargs)
-
     monkeypatch.setattr(tts_publish, "_copy_sealed_to_publication", record_copy)
     monkeypatch.setattr(tts_publish, "_fsync_publication_file", record_file_fsync)
     monkeypatch.setattr(tts_publish, "_fsync_parent", record_parent_fsync)
-    monkeypatch.setattr(tts_publish, "_final_policy_allows_publication", record_final)
-    monkeypatch.setattr(tts_publish, "_rename_absent_for_host", record_absent)
 
     published = _publish_one(tmp_path / "stage", destination)
 
     assert published.path == destination
     assert destination.read_bytes() == VALID_MP3
-    assert events == [
-        "copy",
-        "file-fsync",
-        "final-policy",
-        "rename-noreplace",
-        "parent-fsync",
-    ]
+    assert events == ["copy", "file-fsync", "parent-fsync"]
 
 
-def test_existing_destination_uses_authorized_atomic_replace(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    from tools import tts_publish
-
+def test_existing_destination_uses_authorized_atomic_replace(tmp_path: Path):
     destination = tmp_path / "voice.mp3"
     destination.write_bytes(b"old")
-    calls: list[tuple[object, ...]] = []
-    real_replace = os.replace
-
-    def record_replace(*args, **kwargs):
-        calls.append((*args, kwargs))
-        return real_replace(*args, **kwargs)
-
-    monkeypatch.setattr(tts_publish.os, "replace", record_replace)
     published = _publish_one(tmp_path / "stage", destination)
 
     assert published.path == destination
     assert destination.read_bytes() == VALID_MP3
-    assert len(calls) == 1
-    assert calls[0][-1]["src_dir_fd"] == calls[0][-1]["dst_dir_fd"]
 
 
 def test_permit_rejects_clone_before_destination_access(tmp_path: Path):
@@ -186,14 +154,15 @@ def test_final_latch_flip_before_publish_scrubs_and_does_not_publish(
     from tools import tts_publish
 
     destination = tmp_path / "voice.mp3"
-    real_final = tts_publish._final_policy_allows_publication
+    real_verify = tts_publish._verify_publication_digest
 
-    def flip_then_check(observation):
+    def verify_then_flip(*args, **kwargs):
+        result = real_verify(*args, **kwargs)
         with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
             pass
-        return real_final(observation)
+        return result
 
-    monkeypatch.setattr(tts_publish, "_final_policy_allows_publication", flip_then_check)
+    monkeypatch.setattr(tts_publish, "_verify_publication_digest", verify_then_flip)
     with pytest.raises(TTSPublishError, match="^tts_durable_publication_failed$"):
         _publish_one(tmp_path / "stage", destination)
     assert not destination.exists()
@@ -404,36 +373,423 @@ def test_publication_temp_uid_gid_drift_fails_closed(
     assert residue.stat().st_size == 0
 
 
-def test_final_policy_check_immediately_precedes_exactly_one_publish_call(
+def test_unmodified_final_interval_publishes_exactly_once(tmp_path: Path):
+    destination = tmp_path / "voice.mp3"
+    _publish_one(tmp_path / "stage", destination)
+    assert destination.read_bytes() == VALID_MP3
+
+
+def test_rebound_preparer_cannot_inject_callback_after_final_policy_check(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     from tools import tts_publish
 
-    events: list[str] = []
-    real_final = tts_publish._final_policy_allows_publication
-    real_publish = tts_publish._rename_absent_for_host
+    destination = tmp_path / "voice.mp3"
 
-    def final(observation):
-        events.append("final-policy")
-        result = real_final(observation)
-        events.append("final-return")
+    def fake_prepare(*, parent_fd, source, destination, **_kwargs):
+        def evil_publish(src, dst, *, src_dir_fd, dst_dir_fd):
+            with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
+                os.replace(
+                    src,
+                    dst,
+                    src_dir_fd=src_dir_fd,
+                    dst_dir_fd=dst_dir_fd,
+                )
+
+        return tts_publish._PreparedPublicationCall(
+            kind="replace",
+            callable_ref=evil_publish,
+            source=source,
+            destination=destination,
+            source_dir_fd=parent_fd,
+            destination_dir_fd=parent_fd,
+            flags=0,
+        )
+
+    monkeypatch.setattr(tts_publish, "_prepare_publication_call", fake_prepare)
+    with pytest.raises(TTSPublishError):
+        _publish_one(tmp_path / "stage", destination)
+    assert not destination.exists()
+
+
+def test_rebound_prepared_call_constructor_cannot_inject_final_callback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from tools import tts_publish
+
+    destination = tmp_path / "voice.mp3"
+
+    def fake_constructor(**values):
+        def evil_publish(src, dst, *, src_dir_fd, dst_dir_fd):
+            with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
+                os.replace(
+                    src,
+                    dst,
+                    src_dir_fd=src_dir_fd,
+                    dst_dir_fd=dst_dir_fd,
+                )
+
+        values["kind"] = "replace"
+        values["callable_ref"] = evil_publish
+        return type("InjectedCall", (), values)()
+
+    monkeypatch.setattr(tts_publish, "_PreparedPublicationCall", fake_constructor)
+    with pytest.raises(TTSPublishError):
+        _publish_one(tmp_path / "stage", destination)
+    assert not destination.exists()
+
+
+def test_rebound_digest_verifier_cannot_mutate_after_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from tools import tts_publish
+
+    destination = tmp_path / "voice.mp3"
+    real_verify = tts_publish._verify_publication_digest
+
+    def verify_then_mutate(temp, sealed):
+        real_verify(temp, sealed)
+        os.pwrite(temp.fd, b"X", len(VALID_MP3) - 1)
+
+    monkeypatch.setattr(tts_publish, "_verify_publication_digest", verify_then_mutate)
+    with pytest.raises(TTSPublishError):
+        _publish_one(tmp_path / "stage", destination)
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize(
+    "slot",
+    [
+        "os.fsencode",
+        "_rename_absent_for_host",
+        "_rename_absent_darwin",
+        "_darwin_renameatx_np",
+        "_DARWIN_RENAMEATX_NP",
+    ],
+)
+def test_darwin_mutable_post_check_slot_cannot_hide_durable_ephemeral_durable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    slot: str,
+):
+    from tools import tts_publish
+
+    if sys.platform != "darwin":
+        pytest.skip("Darwin runtime required")
+    destination = tmp_path / "voice.mp3"
+    if slot == "os.fsencode":
+        original = tts_publish.os.fsencode
+
+        def tripwire(*args, **kwargs):
+            with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
+                pass
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(tts_publish.os, "fsencode", tripwire)
+    else:
+        original = getattr(tts_publish, slot)
+
+        def tripwire(*args, **kwargs):
+            with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
+                pass
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(tts_publish, slot, tripwire)
+
+    with pytest.raises(TTSPublishError):
+        _publish_one(tmp_path / "stage", destination)
+    assert not destination.exists()
+    assert all(
+        path.stat().st_size == 0
+        for path in tmp_path.glob(".hermes-tts-publish-*")
+    )
+
+
+def test_existing_replace_mutable_slot_cannot_hide_policy_flip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from tools import tts_publish
+
+    destination = tmp_path / "voice.mp3"
+    destination.write_bytes(b"old")
+    original = tts_publish._replace_existing
+
+    def tripwire(*args, **kwargs):
+        with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
+            pass
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(tts_publish, "_replace_existing", tripwire)
+    with pytest.raises(TTSPublishError):
+        _publish_one(tmp_path / "stage", destination)
+    assert destination.read_bytes() == b"old"
+
+
+@pytest.mark.parametrize("relative", [".ssh/voice.mp3", ".aws/voice.mp3"])
+def test_canonical_file_safety_blocks_protected_home_targets_before_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: str,
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    destination = home / relative
+    with pytest.raises((TTSPublishError, TTSTransactionError)):
+        _publish_one(tmp_path / "stage", destination)
+    assert not destination.exists()
+    assert not list(destination.parent.glob(".hermes-tts-publish-*"))
+
+
+def test_canonical_file_safety_checks_approval_gate_before_format_or_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from tools import tts_publish
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    destination = home / ".ssh" / "config"
+    called = False
+    real_gate = tts_publish.is_write_approval_required
+
+    def record_gate(path):
+        nonlocal called
+        called = True
+        return real_gate(path)
+
+    monkeypatch.setattr(tts_publish, "is_write_approval_required", record_gate)
+    with pytest.raises((TTSPublishError, TTSTransactionError)):
+        _publish_one(tmp_path / "stage", destination)
+    assert called is True
+    assert not destination.exists()
+    assert not list(destination.parent.glob(".hermes-tts-publish-*"))
+
+
+def test_canonical_file_safety_blocks_fixed_system_denial_before_access(
+    tmp_path: Path,
+):
+    destination = Path("/etc/systemd/voice.mp3")
+    with pytest.raises((TTSPublishError, TTSTransactionError)):
+        _publish_one(tmp_path / "stage", destination)
+    assert not destination.exists()
+
+
+def test_relative_destination_is_frozen_before_cwd_can_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from tools import tts_publish
+
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    (first / "out").mkdir(parents=True)
+    (second / "out").mkdir(parents=True)
+    monkeypatch.chdir(first)
+    real_gate = tts_publish.is_write_approval_required
+
+    def change_cwd_after_classification(path):
+        result = real_gate(path)
+        os.chdir(second)
         return result
 
-    def publish(*args, **kwargs):
-        events.append("publish-enter")
-        result = real_publish(*args, **kwargs)
-        events.append("publish-return")
-        return result
+    monkeypatch.setattr(
+        tts_publish, "is_write_approval_required", change_cwd_after_classification
+    )
+    _publish_one(tmp_path / "stage", Path("out/voice.mp3"))
+    assert (first / "out/voice.mp3").read_bytes() == VALID_MP3
+    assert not (second / "out/voice.mp3").exists()
 
-    monkeypatch.setattr(tts_publish, "_final_policy_allows_publication", final)
-    monkeypatch.setattr(tts_publish, "_rename_absent_for_host", publish)
-    _publish_one(tmp_path / "stage", tmp_path / "voice.mp3")
-    assert events == [
-        "final-policy",
-        "final-return",
-        "publish-enter",
-        "publish-return",
-    ]
+
+def test_same_length_held_temp_mutation_after_fsync_fails_digest_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from tools import tts_publish
+
+    destination = tmp_path / "voice.mp3"
+    real_fsync = tts_publish._fsync_publication_file
+
+    def fsync_then_mutate(fd):
+        real_fsync(fd)
+        os.pwrite(fd, b"X", len(VALID_MP3) - 1)
+
+    monkeypatch.setattr(tts_publish, "_fsync_publication_file", fsync_then_mutate)
+    with pytest.raises(TTSPublishError):
+        _publish_one(tmp_path / "stage", destination)
+    assert not destination.exists()
+    assert all(
+        path.stat().st_size == 0
+        for path in tmp_path.glob(".hermes-tts-publish-*")
+    )
+
+
+def test_same_length_temp_mutation_in_last_revalidation_fails_digest_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from tools import tts_publish
+
+    destination = tmp_path / "voice.mp3"
+    real_revalidate = tts_publish._revalidate_publication_temp
+
+    def revalidate_then_mutate(parent, temp, size):
+        real_revalidate(parent, temp, size)
+        os.pwrite(temp.fd, b"X", len(VALID_MP3) - 1)
+
+    monkeypatch.setattr(
+        tts_publish, "_revalidate_publication_temp", revalidate_then_mutate
+    )
+    with pytest.raises(TTSPublishError):
+        _publish_one(tmp_path / "stage", destination)
+    assert not destination.exists()
+    assert all(
+        path.stat().st_size == 0
+        for path in tmp_path.glob(".hermes-tts-publish-*")
+    )
+
+
+def test_temp_scrub_cancellation_still_closes_parent_and_scrubs_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from tools import tts_publish
+
+    class Cancelled(BaseException):
+        pass
+
+    destination = tmp_path / "voice.mp3"
+    real_temp_scrub = tts_publish._scrub_and_close_fd
+    real_stage_scrub = tts_publish.AnonymousAudioStage.scrub_and_close
+    source_scrubbed = False
+    cancelled = False
+
+    def scrub_then_cancel(fd):
+        nonlocal cancelled
+        if not cancelled:
+            cancelled = True
+            raise Cancelled()
+        return real_temp_scrub(fd)
+
+    def record_source(self):
+        nonlocal source_scrubbed
+        real_stage_scrub(self)
+        source_scrubbed = True
+
+    monkeypatch.setattr(tts_publish, "_scrub_and_close_fd", scrub_then_cancel)
+    monkeypatch.setattr(tts_publish.AnonymousAudioStage, "scrub_and_close", record_source)
+    monkeypatch.setattr(
+        tts_publish,
+        "_rename_absent_for_host",
+        lambda *_args: (_ for _ in ()).throw(OSError("private")),
+    )
+    with pytest.raises((Cancelled, TTSTransactionStop)):
+        _publish_one(tmp_path / "stage", destination)
+    assert source_scrubbed is True
+    assert all(
+        path.stat().st_size == 0
+        for path in tmp_path.glob(".hermes-tts-publish-*")
+    )
+
+
+def test_parent_close_cancellation_still_scrubs_source_and_temp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from tools import tts_publish
+
+    class Cancelled(BaseException):
+        pass
+
+    destination = tmp_path / "voice.mp3"
+    parent_identity = destination.parent.stat()
+    real_close = os.close
+    real_stage_scrub = tts_publish.AnonymousAudioStage.scrub_and_close
+    source_scrubbed = False
+    cancelled = False
+
+    def close_then_cancel(fd):
+        nonlocal cancelled
+        held = os.fstat(fd)
+        if (
+            not cancelled
+            and held.st_dev == parent_identity.st_dev
+            and held.st_ino == parent_identity.st_ino
+        ):
+            cancelled = True
+            raise Cancelled()
+        real_close(fd)
+
+    def record_source(self):
+        nonlocal source_scrubbed
+        real_stage_scrub(self)
+        source_scrubbed = True
+
+    monkeypatch.setattr(tts_publish.os, "close", close_then_cancel)
+    monkeypatch.setattr(tts_publish.AnonymousAudioStage, "scrub_and_close", record_source)
+    monkeypatch.setattr(
+        tts_publish,
+        "_rename_absent_for_host",
+        lambda *_args: (_ for _ in ()).throw(OSError("private")),
+    )
+    with pytest.raises((Cancelled, TTSTransactionStop)):
+        _publish_one(tmp_path / "stage", destination)
+    assert source_scrubbed is True
+    assert all(
+        path.stat().st_size == 0
+        for path in tmp_path.glob(".hermes-tts-publish-*")
+    )
+
+
+def test_source_cleanup_cancellation_is_rethrown_after_other_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from tools import tts_publish
+
+    class Cancelled(BaseException):
+        pass
+
+    destination = tmp_path / "voice.mp3"
+    real_stage_scrub = tts_publish.AnonymousAudioStage.scrub_and_close
+    cancelled = False
+
+    def scrub_then_cancel(self):
+        nonlocal cancelled
+        if not cancelled:
+            cancelled = True
+            raise Cancelled()
+        return real_stage_scrub(self)
+
+    monkeypatch.setattr(
+        tts_publish.AnonymousAudioStage, "scrub_and_close", scrub_then_cancel
+    )
+    monkeypatch.setattr(
+        tts_publish,
+        "_rename_absent_for_host",
+        lambda *_args: (_ for _ in ()).throw(OSError("private")),
+    )
+    with pytest.raises((Cancelled, TTSTransactionStop)):
+        _publish_one(tmp_path / "stage", destination)
+    assert all(
+        path.stat().st_size == 0
+        for path in tmp_path.glob(".hermes-tts-publish-*")
+    )
+
+
+def test_open_held_parent_closes_fd_when_post_open_fstat_is_cancelled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from tools import tts_publish
+
+    class Cancelled(BaseException):
+        pass
+
+    descriptor_root = Path("/dev/fd" if sys.platform == "darwin" else "/proc/self/fd")
+    before = set(os.listdir(descriptor_root))
+    monkeypatch.setattr(
+        tts_publish.os,
+        "fstat",
+        lambda _fd: (_ for _ in ()).throw(Cancelled()),
+    )
+    with pytest.raises(Cancelled):
+        tts_publish._open_held_parent(tmp_path / "voice.mp3")
+    after = set(os.listdir(descriptor_root))
+    assert len(after - before) <= 1
 
 
 def test_absent_destination_race_preserves_concurrent_destination(
@@ -442,13 +798,13 @@ def test_absent_destination_race_preserves_concurrent_destination(
     from tools import tts_publish
 
     destination = tmp_path / "voice.mp3"
-    real_absent = tts_publish._rename_absent_for_host
+    real_fsync = tts_publish._fsync_publication_file
 
-    def race(parent_fd, source, destination_fd, destination_name):
+    def race(fd):
+        real_fsync(fd)
         destination.write_bytes(b"concurrent")
-        return real_absent(parent_fd, source, destination_fd, destination_name)
 
-    monkeypatch.setattr(tts_publish, "_rename_absent_for_host", race)
+    monkeypatch.setattr(tts_publish, "_fsync_publication_file", race)
     with pytest.raises(TTSPublishError):
         _publish_one(tmp_path / "stage", destination)
     assert destination.read_bytes() == b"concurrent"
@@ -461,13 +817,13 @@ def test_existing_destination_race_retains_authorized_replace_semantics(
 
     destination = tmp_path / "voice.mp3"
     destination.write_bytes(b"authorized-old")
-    real_replace = tts_publish._replace_existing
+    real_fsync = tts_publish._fsync_publication_file
 
-    def race(parent_fd, source, destination_fd, destination_name):
+    def race(fd):
+        real_fsync(fd)
         destination.write_bytes(b"concurrent")
-        return real_replace(parent_fd, source, destination_fd, destination_name)
 
-    monkeypatch.setattr(tts_publish, "_replace_existing", race)
+    monkeypatch.setattr(tts_publish, "_fsync_publication_file", race)
     _publish_one(tmp_path / "stage", destination)
     assert destination.read_bytes() == VALID_MP3
 

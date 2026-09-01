@@ -17,8 +17,9 @@ from pathlib import Path
 import secrets
 import stat
 import sys
-from typing import Final
+from typing import Callable, Final
 
+from agent.file_safety import is_write_approval_required, is_write_denied
 from hermes_cli.persistence import PersistenceObservation, PersistencePolicy
 from tools.path_security import has_traversal_component
 from tools.tts_staging import (
@@ -73,6 +74,19 @@ class _PublicationTemp:
 @dataclass(frozen=True, slots=True)
 class _PublicationOutcome:
     status: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedPublicationCall:
+    kind: str
+    callable_ref: Callable[..., object]
+    source: str | bytes
+    destination: str | bytes
+    source_dir_fd: int
+    destination_dir_fd: int
+    flags: int
+    expected_argtypes: tuple[object, ...] | None = None
+    expected_restype: object = None
 
 
 def _load_libc_symbol(name: str):
@@ -207,6 +221,106 @@ def _replace_existing(
     )
 
 
+def _create_publication_call_preparer():
+    canonical_call_record = _PreparedPublicationCall
+    canonical_fsencode = os.fsencode
+    canonical_replace = os.replace
+    canonical_replace_helper = _replace_existing
+    canonical_host_helper = _rename_absent_for_host
+    canonical_darwin_helper = _rename_absent_darwin
+    canonical_darwin_wrapper = _darwin_renameatx_np
+    canonical_linux_helper = _rename_absent_linux
+    canonical_linux_wrapper = _linux_renameat2
+    canonical_darwin_symbol = _DARWIN_RENAMEATX_NP
+    canonical_linux_symbol = _LINUX_RENAMEAT2
+    canonical_rename_noreplace = RENAME_NOREPLACE
+    canonical_rename_excl = RENAME_EXCL
+    canonical_rename_nofollow_any = RENAME_NOFOLLOW_ANY
+    canonical_rename_resolve_beneath = RENAME_RESOLVE_BENEATH
+    canonical_argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    canonical_restype = ctypes.c_int
+
+    def prepare(
+        *,
+        replacing: bool,
+        parent_fd: int,
+        source: str,
+        destination: str,
+        platform: str,
+    ) -> _PreparedPublicationCall:
+        if (
+            _PreparedPublicationCall is not canonical_call_record
+            or os.fsencode is not canonical_fsencode
+            or os.replace is not canonical_replace
+            or _replace_existing is not canonical_replace_helper
+            or _rename_absent_for_host is not canonical_host_helper
+            or _rename_absent_darwin is not canonical_darwin_helper
+            or _darwin_renameatx_np is not canonical_darwin_wrapper
+            or _rename_absent_linux is not canonical_linux_helper
+            or _linux_renameat2 is not canonical_linux_wrapper
+            or _DARWIN_RENAMEATX_NP is not canonical_darwin_symbol
+            or _LINUX_RENAMEAT2 is not canonical_linux_symbol
+            or RENAME_NOREPLACE != canonical_rename_noreplace
+            or RENAME_EXCL != canonical_rename_excl
+            or RENAME_NOFOLLOW_ANY != canonical_rename_nofollow_any
+            or RENAME_RESOLVE_BENEATH != canonical_rename_resolve_beneath
+        ):
+            raise TTSPublishError(_PUBLISH_ERROR)
+        if replacing:
+            return canonical_call_record(
+                kind="replace",
+                callable_ref=canonical_replace,
+                source=source,
+                destination=destination,
+                source_dir_fd=parent_fd,
+                destination_dir_fd=parent_fd,
+                flags=0,
+            )
+        if platform == "darwin":
+            _require_absent_primitive_for_platform(platform)
+            assert canonical_darwin_symbol is not None
+            return canonical_call_record(
+                kind="darwin",
+                callable_ref=canonical_darwin_symbol,
+                source=canonical_fsencode(source),
+                destination=canonical_fsencode(destination),
+                source_dir_fd=parent_fd,
+                destination_dir_fd=parent_fd,
+                flags=canonical_rename_excl
+                | canonical_rename_nofollow_any
+                | canonical_rename_resolve_beneath,
+                expected_argtypes=canonical_argtypes,
+                expected_restype=canonical_restype,
+            )
+        if platform.startswith("linux"):
+            _require_absent_primitive_for_platform(platform)
+            assert canonical_linux_symbol is not None
+            return canonical_call_record(
+                kind="linux",
+                callable_ref=canonical_linux_symbol,
+                source=canonical_fsencode(source),
+                destination=canonical_fsencode(destination),
+                source_dir_fd=parent_fd,
+                destination_dir_fd=parent_fd,
+                flags=canonical_rename_noreplace,
+                expected_argtypes=canonical_argtypes,
+                expected_restype=canonical_restype,
+            )
+        raise TTSPublishError(_PUBLISH_ERROR)
+
+    return prepare
+
+
+_prepare_publication_call = _create_publication_call_preparer()
+del _create_publication_call_preparer
+
+
 def _validate_destination(destination: object) -> Path:
     if type(destination) is not type(Path()):
         raise TTSPublishError(_PUBLISH_ERROR)
@@ -219,7 +333,15 @@ def _validate_destination(destination: object) -> Path:
         or destination.name in ("", ".", "..")
     ):
         raise TTSPublishError(_PUBLISH_ERROR)
-    return destination
+    try:
+        canonical = Path(os.path.realpath(os.path.expanduser(raw)))
+        denied = is_write_denied(str(canonical))
+        approval_required = is_write_approval_required(str(canonical))
+    except (OSError, TypeError, ValueError):
+        raise TTSPublishError(_PUBLISH_ERROR) from None
+    if denied or approval_required:
+        raise TTSPublishError(_PUBLISH_ERROR)
+    return canonical
 
 
 def _open_held_parent(destination: Path) -> _HeldParent:
@@ -234,17 +356,20 @@ def _open_held_parent(destination: Path) -> _HeldParent:
         if not _same_parent(held, named):
             raise TTSPublishError(_PUBLISH_ERROR)
         return _HeldParent(fd=fd, path=destination.parent, stat=held)
-    except TTSPublishError:
-        if fd >= 0:
-            os.close(fd)
-        raise
-    except (OSError, TypeError, ValueError):
+    except BaseException as exc:
         if fd >= 0:
             try:
                 os.close(fd)
-            except OSError:
-                pass
-        raise TTSPublishError(_PUBLISH_ERROR) from None
+            except BaseException:
+                try:
+                    os.close(fd)
+                except BaseException:
+                    pass
+        if isinstance(exc, TTSPublishError):
+            raise
+        if isinstance(exc, (OSError, TypeError, ValueError)):
+            raise TTSPublishError(_PUBLISH_ERROR) from None
+        raise
 
 
 def _same_parent(held: os.stat_result, named: os.stat_result) -> bool:
@@ -406,11 +531,35 @@ def _revalidate_publication_temp(
         raise TTSPublishError(_PUBLISH_ERROR)
 
 
-def _final_policy_allows_publication(observation: PersistenceObservation) -> bool:
-    return (
-        observation.current_policy is PersistencePolicy.DURABLE
-        and not observation.ever_ephemeral
-    )
+def _verify_publication_digest(
+    temp: _PublicationTemp,
+    sealed: SealedAudio,
+) -> None:
+    if (
+        type(sealed._size) is not int
+        or sealed._size <= 0
+        or sealed._size > MAX_ANONYMOUS_AUDIO_BYTES
+    ):
+        raise TTSPublishError(_PUBLISH_ERROR)
+    digest = hashlib.sha256()
+    remaining = sealed._size
+    try:
+        os.lseek(temp.fd, 0, os.SEEK_SET)
+        while remaining:
+            chunk = os.read(temp.fd, min(remaining, _COPY_CHUNK_BYTES))
+            if not chunk:
+                raise TTSPublishError(_PUBLISH_ERROR)
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(temp.fd, 1):
+            raise TTSPublishError(_PUBLISH_ERROR)
+    finally:
+        try:
+            os.lseek(temp.fd, 0, os.SEEK_SET)
+        except OSError:
+            pass
+    if digest.digest() != sealed._digest:
+        raise TTSPublishError(_PUBLISH_ERROR)
 
 
 def _fsync_publication_file(fd: int) -> None:
@@ -425,16 +574,24 @@ def _scrub_and_close_fd(fd: int) -> None:
     failed = False
     try:
         os.ftruncate(fd, 0)
-    except OSError:
+    except BaseException:
         failed = True
+        try:
+            os.ftruncate(fd, 0)
+        except BaseException:
+            pass
     try:
         os.fsync(fd)
-    except OSError:
+    except BaseException:
         failed = True
     try:
         os.close(fd)
-    except OSError:
+    except BaseException:
         failed = True
+        try:
+            os.close(fd)
+        except BaseException:
+            pass
     if failed:
         raise AnonymousAudioScrubError(_SCRUB_ERROR)
 
@@ -446,11 +603,36 @@ def _close_fd(fd: int) -> None:
         raise TTSPublishUncertain(_PUBLISH_UNCERTAIN) from None
 
 
+def _bind_publication_helpers(function: Callable[..., _PublicationOutcome]):
+    canonical_prepare = _prepare_publication_call
+    canonical_verify = _verify_publication_digest
+
+    def bound(
+        stage: AnonymousAudioStage,
+        sealed: SealedAudio,
+        observation: PersistenceObservation,
+        destination: Path,
+    ) -> _PublicationOutcome:
+        return function(
+            stage,
+            sealed,
+            observation,
+            destination,
+            canonical_prepare,
+            canonical_verify,
+        )
+
+    return bound
+
+
+@_bind_publication_helpers
 def _publish_one(
     stage: AnonymousAudioStage,
     sealed: SealedAudio,
     observation: PersistenceObservation,
     destination: Path,
+    canonical_prepare: Callable[..., _PreparedPublicationCall],
+    canonical_verify: Callable[[_PublicationTemp, SealedAudio], None],
 ) -> _PublicationOutcome:
     parent: _HeldParent | None = None
     temp: _PublicationTemp | None = None
@@ -465,10 +647,68 @@ def _publish_one(
         _fsync_publication_file(temp.fd)
         _revalidate_parent(parent)
         _revalidate_publication_temp(parent, temp, sealed._size)
-        publisher = _replace_existing if replacing else _rename_absent_for_host
-        if not _final_policy_allows_publication(observation):
+        if (
+            _prepare_publication_call is not canonical_prepare
+            or _verify_publication_digest is not canonical_verify
+        ):
             raise TTSPublishError(_PUBLISH_ERROR)
-        publisher(parent.fd, temp.name, parent.fd, destination.name)
+        prepared = canonical_prepare(
+            replacing=replacing,
+            parent_fd=parent.fd,
+            source=temp.name,
+            destination=destination.name,
+            platform=sys.platform,
+        )
+        native_callable = prepared.callable_ref
+        source_name = prepared.source
+        destination_name = prepared.destination
+        source_dir_fd = prepared.source_dir_fd
+        destination_dir_fd = prepared.destination_dir_fd
+        flags = prepared.flags
+        publication_kind = prepared.kind
+        expected_argtypes = prepared.expected_argtypes
+        expected_restype = prepared.expected_restype
+        canonical_verify(temp, sealed)
+        if publication_kind != "replace":
+            try:
+                signature_is_plain = (
+                    tuple(native_callable.argtypes or ()) == expected_argtypes
+                    and native_callable.restype is expected_restype
+                    and getattr(native_callable, "errcheck", None) is None
+                )
+            except (AttributeError, TypeError, ValueError):
+                signature_is_plain = False
+            if not signature_is_plain:
+                raise TTSPublishError(_PUBLISH_ERROR)
+        if publication_kind == "replace":
+            if (
+                observation.current_policy is not PersistencePolicy.DURABLE
+                or observation.ever_ephemeral
+            ):
+                raise TTSPublishError(_PUBLISH_ERROR)
+            native_result = native_callable(
+                source_name,
+                destination_name,
+                src_dir_fd=source_dir_fd,
+                dst_dir_fd=destination_dir_fd,
+            )
+        else:
+            ctypes.set_errno(0)
+            if (
+                observation.current_policy is not PersistencePolicy.DURABLE
+                or observation.ever_ephemeral
+            ):
+                raise TTSPublishError(_PUBLISH_ERROR)
+            native_result = native_callable(
+                source_dir_fd,
+                source_name,
+                destination_dir_fd,
+                destination_name,
+                flags,
+            )
+        if publication_kind != "replace" and native_result != 0:
+            error = ctypes.get_errno() or errno.EIO
+            raise OSError(error, "durable publication unavailable")
         temp.published = True
         try:
             _fsync_parent(parent.fd)
@@ -485,6 +725,9 @@ def _publish_one(
     return outcome
 
 
+del _bind_publication_helpers
+
+
 def _finish_publication_ownership(
     stage: AnonymousAudioStage,
     temp: _PublicationTemp | None,
@@ -493,31 +736,59 @@ def _finish_publication_ownership(
 ) -> None:
     scrub_failed = False
     close_failed = False
+    first_stop: BaseException | None = None
     if temp is not None:
         try:
             if temp.published:
                 os.close(temp.fd)
             else:
                 _scrub_and_close_fd(temp.fd)
-        except AnonymousAudioScrubError:
-            scrub_failed = True
-        except OSError:
-            close_failed = True
+        except BaseException as exc:
+            if first_stop is None:
+                first_stop = exc
+            if temp.published:
+                close_failed = True
+                try:
+                    os.close(temp.fd)
+                except BaseException:
+                    pass
+            else:
+                scrub_failed = True
+                try:
+                    _scrub_and_close_fd(temp.fd)
+                except BaseException:
+                    pass
     if parent is not None:
         try:
             os.close(parent.fd)
-        except OSError:
+        except BaseException as exc:
+            if first_stop is None:
+                first_stop = exc
             close_failed = True
+            try:
+                os.close(parent.fd)
+            except BaseException:
+                pass
     try:
         stage.scrub_and_close()
-    except BaseException:
+    except BaseException as exc:
+        if first_stop is None:
+            first_stop = exc
         scrub_failed = True
+        try:
+            stage.scrub_and_close()
+        except BaseException:
+            pass
     if scrub_failed:
         raise AnonymousAudioScrubError(_SCRUB_ERROR)
     if close_failed:
+        if first_stop is not None and not isinstance(first_stop, Exception):
+            raise first_stop
         if outcome.status in ("published", "uncertain"):
             raise TTSPublishUncertain(_PUBLISH_UNCERTAIN)
         raise TTSPublishError(_PUBLISH_ERROR)
+    if first_stop is not None:
+        raise first_stop
 
 
 def _scrub_all_stages(
