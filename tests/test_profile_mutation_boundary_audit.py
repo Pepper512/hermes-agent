@@ -601,6 +601,7 @@ def _canonical_deletion_leaf_callers(
     sources: list[tuple[str, str]],
 ) -> set[tuple[str, str, str]]:
     leaf_names = set(CANONICAL_DELETION_LEAF_CALLERS)
+    module_binding = "<hermes_state_module>"
     callers: set[tuple[str, str, str]] = set()
     for relative, source in sources:
         if not any(leaf_name in source for leaf_name in leaf_names):
@@ -611,49 +612,130 @@ def _canonical_deletion_leaf_callers(
             for child in ast.iter_child_nodes(node):
                 parents[child] = node
 
-        imported_leaves: dict[ast.AST, dict[str, str]] = {}
-        imported_modules: dict[ast.AST, set[str]] = {}
+        binding_events: dict[
+            ast.AST, dict[str, list[tuple[tuple[int, int], str | None]]]
+        ] = {}
+        assignment_events: list[tuple[ast.AST, str, int, ast.AST]] = []
+
+        def add_binding(
+            scope: ast.AST,
+            name: str,
+            node: ast.AST,
+            binding: str | None,
+        ) -> int:
+            position = (
+                getattr(node, "end_lineno", node.lineno),
+                getattr(node, "end_col_offset", node.col_offset),
+            )
+            events = binding_events.setdefault(scope, {}).setdefault(name, [])
+            events.append((position, binding))
+            return len(events) - 1
+
         for node in ast.walk(tree):
             scope = _nearest_import_scope(node, parents, tree)
             if isinstance(node, ast.ImportFrom) and node.module == "hermes_state":
                 for alias in node.names:
-                    if alias.name in leaf_names:
-                        imported_leaves.setdefault(scope, {})[
-                            alias.asname or alias.name
-                        ] = alias.name
+                    add_binding(
+                        scope,
+                        alias.asname or alias.name,
+                        node,
+                        alias.name if alias.name in leaf_names else None,
+                    )
             elif isinstance(node, ast.Import):
                 for alias in node.names:
-                    if alias.name == "hermes_state":
-                        imported_modules.setdefault(scope, set()).add(
-                            alias.asname or alias.name
-                        )
+                    add_binding(
+                        scope,
+                        alias.asname or alias.name.split(".", maxsplit=1)[0],
+                        node,
+                        module_binding if alias.name == "hermes_state" else None,
+                    )
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name != "*":
+                        add_binding(scope, alias.asname or alias.name, node, None)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                definition_binding = (
+                    node.name
+                    if relative == "hermes_state.py"
+                    and scope is tree
+                    and node.name in leaf_names
+                    else None
+                )
+                add_binding(scope, node.name, node, definition_binding)
+                arguments = [
+                    *node.args.posonlyargs,
+                    *node.args.args,
+                    *node.args.kwonlyargs,
+                ]
+                if node.args.vararg is not None:
+                    arguments.append(node.args.vararg)
+                if node.args.kwarg is not None:
+                    arguments.append(node.args.kwarg)
+                for argument in arguments:
+                    add_binding(node, argument.arg, node, None)
+            elif isinstance(node, ast.ClassDef):
+                add_binding(scope, node.name, node, None)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        index = add_binding(scope, target.id, node, None)
+                        assignment_events.append((scope, target.id, index, node.value))
+            elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and isinstance(
+                node.target, ast.Name
+            ):
+                index = add_binding(scope, node.target.id, node, None)
+                if node.value is not None:
+                    assignment_events.append(
+                        (scope, node.target.id, index, node.value)
+                    )
+            elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
+                add_binding(scope, node.target.id, node, None)
+
+        def resolve_name(name: str, node: ast.AST) -> str | None:
+            reference_scope = _nearest_import_scope(node, parents, tree)
+            position = (node.lineno, node.col_offset)
+            for scope in _visible_import_scopes(node, parents, tree):
+                events = binding_events.get(scope, {}).get(name)
+                if not events:
+                    continue
+                if scope is reference_scope:
+                    preceding = [event for event in events if event[0] < position]
+                    if not preceding:
+                        return None
+                    return max(preceding, key=lambda event: event[0])[1]
+                return max(events, key=lambda event: event[0])[1]
+            return None
+
+        def resolve_reference(node: ast.AST) -> str | None:
+            if isinstance(node, ast.Name):
+                return resolve_name(node.id, node)
+            if (
+                isinstance(node, ast.Attribute)
+                and node.attr in leaf_names
+                and isinstance(node.value, ast.Name)
+                and resolve_name(node.value.id, node) == module_binding
+            ):
+                return node.attr
+            return None
+
+        while True:
+            changed = False
+            for scope, name, index, value in assignment_events:
+                binding = resolve_reference(value)
+                if binding is None:
+                    continue
+                position, previous = binding_events[scope][name][index]
+                if previous != binding:
+                    binding_events[scope][name][index] = (position, binding)
+                    changed = True
+            if not changed:
+                break
 
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
-            scopes = _visible_import_scopes(node, parents, tree)
-            leaf: str | None = None
-            if (
-                relative == "hermes_state.py"
-                and isinstance(node.func, ast.Name)
-                and node.func.id in leaf_names
-            ):
-                leaf = node.func.id
-            elif isinstance(node.func, ast.Name):
-                for scope in scopes:
-                    leaf = imported_leaves.get(scope, {}).get(node.func.id)
-                    if leaf is not None:
-                        break
-            elif (
-                isinstance(node.func, ast.Attribute)
-                and node.func.attr in leaf_names
-                and isinstance(node.func.value, ast.Name)
-            ):
-                for scope in scopes:
-                    if node.func.value.id in imported_modules.get(scope, set()):
-                        leaf = node.func.attr
-                        break
-            if leaf is None:
+            leaf = resolve_reference(node.func)
+            if leaf not in leaf_names:
                 continue
 
             cursor: ast.AST | None = parents.get(node)
@@ -809,6 +891,53 @@ def unrelated_terminal_name(service, connection):
         (
             "_delete_unreferenced_system_prompts_on",
             "gateway/injected_delete.py",
+            "new_prompt_cleanup",
+        ),
+    }
+    with pytest.raises(
+        AssertionError, match="^canonical_deletion_leaf_callers_changed:"
+    ):
+        _assert_canonical_deletion_leaf_callers([
+            (
+                "hermes_state.py",
+                (REPO_ROOT / "hermes_state.py").read_text(encoding="utf-8"),
+            ),
+            *injected,
+        ])
+
+
+def test_assignment_aliased_outside_module_deletion_leaf_callers_fail_gate() -> None:
+    synthetic_outside_calls = """
+from hermes_state import _delete_session_root_on as imported_root_delete
+import hermes_state as state
+
+assigned_root_delete = imported_root_delete
+
+def new_root_delete(connection):
+    assigned_root_delete(connection, "root")
+
+def new_prompt_cleanup(connection):
+    assigned_prompt_cleanup = state._delete_unreferenced_system_prompts_on
+    assigned_prompt_cleanup(connection)
+
+def unrelated_root_assignment(service, connection):
+    assigned_root_delete = service._delete_session_root_on
+    assigned_root_delete(connection, "unrelated")
+
+def unrelated_prompt_assignment(service, connection):
+    assigned_prompt_cleanup = service._delete_unreferenced_system_prompts_on
+    assigned_prompt_cleanup(connection)
+"""
+    injected = [("gateway/injected_assignment_delete.py", synthetic_outside_calls)]
+    assert _canonical_deletion_leaf_callers(injected) == {
+        (
+            "_delete_session_root_on",
+            "gateway/injected_assignment_delete.py",
+            "new_root_delete",
+        ),
+        (
+            "_delete_unreferenced_system_prompts_on",
+            "gateway/injected_assignment_delete.py",
             "new_prompt_cleanup",
         ),
     }

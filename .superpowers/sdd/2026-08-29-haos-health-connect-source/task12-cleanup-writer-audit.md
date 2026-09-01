@@ -2,7 +2,7 @@
 
 **Source frozen:** Task 1 at `ef05af5c7824a875693bc13e472195323d40e257`;
 Task 4 canonical deletion leaves/caller surface at
-`ad32c7d810c109d586de6d0c56a44cf9304dd8cf`
+`92c976e09bc8597e11b0fed01052f2a841622221`
 **Scope:** Task 1 of the approved exact-cleanup maintenance plan (`ace1017`)
 plus the approved Task 4 deletion-leaf audit correction
 **Result:** inventory only; no production, live profile, service, database, or
@@ -122,9 +122,12 @@ They must stay dynamically enclosed by either `SessionDB.__init__`,
   Read pools and statistics use URI `mode=ro` and are excluded.
 - Canonical root/prompt deletion leaves accept an already-open connection and
   never acquire authority independently. The static guard scans the complete
-  production surface covered by the mutation audit, resolves direct calls plus
-  explicit imported/aliased uses, and freezes path-qualified callers so a new
-  in-module or imported out-of-coordinator call is a review STOP.
+  production surface covered by the mutation audit, resolves direct calls,
+  explicit imports, and simple assignment aliases of imported helpers or
+  module-qualified helpers. It freezes path-qualified callers so a new
+  in-module, imported, or assignment-aliased out-of-coordinator call is a
+  review STOP without treating unrelated same-terminal object methods as the
+  protected leaves.
 - Schema mutation is concentrated in `hermes_state_schema.py` during writable
   construction or an already-admitted write callback. FTS background mutation
   is mostly routed through `_execute_write`; the static guard now identifies
