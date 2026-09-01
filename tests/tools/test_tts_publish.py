@@ -926,14 +926,91 @@ def test_every_executed_opcode_through_parent_fsync_preserves_linearization(
             )
         elif preexisting:
             assert destination.read_bytes() == b"old"
-            assert isinstance(error, _OpcodeCancellation)
+            assert isinstance(error, TTSPublishUncertain), (target, error)
         else:
             assert not destination.exists()
-            assert isinstance(error, _OpcodeCancellation)
+            assert isinstance(error, TTSPublishUncertain), (target, error)
         assert all(
             path.stat().st_size == 0
             for path in case.glob(".hermes-tts-publish-*")
         )
+
+
+@pytest.mark.parametrize("preexisting", [False, True])
+def test_every_executed_finish_opcode_emits_fixed_uncertainty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    preexisting: bool,
+):
+    from tools import tts_publish
+
+    finish = tts_publish._finish_publication_ownership
+    executed: list[int] = []
+    real_fsync = tts_publish._fsync_parent
+
+    def uncertain_fsync(fd):
+        real_fsync(fd)
+        raise OSError("injected")
+
+    monkeypatch.setattr(tts_publish, "_fsync_parent", uncertain_fsync)
+
+    def record(frame, event, _arg):
+        if frame.f_code is finish.__code__:
+            frame.f_trace_opcodes = True
+            if event == "opcode":
+                executed.append(frame.f_lasti)
+        return record
+
+    probe = tmp_path / "probe-finish"
+    probe.mkdir()
+    probe_destination = probe / "voice.mp3"
+    if preexisting:
+        probe_destination.write_bytes(b"old")
+    sys.settrace(record)
+    try:
+        with pytest.raises(TTSPublishUncertain):
+            _publish_one(probe / "stage", probe_destination)
+    finally:
+        sys.settrace(None)
+
+    descriptor_root = Path("/dev/fd" if sys.platform == "darwin" else "/proc/self/fd")
+    baseline = set(os.listdir(descriptor_root))
+    for index, target in enumerate(dict.fromkeys(executed)):
+        case = tmp_path / f"finish-case-{index}"
+        case.mkdir()
+        destination = case / "voice.mp3"
+        if preexisting:
+            destination.write_bytes(b"old")
+
+        def cancel(frame, event, _arg, *, target=target):
+            if frame.f_code is finish.__code__:
+                frame.f_trace_opcodes = True
+                if event == "opcode" and frame.f_lasti == target:
+                    sys.settrace(None)
+                    frame.f_trace = None
+                    raise _OpcodeCancellation()
+            return cancel
+
+        sys.settrace(cancel)
+        try:
+            error: BaseException | None = None
+            try:
+                _publish_one(case / "stage", destination)
+            except BaseException as exc:
+                error = exc
+        finally:
+            sys.settrace(None)
+        assert isinstance(error, (TTSPublishUncertain, TTSTransactionStop)), (
+            target,
+            error,
+        )
+        assert str(error) in {
+            "tts_durable_publication_uncertain",
+            "tts_anonymous_scrub_failed",
+        }
+        assert destination.read_bytes() == VALID_MP3
+        assert not list(case.glob(".hermes-tts-publish-*"))
+    assert not (set(os.listdir(descriptor_root)) - baseline)
 
 
 @pytest.mark.parametrize("local_name", ["parent", "temp"])
@@ -958,10 +1035,7 @@ def test_acquisition_store_gap_releases_registered_descriptors(
         sys.settrace(None)
     after = set(os.listdir(descriptor_root))
     assert not (after - before)
-    assert all(
-        path.stat().st_size == 0
-        for path in tmp_path.glob(".hermes-tts-publish-*")
-    )
+    assert not list(tmp_path.glob(".hermes-tts-publish-*"))
 
 
 @pytest.mark.parametrize(
@@ -1003,10 +1077,7 @@ def test_acquisition_return_to_caller_gap_uses_registered_custody(
         sys.settrace(None)
     after = set(os.listdir(descriptor_root))
     assert not (after - before)
-    assert all(
-        path.stat().st_size == 0
-        for path in tmp_path.glob(".hermes-tts-publish-*")
-    )
+    assert not list(tmp_path.glob(".hermes-tts-publish-*"))
 
 
 def test_open_held_parent_closes_fd_when_post_open_fstat_is_cancelled(

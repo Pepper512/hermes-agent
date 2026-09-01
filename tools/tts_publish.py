@@ -67,7 +67,7 @@ class _HeldParent:
 class _PublicationTemp:
     fd: int
     name: str
-    stat: os.stat_result
+    stat: os.stat_result | None
     destination_name: str
     publication_armed: bool = False
     published: bool = False
@@ -419,6 +419,21 @@ def _create_publication_temp(
     destination_name: str,
     custody: _PublicationCustody | None = None,
 ) -> _PublicationTemp:
+    temp = _PublicationTemp(
+        fd=-1,
+        name="",
+        stat=None,
+        destination_name=destination_name,
+    )
+    if custody is not None:
+        custody.temp = temp
+    return temp
+
+
+def _materialize_publication_temp(
+    parent: _HeldParent,
+    temp: _PublicationTemp,
+) -> None:
     flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
@@ -442,18 +457,11 @@ def _create_publication_temp(
             if not _same_parent(parent_held, parent_named):
                 raise TTSPublishError(_PUBLISH_ERROR)
             parent.stat = parent_held
-            temp = _PublicationTemp(
-                fd=fd,
-                name=name,
-                stat=held,
-                destination_name=destination_name,
-            )
-            if custody is not None:
-                custody.temp = temp
-            return temp
+            temp.fd = fd
+            temp.name = name
+            temp.stat = held
+            return
         except BaseException:
-            if custody is not None and custody.temp is not None:
-                raise
             try:
                 _scrub_and_close_fd(fd)
             except AnonymousAudioScrubError:
@@ -547,6 +555,8 @@ def _revalidate_publication_temp(
     temp: _PublicationTemp,
     size: int,
 ) -> None:
+    if temp.stat is None:
+        raise TTSPublishError(_PUBLISH_ERROR)
     held = os.fstat(temp.fd)
     named = os.stat(temp.name, dir_fd=parent.fd, follow_symlinks=False)
     if (
@@ -641,14 +651,36 @@ def _bind_publication_helpers(function: Callable[..., _PublicationOutcome]):
         observation: PersistenceObservation,
         destination: Path,
     ) -> _PublicationOutcome:
-        return function(
-            stage,
-            sealed,
-            observation,
-            destination,
-            canonical_prepare,
-            canonical_verify,
-        )
+        custody = _PublicationCustody()
+        outcome = _PublicationOutcome("failed")
+        try:
+            return function(
+                stage,
+                sealed,
+                observation,
+                destination,
+                canonical_prepare,
+                canonical_verify,
+                custody,
+                outcome,
+            )
+        except AnonymousAudioScrubError:
+            raise
+        except BaseException:
+            if outcome.status in ("uncertain", "published"):
+                try:
+                    _finish_publication_ownership(
+                        stage,
+                        custody.temp,
+                        custody.parent,
+                        outcome,
+                    )
+                except AnonymousAudioScrubError:
+                    raise
+                except BaseException:
+                    pass
+                return outcome
+            raise
 
     return bound
 
@@ -661,11 +693,11 @@ def _publish_one(
     destination: Path,
     canonical_prepare: Callable[..., _PreparedPublicationCall],
     canonical_verify: Callable[[_PublicationTemp, SealedAudio], None],
+    custody: _PublicationCustody,
+    outcome: _PublicationOutcome,
 ) -> _PublicationOutcome:
-    custody = _PublicationCustody()
     parent: _HeldParent | None = None
     temp: _PublicationTemp | None = None
-    outcome = _PublicationOutcome("failed")
     pending_stop: BaseException | None = None
     try:
         if sealed._output_format != destination.suffix.lower().lstrip("."):
@@ -679,6 +711,7 @@ def _publish_one(
         temp = custody.temp
         if temp is None:
             raise TTSPublishError(_PUBLISH_ERROR)
+        _materialize_publication_temp(parent, temp)
         _copy_sealed_to_publication(stage, sealed, temp)
         _fsync_publication_file(temp.fd)
         _revalidate_parent(parent)
@@ -716,12 +749,14 @@ def _publish_one(
                 signature_is_plain = False
             if not signature_is_plain:
                 raise TTSPublishError(_PUBLISH_ERROR)
+        outcome.status = "uncertain"
         temp.publication_armed = True
         if publication_kind == "replace":
             if (
                 observation.current_policy is not PersistencePolicy.DURABLE
                 or observation.ever_ephemeral
             ):
+                outcome.status = "failed"
                 raise TTSPublishError(_PUBLISH_ERROR)
             native_result = native_callable(
                 source_name,
@@ -735,6 +770,7 @@ def _publish_one(
                 observation.current_policy is not PersistencePolicy.DURABLE
                 or observation.ever_ephemeral
             ):
+                outcome.status = "failed"
                 raise TTSPublishError(_PUBLISH_ERROR)
             native_result = native_callable(
                 source_dir_fd,
@@ -745,17 +781,17 @@ def _publish_one(
             )
         if publication_kind != "replace" and native_result != 0:
             error = ctypes.get_errno() or errno.EIO
+            outcome.status = "failed"
             raise OSError(error, "durable publication unavailable")
         temp.published = True
         _fsync_parent(parent.fd)
-        outcome = _PublicationOutcome("published")
+        outcome.status = "published"
     except AnonymousAudioScrubError:
         raise
     except Exception:
-        outcome = _PublicationOutcome("failed")
+        pass
     except BaseException as exc:
         pending_stop = exc
-        outcome = _PublicationOutcome("failed")
     finally:
         _finish_publication_ownership(stage, custody.temp, custody.parent, outcome)
     if pending_stop is not None and outcome.status != "uncertain":
@@ -774,13 +810,13 @@ def _finish_publication_ownership(
 ) -> None:
     scrub_failed = False
     close_failed = False
-    publication_uncertain = False
     first_stop: BaseException | None = None
     if temp is not None:
+        if temp.fd < 0:
+            temp = None
+    if temp is not None:
         preserve_temp = temp.published
-        if temp.published and outcome.status == "failed":
-            publication_uncertain = True
-        elif temp.publication_armed and not temp.published:
+        if temp.publication_armed and not temp.published:
             preserve_temp = True
             try:
                 held = os.fstat(temp.fd)
@@ -809,10 +845,8 @@ def _finish_publication_ownership(
                 )
                 if source_is_held and not destination_is_held:
                     preserve_temp = False
-                else:
-                    publication_uncertain = True
             except BaseException:
-                publication_uncertain = True
+                pass
         try:
             if preserve_temp:
                 os.close(temp.fd)
@@ -856,9 +890,6 @@ def _finish_publication_ownership(
             pass
     if scrub_failed:
         raise AnonymousAudioScrubError(_SCRUB_ERROR)
-    if publication_uncertain:
-        outcome.status = "uncertain"
-        return
     if close_failed:
         if first_stop is not None and not isinstance(first_stop, Exception):
             raise first_stop
