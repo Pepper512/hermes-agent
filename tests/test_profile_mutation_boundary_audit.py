@@ -144,6 +144,7 @@ AUDITED_DIRECT_BOUNDARIES = {
     "hermes_state.py::SessionDB.delete_sessions",
     "hermes_state.py::SessionDB.maybe_auto_prune_and_vacuum",
     "hermes_state.py::SessionDB.prune_sessions",
+    "hermes_state.py::SessionDB.prune_empty_ghost_sessions",
     "hermes_state.py::SessionDB.purge_stale_tool_call_markers",
     "hermes_state.py::SessionDB.vacuum",
     "hermes_state_search.py::SessionSearchMixin._demote_legacy_fts_to_trash",
@@ -188,6 +189,7 @@ CANONICAL_FILE_WRITERS = {
         "SessionDB.delete_session_if_empty",
         "SessionDB.delete_sessions",
         "SessionDB.prune_sessions",
+        "SessionDB.prune_empty_ghost_sessions",
     },
     "hermes_cli/update_cmd.py": {"_clear_stale_sqlite_sidecars"},
     "run_agent.py": {"AIAgent._save_session_log"},
@@ -393,6 +395,15 @@ def _coordinator_for(
             if qualified.startswith("SessionDB.") or qualified == "_delete_delegate_children":
                 return "hermes_state.py::SessionDB._execute_write"
             return f"{relative}::{qualified}"
+        if (
+            qualified.startswith("SessionDB.")
+            and "self._execute_write(" in source
+            and "self._remove_session_files(" in source
+        ):
+            # A delegated SQL phase followed by a filesystem mutation needs
+            # one outer span.  Collapsing it to _execute_write would hide the
+            # post-callback lease gap this gate is intended to prevent.
+            return f"{relative}::{qualified}"
         if qualified.startswith("SessionDB.") and "self._execute_write(" in source:
             return "hermes_state.py::SessionDB._execute_write"
         if qualified.startswith("SessionDB.") and qualified.endswith("._do"):
@@ -531,6 +542,29 @@ class SessionDB:
     def mixed_writer(self):
         self._conn.execute("VACUUM INTO ?", ("snapshot.db",))
         self._execute_write(lambda conn: conn.execute("DELETE FROM sessions"))
+"""
+    )
+    parents: dict[ast.AST, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    function = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "mixed_writer"
+    )
+    assert _coordinator_for("hermes_state.py", function, parents) == (
+        "hermes_state.py::SessionDB.mixed_writer"
+    )
+
+
+def test_delegated_sql_followed_by_sidecar_mutation_keeps_outer_boundary() -> None:
+    tree = ast.parse(
+        """
+class SessionDB:
+    def mixed_writer(self, sessions_dir):
+        removed = self._execute_write(lambda conn: conn.execute("DELETE FROM sessions"))
+        self._remove_session_files(sessions_dir, removed)
 """
     )
     parents: dict[ast.AST, ast.AST] = {}

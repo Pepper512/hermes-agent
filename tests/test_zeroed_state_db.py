@@ -7,18 +7,47 @@ from pathlib import Path
 import pytest
 
 
-def test_is_zeroed_state_db_and_quarantine(tmp_path):
+def test_is_zeroed_state_db_and_quarantine(tmp_path, monkeypatch):
     import hermes_state as hs
 
     db = tmp_path / "state.db"
     db.write_bytes(bytes(1024))
     assert hs.is_zeroed_state_db(db) is True
+    synced: list[Path] = []
+    real_fsync_directory = hs._fsync_directory
+
+    def record_directory_fsync(directory: Path) -> None:
+        synced.append(directory)
+        real_fsync_directory(directory)
+
+    monkeypatch.setattr(hs, "_fsync_directory", record_directory_fsync)
 
     q = hs.quarantine_zeroed_state_db(db)
     assert q is not None
     assert q.exists()
     assert not db.exists()
     assert q.read_bytes() == bytes(1024)
+    assert synced == [tmp_path]
+
+
+def test_quarantine_directory_fsync_failure_is_categorical(tmp_path, monkeypatch):
+    import hermes_state as hs
+    from hermes_state_maintenance import UnsafeProfileState
+
+    db = tmp_path / "state.db"
+    db.write_bytes(bytes(1024))
+
+    def fail_directory_fsync(_directory: Path) -> None:
+        raise OSError("synthetic quarantine durability failure")
+
+    monkeypatch.setattr(hs, "_fsync_directory", fail_directory_fsync)
+    with pytest.raises(UnsafeProfileState):
+        hs.quarantine_zeroed_state_db(db)
+
+    assert not db.exists()
+    quarantines = list(tmp_path.glob("state.db.zeroed-*.bak"))
+    assert len(quarantines) == 1
+    assert quarantines[0].read_bytes() == bytes(1024)
 
 
 def test_sessiondb_opens_fresh_after_zeroed_quarantine(tmp_path, monkeypatch):

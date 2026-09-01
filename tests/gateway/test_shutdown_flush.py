@@ -118,6 +118,7 @@ def test_recover_closes_owned_db_when_unexpected_exception_escapes(
 
     class InterruptingDB:
         closed = False
+        db_path = Path(os.environ["HERMES_HOME"]) / "state.db"
 
         def append_message(self, **_kwargs):
             raise KeyboardInterrupt
@@ -132,6 +133,35 @@ def test_recover_closes_owned_db_when_unexpected_exception_escapes(
         recover_pending_to_db()
 
     assert db.closed is True
+
+
+def test_recover_preserves_payload_after_ordinary_append_failure(
+    tmp_path, monkeypatch
+):
+    profile = Path(os.environ["HERMES_HOME"])
+    flush_dir = _make_flush_dir(profile)
+    monkeypatch.setattr(
+        "gateway.shutdown_flush._get_flush_dir", lambda: flush_dir
+    )
+    flush_file = flush_dir / "pending.json"
+    flush_file.write_text(
+        json.dumps(
+            {
+                "session_key": "agent:main:telegram:123",
+                "data": {"text": "message", "session_id": "sid"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FailingDB:
+        db_path = profile / "state.db"
+
+        def append_message(self, **_kwargs):
+            raise RuntimeError("synthetic transient write failure")
+
+    assert recover_pending_to_db(FailingDB()) == 0
+    assert flush_file.exists()
 
 
 def test_serialise_object_with_text():
@@ -167,4 +197,3 @@ def test_get_flush_dir_uses_get_hermes_home(tmp_path, monkeypatch):
     result = mod._get_flush_dir()
     assert captured.get("called") is True
     assert result == tmp_path / "pending_messages"
-

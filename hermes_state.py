@@ -26,6 +26,7 @@ import queue
 import random
 import re
 import sqlite3
+import stat
 import sys
 import threading
 import time
@@ -96,7 +97,11 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_schema import SessionSchemaMixin
 from hermes_state_search import SessionSearchMixin
-from hermes_state_maintenance import _fsync_directory, _leased_profile_mutation
+from hermes_state_maintenance import (
+    UnsafeProfileState,
+    _fsync_directory,
+    _leased_profile_mutation,
+)
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
     import psutil
@@ -113,10 +118,26 @@ def _sessiondb_profile_roots(
     session_db: "SessionDB",
     sessions_dir: Optional[Path] = None,
 ) -> tuple[Path, ...]:
-    roots = [session_db.db_path.parent]
-    if sessions_dir is not None:
-        roots.append(sessions_dir.parent)
-    return tuple(roots)
+    profile_root = session_db.db_path.parent
+    if sessions_dir is None:
+        return (profile_root,)
+    canonical_sessions_dir = profile_root / "sessions"
+    if (
+        type(sessions_dir) is not type(Path())
+        or sessions_dir != canonical_sessions_dir
+    ):
+        raise UnsafeProfileState
+    try:
+        named = os.stat(sessions_dir, follow_symlinks=False)
+    except FileNotFoundError:
+        # An absent exact sink has no sidecars to remove.  The profile lease
+        # still protects the database phase and any later canonical creation.
+        return (profile_root,)
+    except OSError:
+        raise UnsafeProfileState from None
+    if not stat.S_ISDIR(named.st_mode):
+        raise UnsafeProfileState
+    return (profile_root,)
 
 
 def _state_db_profile_roots(db_path: Path | str) -> tuple[Path, ...]:
@@ -4083,6 +4104,10 @@ def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
                     side.rename(Path(str(dest) + suffix))
                 except OSError:
                     pass
+        try:
+            _fsync_directory(path.parent)
+        except OSError:
+            raise UnsafeProfileState from None
         return dest
     finally:
         try:
@@ -9247,6 +9272,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         self._execute_write(_do)
 
+    @_leased_profile_mutation(
+        lambda self, sessions_dir=None: _sessiondb_profile_roots(self, sessions_dir)
+    )
     def prune_empty_ghost_sessions(self, sessions_dir: "Optional[Path]" = None) -> int:
         """Remove empty TUI ghost sessions (no messages, no title, >24hr old)."""
         cutoff = time.time() - 86400  # Only sessions older than 24 hours

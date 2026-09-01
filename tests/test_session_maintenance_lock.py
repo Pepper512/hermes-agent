@@ -358,16 +358,240 @@ def test_recovery_barrier_retires_only_with_exact_nonce(tmp_path):
         profile, timeout_seconds=1.0
     ) as exclusive:
         maintenance.publish_recovery_barrier(exclusive, _operation_nonce("a"))
+        published_identity = (
+            _barrier_path(profile).stat().st_dev,
+            _barrier_path(profile).stat().st_ino,
+        )
         with pytest.raises(maintenance.UnsafeRecoveryBarrier):
             maintenance.retire_recovery_barrier(exclusive, _operation_nonce("b"))
         assert _barrier_path(profile).exists()
         maintenance.retire_recovery_barrier(exclusive, _operation_nonce("a"))
 
     assert not _barrier_path(profile).exists()
+    retired = list(profile.glob(maintenance._RECOVERY_BARRIER_RETIRED_PREFIX + "*"))
+    assert len(retired) == 1
+    assert (retired[0].stat().st_dev, retired[0].stat().st_ino) == published_identity
     with maintenance.acquire_profile_state_shared(
         profile, timeout_seconds=1.0
     ) as shared:
         maintenance.require_no_recovery_barrier(shared)
+
+
+def test_recovery_barrier_retirement_rejects_last_window_replacement(
+    tmp_path, monkeypatch
+):
+    profile = _profile(tmp_path)
+    nonce = _operation_nonce()
+    exclusive = maintenance.acquire_profile_state_exclusive(
+        profile, timeout_seconds=1.0
+    )
+    maintenance.publish_recovery_barrier(exclusive, nonce)
+    payload = _barrier_path(profile).read_bytes()
+    real_retire = getattr(maintenance, "_rename_barrier_no_replace", None)
+    injected = False
+
+    def replace_at_retirement(profile_fd: int, source: str, destination: str) -> None:
+        nonlocal injected
+        assert real_retire is not None
+        if not injected:
+            injected = True
+            _barrier_path(profile).rename(profile / "held-original")
+            _write_private_file(_barrier_path(profile), payload)
+        real_retire(profile_fd, source, destination)
+
+    monkeypatch.setattr(
+        maintenance,
+        "_rename_barrier_no_replace",
+        replace_at_retirement,
+        raising=False,
+    )
+    try:
+        with pytest.raises(maintenance.UnsafeRecoveryBarrier):
+            maintenance.retire_recovery_barrier(exclusive, nonce)
+        assert _barrier_path(profile).exists()
+    finally:
+        exclusive.close()
+
+
+def test_recovery_barrier_retirement_fsync_failure_republishes(tmp_path, monkeypatch):
+    profile = _profile(tmp_path)
+    nonce = _operation_nonce()
+    exclusive = maintenance.acquire_profile_state_exclusive(
+        profile, timeout_seconds=1.0
+    )
+    maintenance.publish_recovery_barrier(exclusive, nonce)
+    real_fsync = maintenance.os.fsync
+
+    def fail_directory_fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.EIO, "synthetic retirement durability failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(maintenance.os, "fsync", fail_directory_fsync)
+    try:
+        with pytest.raises(maintenance.UnsafeRecoveryBarrier):
+            maintenance.retire_recovery_barrier(exclusive, nonce)
+        assert _barrier_path(profile).exists()
+    finally:
+        exclusive.close()
+
+
+def test_recovery_barrier_retirement_baseexception_republishes(tmp_path, monkeypatch):
+    profile = _profile(tmp_path)
+    nonce = _operation_nonce()
+    exclusive = maintenance.acquire_profile_state_exclusive(
+        profile, timeout_seconds=1.0
+    )
+    maintenance.publish_recovery_barrier(exclusive, nonce)
+    real_fsync = maintenance.os.fsync
+
+    def cancel_directory_fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise KeyboardInterrupt
+        real_fsync(fd)
+
+    monkeypatch.setattr(maintenance.os, "fsync", cancel_directory_fsync)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            maintenance.retire_recovery_barrier(exclusive, nonce)
+        assert _barrier_path(profile).exists()
+    finally:
+        exclusive.close()
+
+
+def test_recovery_barrier_close_failure_preserves_category_and_fd_custody(
+    tmp_path, monkeypatch
+):
+    profile = _profile(tmp_path)
+    nonce = _operation_nonce()
+    with maintenance.acquire_profile_state_exclusive(
+        profile, timeout_seconds=1.0
+    ) as exclusive:
+        maintenance.publish_recovery_barrier(exclusive, nonce)
+    barrier_inode = _barrier_path(profile).stat().st_ino
+    shared = maintenance.acquire_profile_state_shared(profile, timeout_seconds=1.0)
+    real_close = maintenance.os.close
+    reused_fds: list[int] = []
+    barrier_close_calls = 0
+
+    def close_then_reuse(fd: int) -> None:
+        nonlocal barrier_close_calls
+        try:
+            is_barrier = os.fstat(fd).st_ino == barrier_inode
+        except OSError:
+            is_barrier = False
+        real_close(fd)
+        if is_barrier:
+            barrier_close_calls += 1
+            reused_fd = os.open(os.devnull, os.O_RDONLY)
+            assert reused_fd == fd
+            reused_fds.append(reused_fd)
+            raise OSError(errno.EINTR, "synthetic ambiguous close")
+
+    monkeypatch.setattr(maintenance.os, "close", close_then_reuse)
+    try:
+        with pytest.raises(maintenance.ProfileStateRecoveryRequired):
+            maintenance.require_no_recovery_barrier(shared)
+    finally:
+        monkeypatch.setattr(maintenance.os, "close", real_close)
+        shared.close()
+    assert barrier_close_calls == 1
+    assert len(reused_fds) == 1
+    os.fstat(reused_fds[0])
+    real_close(reused_fds[0])
+
+    with maintenance.acquire_profile_state_exclusive(
+        profile, timeout_seconds=1.0
+    ) as exclusive:
+        maintenance.retire_recovery_barrier(exclusive, nonce)
+
+
+def test_barrier_publication_baseexception_releases_staged_descriptor(
+    tmp_path, monkeypatch
+):
+    profile = _profile(tmp_path)
+    exclusive = maintenance.acquire_profile_state_exclusive(
+        profile, timeout_seconds=1.0
+    )
+
+    def cancel_link(*_args, **_kwargs) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(maintenance.os, "link", cancel_link)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            maintenance.publish_recovery_barrier(exclusive, _operation_nonce())
+    finally:
+        exclusive.close()
+    assert not _barrier_path(profile).exists()
+    assert not any(
+        entry.name.startswith(maintenance._RECOVERY_BARRIER_STAGE_PREFIX)
+        for entry in profile.iterdir()
+    )
+
+
+def test_read_only_sessiondb_neither_creates_nor_retires_barrier_authority(tmp_path):
+    from hermes_state import SessionDB
+
+    profile = _profile(tmp_path)
+    state_path = profile / "state.db"
+    db = SessionDB(state_path)
+    db.set_meta("synthetic", "value")
+    db.close()
+    nonce = _operation_nonce()
+    with maintenance.acquire_profile_state_exclusive(
+        profile, timeout_seconds=1.0
+    ) as exclusive:
+        maintenance.publish_recovery_barrier(exclusive, nonce)
+    expected_payload = _barrier_path(profile).read_bytes()
+    recovery_entries = {
+        entry.name
+        for entry in profile.iterdir()
+        if entry.name.startswith(".hermes-state-recovery")
+    }
+
+    read_only = SessionDB(state_path, read_only=True)
+    try:
+        assert read_only.get_meta("synthetic") == "value"
+    finally:
+        read_only.close()
+
+    assert _barrier_path(profile).read_bytes() == expected_payload
+    assert {
+        entry.name
+        for entry in profile.iterdir()
+        if entry.name.startswith(".hermes-state-recovery")
+    } == recovery_entries
+    with maintenance.acquire_profile_state_exclusive(
+        profile, timeout_seconds=1.0
+    ) as exclusive:
+        maintenance.retire_recovery_barrier(exclusive, nonce)
+
+
+def test_multi_profile_acquisition_baseexception_releases_prior_lease(
+    tmp_path, monkeypatch
+):
+    first = _profile(tmp_path, "a-profile")
+    second = _profile(tmp_path, "b-profile")
+    real_acquire = maintenance.acquire_profile_state_shared
+    calls = 0
+
+    def cancel_second(profile_root: Path, *, timeout_seconds: float):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise KeyboardInterrupt
+        return real_acquire(profile_root, timeout_seconds=timeout_seconds)
+
+    monkeypatch.setattr(maintenance, "acquire_profile_state_shared", cancel_second)
+    with pytest.raises(KeyboardInterrupt):
+        with maintenance._profile_state_mutation_scope((second, first)):
+            raise AssertionError("scope must not be entered")
+    assert calls == 2
+
+    for profile in (first, second):
+        with maintenance.acquire_profile_state_exclusive(profile, timeout_seconds=0.1):
+            pass
 
 
 @pytest.mark.require_symlinks
@@ -844,6 +1068,71 @@ def test_multi_profile_mutation_scope_uses_canonical_resolved_path_order(
         pass
 
     assert acquired == [first_profile, aliased_second_profile]
+
+
+def test_ghost_prune_holds_one_lease_through_sidecar_removal(tmp_path, monkeypatch):
+    from hermes_state import SessionDB
+
+    profile = _profile(tmp_path)
+    sessions_dir = profile / "sessions"
+    sessions_dir.mkdir(mode=0o700)
+    sidecar = sessions_dir / "ghost.json"
+    _write_private_file(sidecar, b"{}")
+    db = SessionDB(profile / "state.db")
+    db.create_session("ghost", "tui")
+    db.end_session("ghost", "user_exit")
+    db._conn.execute("UPDATE sessions SET started_at = 0 WHERE id = 'ghost'")
+    db._conn.commit()
+
+    sidecar_phase = threading.Event()
+    allow_sidecar = threading.Event()
+    barrier_published = threading.Event()
+    allow_retirement = threading.Event()
+    errors: list[BaseException] = []
+    real_remove = db._remove_session_files
+
+    def paused_remove(path: Path, session_id: str) -> None:
+        sidecar_phase.set()
+        assert allow_sidecar.wait(timeout=5.0)
+        real_remove(path, session_id)
+
+    def prune() -> None:
+        try:
+            assert db.prune_empty_ghost_sessions(sessions_dir) == 1
+        except BaseException as exc:
+            errors.append(exc)
+
+    def maintain() -> None:
+        try:
+            with maintenance.acquire_profile_state_exclusive(
+                profile, timeout_seconds=5.0
+            ) as exclusive:
+                maintenance.publish_recovery_barrier(exclusive, _operation_nonce())
+                barrier_published.set()
+                assert allow_retirement.wait(timeout=5.0)
+                maintenance.retire_recovery_barrier(exclusive, _operation_nonce())
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(db, "_remove_session_files", paused_remove)
+    prune_thread = threading.Thread(target=prune)
+    maintenance_thread = threading.Thread(target=maintain)
+    prune_thread.start()
+    assert sidecar_phase.wait(timeout=5.0)
+    maintenance_thread.start()
+    published_before_sidecar_finished = barrier_published.wait(timeout=0.2)
+    allow_sidecar.set()
+    prune_thread.join(timeout=5.0)
+    assert not prune_thread.is_alive()
+    assert barrier_published.wait(timeout=5.0)
+    allow_retirement.set()
+    maintenance_thread.join(timeout=5.0)
+    assert not maintenance_thread.is_alive()
+    db.close()
+
+    assert not published_before_sidecar_finished
+    assert not errors
+    assert not sidecar.exists()
 
 
 @pytest.mark.parametrize("operation", ["drain", "recover"])

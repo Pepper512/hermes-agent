@@ -259,3 +259,159 @@ HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/test_session_maintenance_l
 
 Independent review remains required, and native Linux verification is the one
 platform gate still outstanding.
+
+---
+
+## Fix round 1 — 2026-09-01
+
+### Status and authority
+
+`DONE_WITH_CONCERNS` on Darwin after addressing every P2 and P3 in
+`task12-cleanup-task3-review.md`. This appendix supersedes the original
+retirement description above: successful retirement no longer performs a
+path-only unlink. Native Linux remains unavailable, so cross-platform
+completion is still intentionally not claimed.
+
+The controller resolved P2-1's frozen-audit mismatch by authorizing
+`SessionDB.prune_empty_ghost_sessions` as an audited Task 3 writer and
+authorizing the exact audit artifact/static test changes needed to freeze it.
+The complete frozen direct-writer file list remains:
+
+- `hermes_state.py`
+- `hermes_state_schema.py`
+- `hermes_state_search.py`
+- `agent/agent_init.py`
+- `agent/agent_runtime_helpers.py`
+- `gateway/platforms/api_server.py`
+- `gateway/session.py`
+- `gateway/shutdown_flush.py`
+- `run_agent.py`
+- `hermes_cli/backup.py`
+- `hermes_cli/doctor.py`
+- `hermes_cli/update_cmd.py`
+
+This round changed only the newly authorized ghost boundary/audit, the
+previously approved Task 3 barrier and writer files, and their exact existing
+tests/report. No dependency, live profile, network, external service,
+provider, push, merge, deployment, production cleanup, or Task 4 action was
+performed. Every behavioral test used synthetic temporary profiles.
+
+### Review-finding disposition
+
+1. **P2-1 — fixed.** `prune_empty_ghost_sessions` now owns one outer shared
+   profile lease from before selection/SQL through commit, every sidecar
+   removal, and sidecar-directory durability. The audit lists it as a direct
+   canonical file writer. Its AST gate now preserves any SessionDB method that
+   delegates SQL to `_execute_write` and then calls `_remove_session_files` as
+   an outer coordinator, preventing the same post-callback lease gap from
+   collapsing into `_execute_write` again. A deterministic two-thread test
+   proves an exclusive maintainer cannot publish during the sidecar phase.
+2. **P2-2 — fixed.** Retirement atomically moves the fixed descriptor-relative
+   barrier name to a random retired name with Darwin `renameatx_np(...,
+   RENAME_EXCL)` or Linux `renameat2(..., RENAME_NOREPLACE)`. It proves the
+   moved name is the exact held inode, proves the fixed name absent, fsyncs the
+   held profile directory, and repeats both proofs. It never path-unlinks the
+   retired object. Ambiguity, ordinary durability failure, or cancellation
+   after the move conservatively republishes the fixed nonce-bound blocker.
+   The small closed-schema retired record intentionally remains as quarantine;
+   deleting it safely is not smuggled-in Task 4 cleanup logic.
+3. **P2-3 — fixed.** Ordinary `Exception` handling once again logs,
+   preserves the spool file, and continues. The later `BaseException` branch
+   closes an owned database and re-raises cancellation/interrupt. A focused
+   transient-append test locks the REQ-M13 behavior while the existing
+   `KeyboardInterrupt` test locks cancellation custody.
+4. **P2-4 — fixed.** Session deletion APIs authorize only
+   `self.db_path.parent`. A supplied sidecar sink must be the exact lexical
+   `profile/sessions` Path and, when present, a no-follow directory rather than
+   an alias or replacement symlink. Unrelated-profile, alias-spelling, and
+   replaced-canonical-sink tests prove the row and sidecar both remain on
+   refusal. No second profile, environment fallback, current-directory
+   fallback, or weakened profile validation was introduced.
+5. **P2-5 — fixed.** Zeroed-database quarantine fsyncs the database parent
+   after the complete database/WAL/SHM rename set and before releasing the
+   shared lease. Directory-fsync failure is the fixed `unsafe_profile_state`
+   category and preserves the moved evidence.
+6. **P3-1 — fixed.** Barrier descriptor custody is centralized in a one-shot
+   close helper. `EINTR` is never retried, so a reused descriptor cannot be
+   closed, and close failure cannot replace the already selected categorical
+   result.
+7. **P3-2 — fixed.** Focused tests now cover read-only construction/read/close
+   without barrier authority, retirement directory-fsync failure and
+   republish, publication and retirement `BaseException`, multi-root
+   acquisition cancellation/reverse release, held-inode quarantine identity,
+   and close-time descriptor reuse.
+
+### Calibrated RED-to-GREEN record
+
+- Ghost audit/span RED: `2 failed` (outer coordinator collapsed to
+  `_execute_write`; exclusive publication entered the sidecar gap). GREEN:
+  `2 passed`.
+- Barrier review RED: seven new tests produced the expected `3 failed, 4
+  passed`; the failures were the final replacement window, cancellation after
+  retirement, and raw close error. GREEN with the existing exact-nonce test:
+  `8 passed`.
+- Spool compatibility RED: ordinary append failure escaped while the existing
+  cancellation test passed (`1 failed, 1 passed`). GREEN: `2 passed`.
+- Same-profile authority RED: all three unrelated/alias/replacement cases
+  deleted without refusal (`3 failed`). GREEN plus the adjusted canonical
+  writer tests and ghost span: `6 passed`.
+- Quarantine durability RED: success made no directory-fsync call and injected
+  failure did not raise (`2 failed`). GREEN: `2 passed`.
+
+No failed test was deleted, weakened, skipped, xfailed, or given a retry.
+`HERMES_TEST_FILE_RETRIES=0` was used for the parallel matrices.
+
+### Final verification evidence
+
+- Final integrated focused/audit gate: `112 passed` across
+  `tests/test_session_maintenance_lock.py`,
+  `tests/test_profile_mutation_boundary_audit.py`,
+  `tests/gateway/test_shutdown_flush.py`, and
+  `tests/test_zeroed_state_db.py`.
+- Exact maintenance/static parallel gate: `100 passed` (`94` maintenance,
+  including cross-process same/unrelated-profile stress; `6` frozen audit).
+- Gateway writer matrix: `113 passed` across seven exact files.
+- State/repair/FTS matrix: `458 passed, 1 failed` across twenty files. The sole
+  failure is the unchanged read-only FTS context trace baseline already named
+  in the original report.
+- Agent/request/snapshot matrix: `434 passed, 1 failed`; the sole failure is
+  the unchanged missing optional `anthropic` dependency baseline, with the
+  separately known `_BarrierDB.flush_token_counts` warning. No dependency was
+  installed.
+- Backup/doctor/focused-update files: `214 passed, 1 skipped`. An additional
+  broad `tests/hermes_cli/test_cmd_update.py` characterization produced `31
+  passed, 8 failed`; those unrelated updater fixture/fleet failures do not
+  exercise this diff and were neither fixed nor hidden.
+- Canonical deletion compatibility: `24 passed` across empty-session hygiene
+  and lifecycle status. A sequential mixed-file characterization exposed one
+  pre-existing HERMES_HOME test-order leak; the exact per-file parallel gateway
+  matrix above passed `113/113` under clean environments.
+- Ruff lint, `compileall`, `ty check hermes_state_maintenance.py`, focused Ruff
+  format, and `git diff --check`: pass.
+- Dependency-manifest/lock delta: empty. Added-line credential, PHI,
+  prohibited-output, deleted-test, skip, xfail, and retry scans: no finding.
+- No repository-local Semgrep rule set exists; registry rules would require
+  prohibited network access, so no registry scan was run. The frozen AST audit
+  and local diff scans passed.
+
+### Native Linux gate still unrun
+
+`uname -s` is Darwin. Run exactly this command on native Linux with zero
+retries before claiming cross-platform completion:
+
+```sh
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/test_session_maintenance_lock.py tests/test_profile_mutation_boundary_audit.py -q
+```
+
+### Final security/control review
+
+This remains high-risk crash-recovery/data-integrity work under the approved
+spec, STRIDE pass, and rollback plan; no new ADR decision was made. Exact
+lease typing/liveness, fixed-schema nonce validation, no-follow descriptor
+authority, atomic no-replace publication/retirement, before/after inode proof,
+directory durability, fixed path-free categories, same-profile sidecar
+binding, reverse lease release, synthetic owner-only profiles, and static
+writer coverage are satisfied. Authz/RLS are not request boundaries in this
+local coordination layer; input/path validation and secret handling are
+satisfied. No dependency or secret was added. Native Linux evidence and
+independent re-review remain the only completion concerns.

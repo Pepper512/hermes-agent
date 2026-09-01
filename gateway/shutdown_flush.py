@@ -424,16 +424,16 @@ def recover_pending_to_db(
             )
             recovered += 1
             path.unlink(missing_ok=True)
-        except BaseException:
-            # Shutdown cancellation/interrupt must not strand an owned DB.
-            _close_owned_db()
-            raise
         except Exception as exc:
             logger.warning(
                 "Failed to recover pending message from %s: %s",
                 path, exc,
             )
             # Leave the file for next startup retry.
+        except BaseException:
+            # Shutdown cancellation/interrupt must not strand an owned DB.
+            _close_owned_db()
+            raise
 
     _close_owned_db()
 

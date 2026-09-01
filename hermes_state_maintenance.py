@@ -8,6 +8,7 @@ receive an opaque shared or exclusive lease, or a fixed categorical error.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import ctypes
 import errno
 from functools import wraps
 import math
@@ -33,6 +34,7 @@ _LOCK_RECORD_LIMIT = 160
 _LOCK_POLL_SECONDS = 0.01
 _RECOVERY_BARRIER_NAME = ".hermes-state-recovery.barrier"
 _RECOVERY_BARRIER_STAGE_PREFIX = ".hermes-state-recovery.stage."
+_RECOVERY_BARRIER_RETIRED_PREFIX = ".hermes-state-recovery.retired."
 _RECOVERY_BARRIER_RECORD_PREFIX = b"HERMES_STATE_RECOVERY_BARRIER_V1\n"
 _RECOVERY_BARRIER_NONCE_BYTES = 64
 _RECOVERY_BARRIER_RECORD_SIZE = (
@@ -628,6 +630,106 @@ def _open_recovery_barrier(profile_fd: int) -> int:
     return os.open(_RECOVERY_BARRIER_NAME, flags, dir_fd=profile_fd)
 
 
+def _close_fd_once(fd: int) -> None:
+    """Relinquish descriptor custody once without retrying an ambiguous close."""
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _rename_barrier_no_replace(
+    profile_fd: int,
+    source: str,
+    destination: str,
+) -> None:
+    """Atomically rename one anchored name without replacing its destination."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    if sys.platform == "darwin":
+        try:
+            rename = libc.renameatx_np
+        except AttributeError:
+            raise ProfileStateMaintenanceUnsupported from None
+        rename.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        rename.restype = ctypes.c_int
+        result = rename(
+            profile_fd,
+            source_bytes,
+            profile_fd,
+            destination_bytes,
+            0x00000004,  # RENAME_EXCL
+        )
+    elif sys.platform.startswith("linux"):
+        try:
+            rename = libc.renameat2
+        except AttributeError:
+            raise ProfileStateMaintenanceUnsupported from None
+        rename.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        rename.restype = ctypes.c_int
+        result = rename(
+            profile_fd,
+            source_bytes,
+            profile_fd,
+            destination_bytes,
+            1,  # RENAME_NOREPLACE
+        )
+    else:
+        raise ProfileStateMaintenanceUnsupported
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def _validate_retired_barrier(
+    profile_fd: int,
+    barrier_fd: int,
+    identity: tuple[int, ...],
+    retired_name: str,
+) -> None:
+    """Prove the held barrier moved to quarantine and the fixed name is absent."""
+    try:
+        held = os.fstat(barrier_fd)
+        retired = os.stat(
+            retired_name,
+            dir_fd=profile_fd,
+            follow_symlinks=False,
+        )
+        try:
+            os.stat(
+                _RECOVERY_BARRIER_NAME,
+                dir_fd=profile_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            fixed_name_absent = True
+        else:
+            fixed_name_absent = False
+    except OSError:
+        raise UnsafeRecoveryBarrier from None
+    if (
+        not fixed_name_absent
+        or not _valid_barrier_stat(held)
+        or not _valid_barrier_stat(retired)
+        or _barrier_identity(held) != identity
+        or _barrier_identity(retired) != identity
+    ):
+        raise UnsafeRecoveryBarrier
+
+
 def _read_recovery_barrier(
     profile_fd: int,
 ) -> tuple[int, tuple[int, ...], str] | None:
@@ -666,16 +768,13 @@ def _read_recovery_barrier(
             raise UnsafeRecoveryBarrier
         return barrier_fd, identity, nonce
     except ProfileStateMaintenanceError:
-        os.close(barrier_fd)
+        _close_fd_once(barrier_fd)
         raise
     except (OSError, TypeError, ValueError, OverflowError):
-        try:
-            os.close(barrier_fd)
-        except OSError:
-            pass
+        _close_fd_once(barrier_fd)
         raise UnsafeRecoveryBarrier from None
     except BaseException:
-        os.close(barrier_fd)
+        _close_fd_once(barrier_fd)
         raise
 
 
@@ -714,7 +813,7 @@ def _stage_recovery_barrier(profile_fd: int, payload: bytes) -> tuple[int, str]:
             os.fsync(stage_fd)
             return stage_fd, stage_name
         except BaseException:
-            os.close(stage_fd)
+            _close_fd_once(stage_fd)
             try:
                 os.unlink(stage_name, dir_fd=profile_fd)
             except OSError:
@@ -734,7 +833,7 @@ def publish_recovery_barrier(
         existing = _read_recovery_barrier(profile_fd)
         if existing is not None:
             existing_fd, _identity, _nonce = existing
-            os.close(existing_fd)
+            _close_fd_once(existing_fd)
             raise ProfileStateRecoveryRequired
         stage_fd = -1
         stage_name = ""
@@ -756,7 +855,7 @@ def publish_recovery_barrier(
             if barrier is None:
                 raise UnsafeRecoveryBarrier
             barrier_fd, _identity, nonce = barrier
-            os.close(barrier_fd)
+            _close_fd_once(barrier_fd)
             if nonce != operation_nonce:
                 raise UnsafeRecoveryBarrier
         except ProfileStateMaintenanceError:
@@ -765,10 +864,7 @@ def publish_recovery_barrier(
             raise UnsafeRecoveryBarrier from None
         finally:
             if stage_fd >= 0:
-                try:
-                    os.close(stage_fd)
-                except OSError:
-                    pass
+                _close_fd_once(stage_fd)
             if stage_name:
                 try:
                     os.unlink(stage_name, dir_fd=profile_fd)
@@ -786,7 +882,7 @@ def require_no_recovery_barrier(lease: SharedStateLease) -> None:
         if barrier is None:
             return
         barrier_fd, _identity, _nonce = barrier
-        os.close(barrier_fd)
+        _close_fd_once(barrier_fd)
         raise ProfileStateRecoveryRequired
 
 
@@ -815,10 +911,7 @@ def _republish_barrier_after_failed_retirement(
         pass
     finally:
         if stage_fd >= 0:
-            try:
-                os.close(stage_fd)
-            except OSError:
-                pass
+            _close_fd_once(stage_fd)
         if stage_name:
             try:
                 os.unlink(stage_name, dir_fd=profile_fd)
@@ -838,32 +931,47 @@ def retire_recovery_barrier(
         if barrier is None:
             raise UnsafeRecoveryBarrier
         barrier_fd, identity, nonce = barrier
-        removed = False
+        moved = False
         try:
             if nonce != operation_nonce:
                 raise UnsafeRecoveryBarrier
-            held = os.fstat(barrier_fd)
-            named = os.stat(
+            retired_name = _RECOVERY_BARRIER_RETIRED_PREFIX + secrets.token_hex(16)
+            _rename_barrier_no_replace(
+                profile_fd,
                 _RECOVERY_BARRIER_NAME,
-                dir_fd=profile_fd,
-                follow_symlinks=False,
+                retired_name,
             )
-            if (
-                _barrier_identity(held) != identity
-                or _barrier_identity(named) != identity
-            ):
-                raise UnsafeRecoveryBarrier
-            os.unlink(_RECOVERY_BARRIER_NAME, dir_fd=profile_fd)
-            removed = True
+            moved = True
+            _validate_retired_barrier(
+                profile_fd,
+                barrier_fd,
+                identity,
+                retired_name,
+            )
             os.fsync(profile_fd)
+            _validate_retired_barrier(
+                profile_fd,
+                barrier_fd,
+                identity,
+                retired_name,
+            )
         except ProfileStateMaintenanceError:
+            if moved:
+                _republish_barrier_after_failed_retirement(profile_fd, payload)
             raise
         except (OSError, TypeError, ValueError, OverflowError):
-            if removed:
+            if moved:
                 _republish_barrier_after_failed_retirement(profile_fd, payload)
             raise UnsafeRecoveryBarrier from None
+        except BaseException:
+            if moved:
+                try:
+                    _republish_barrier_after_failed_retirement(profile_fd, payload)
+                except BaseException:
+                    pass
+            raise
         finally:
-            os.close(barrier_fd)
+            _close_fd_once(barrier_fd)
 
 
 @contextmanager

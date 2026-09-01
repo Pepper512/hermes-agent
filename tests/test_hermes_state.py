@@ -12,6 +12,7 @@ import pytest
 import hermes_state
 from agent.session_activity import ActivityProvenance
 from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
+from hermes_state_maintenance import UnsafeProfileState
 
 
 class _NoFtsCursor(sqlite3.Cursor):
@@ -1044,6 +1045,55 @@ class TestDeleteAndExport:
         assert db.get_session("s1") is None
         assert db.message_count(session_id="s1") == 0
 
+    def test_delete_rejects_unrelated_profile_sidecar_authority(self, db, tmp_path):
+        db.create_session(session_id="same-name", source="cli")
+        unrelated_profile = tmp_path / "unrelated-profile"
+        unrelated_profile.mkdir(mode=0o700)
+        unrelated_sessions = unrelated_profile / "sessions"
+        unrelated_sessions.mkdir(mode=0o700)
+        sidecar = unrelated_sessions / "same-name.json"
+        sidecar.write_text("{}", encoding="utf-8")
+
+        with pytest.raises(UnsafeProfileState):
+            db.delete_session("same-name", sessions_dir=unrelated_sessions)
+
+        assert db.get_session("same-name") is not None
+        assert sidecar.exists()
+
+    @pytest.mark.require_symlinks
+    def test_delete_rejects_alias_spelling_for_canonical_sessions_sink(
+        self, db, tmp_path
+    ):
+        db.create_session(session_id="same-name", source="cli")
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir(mode=0o700)
+        sidecar = sessions_dir / "same-name.json"
+        sidecar.write_text("{}", encoding="utf-8")
+        alias = tmp_path / "sessions-alias"
+        alias.symlink_to(sessions_dir.name, target_is_directory=True)
+
+        with pytest.raises(UnsafeProfileState):
+            db.delete_session("same-name", sessions_dir=alias)
+
+        assert db.get_session("same-name") is not None
+        assert sidecar.exists()
+
+    @pytest.mark.require_symlinks
+    def test_delete_rejects_replaced_canonical_sessions_sink(self, db, tmp_path):
+        db.create_session(session_id="same-name", source="cli")
+        unrelated_sessions = tmp_path / "unrelated" / "sessions"
+        unrelated_sessions.mkdir(parents=True, mode=0o700)
+        sidecar = unrelated_sessions / "same-name.json"
+        sidecar.write_text("{}", encoding="utf-8")
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.symlink_to(unrelated_sessions, target_is_directory=True)
+
+        with pytest.raises(UnsafeProfileState):
+            db.delete_session("same-name", sessions_dir=sessions_dir)
+
+        assert db.get_session("same-name") is not None
+        assert sidecar.exists()
+
 
 
 
@@ -1409,13 +1459,15 @@ class TestBulkDeleteSessions:
         bulk-delete CLI / web flows don't leak files."""
         db.create_session(session_id="s1", source="cli")
         db.create_session(session_id="s2", source="cli")
-        (tmp_path / "s1.jsonl").write_text("")
-        (tmp_path / "s2.json").write_text("{}")
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir(mode=0o700)
+        (sessions_dir / "s1.jsonl").write_text("")
+        (sessions_dir / "s2.json").write_text("{}")
 
-        deleted = db.delete_sessions(["s1", "s2"], sessions_dir=tmp_path)
+        deleted = db.delete_sessions(["s1", "s2"], sessions_dir=sessions_dir)
         assert deleted == 2
-        assert not (tmp_path / "s1.jsonl").exists()
-        assert not (tmp_path / "s2.json").exists()
+        assert not (sessions_dir / "s1.jsonl").exists()
+        assert not (sessions_dir / "s2.json").exists()
 
 
 class TestDeleteEmptySessions:
@@ -1472,12 +1524,14 @@ class TestDeleteEmptySessions:
         db.create_session(session_id="empty_with_dump", source="cli")
         db.end_session("empty_with_dump", end_reason="done")
 
-        dump = tmp_path / "request_dump_empty_with_dump_0.json"
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir(mode=0o700)
+        dump = sessions_dir / "request_dump_empty_with_dump_0.json"
         dump.write_text("{}")
-        transcript = tmp_path / "empty_with_dump.jsonl"
+        transcript = sessions_dir / "empty_with_dump.jsonl"
         transcript.write_text("")
 
-        deleted = db.delete_empty_sessions(sessions_dir=tmp_path)
+        deleted = db.delete_empty_sessions(sessions_dir=sessions_dir)
         assert deleted == 1
         assert not dump.exists()
         assert not transcript.exists()
