@@ -95,6 +95,16 @@ def generate_and_seal(
         acknowledgement = adapter.generate(request, stage.sink)
         adapter.finish_owned_work()
         return stage.seal(acknowledgement)
+    except asyncio.CancelledError:
+        try:
+            try:
+                adapter.stop_owned_work()
+            except BaseException:
+                pass
+            stage.scrub_and_close()
+        except BaseException:
+            raise ProviderLifecycleError(_SCRUB_ERROR) from None
+        raise
     except BaseException:
         try:
             try:

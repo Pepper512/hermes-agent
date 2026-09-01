@@ -305,19 +305,30 @@ def _configure_tts(monkeypatch, home: Path, outcome: str):
     monkeypatch.setattr(tts_tool, "_get_provider", lambda _cfg: "edge")
     monkeypatch.setattr(tts_tool, "_resolve_max_text_length", lambda *_a: 10000)
 
-    monkeypatch.setattr(tts_tool, "_import_edge_tts", lambda: object())
+    class SinkAdapter:
+        def generate(self, _request, sink):
+            sink_fd = int(Path(sink.path).name)
+            os.write(
+                sink_fd,
+                b"ID3\x04\x00\x00\x00\x00\x00\x00private-audio-bytes",
+            )
+            if outcome == "error":
+                raise RuntimeError("private provider failure")
+            if outcome == "cancel":
+                raise asyncio.CancelledError()
+            return sink.path
 
-    async def synth(text, output_path, _config):
-        del text
-        path = Path(output_path)
-        path.write_bytes(b"private-audio-bytes")
-        if outcome == "error":
-            raise RuntimeError(f"private failure {path}")
-        if outcome == "cancel":
-            raise asyncio.CancelledError()
-        return str(path)
+        def finish_owned_work(self):
+            return None
 
-    monkeypatch.setattr(tts_tool, "_generate_edge_tts", synth)
+        def stop_owned_work(self):
+            return None
+
+    monkeypatch.setattr(
+        tts_tool,
+        "_anonymous_adapter_for_provider",
+        lambda *_args, **_kwargs: SinkAdapter(),
+    )
     return tts_tool
 
 
@@ -353,14 +364,26 @@ def test_ephemeral_tts_internal_materializer_cannot_write_requested_path(
 
     requested = tmp_path / ".hermes" / "audio" / "private.mp3"
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
-    monkeypatch.setattr(tts_tool, "_import_edge_tts", lambda: object())
 
-    async def generate(_text, output_path, _config):
-        path = Path(output_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"private-internal-audio")
+    class SinkAdapter:
+        def generate(self, _request, sink):
+            os.write(
+                int(Path(sink.path).name),
+                b"ID3\x04\x00\x00\x00\x00\x00\x00private-internal-audio",
+            )
+            return sink.path
 
-    monkeypatch.setattr(tts_tool, "_generate_edge_tts", generate)
+        def finish_owned_work(self):
+            return None
+
+        def stop_owned_work(self):
+            return None
+
+    monkeypatch.setattr(
+        tts_tool,
+        "_anonymous_adapter_for_provider",
+        lambda *_args, **_kwargs: SinkAdapter(),
+    )
     with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
         result = json.loads(
             tts_tool._text_to_speech_single(

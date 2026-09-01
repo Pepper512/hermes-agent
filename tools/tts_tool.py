@@ -4121,6 +4121,73 @@ def _anonymous_output_format(
     return "mp3"
 
 
+class _TTSDestinationError(ValueError):
+    """Fixed path-free durable destination preflight failure."""
+
+
+def _ensure_tts_destination_allowed(destination: Path) -> None:
+    from agent.file_safety import is_write_approval_required, is_write_denied
+
+    try:
+        denied = is_write_denied(str(destination))
+        approval_required = is_write_approval_required(str(destination))
+    except (OSError, TypeError, ValueError):
+        raise _TTSDestinationError("TTS destination is invalid") from None
+    if denied or approval_required:
+        raise _TTSDestinationError(
+            "TTS destination targets a protected credential or system location"
+        )
+
+
+def _preflight_tts_destination(
+    output_path: object,
+    provider: str,
+    tts_config: Dict[str, Any],
+    *,
+    timestamp_format: str,
+) -> tuple[Path | None, str]:
+    """Select policy before inspecting a caller-controlled destination."""
+    from hermes_cli.persistence import PersistencePolicy, current_persistence_policy
+
+    output_format = _anonymous_output_format(provider, tts_config)
+    if current_persistence_policy() is PersistencePolicy.EPHEMERAL:
+        return None, output_format
+
+    command_config = _resolve_command_provider_config(provider, tts_config)
+    if output_path is None:
+        destination = Path(DEFAULT_OUTPUT_DIR) / (
+            "tts_" + datetime.datetime.now().strftime(timestamp_format)
+            + f".{output_format}"
+        )
+    else:
+        if type(output_path) is not str or not output_path or "\x00" in output_path:
+            raise _TTSDestinationError("TTS destination is invalid")
+        from tools.path_security import has_traversal_component
+
+        if has_traversal_component(output_path):
+            raise _TTSDestinationError(
+                "TTS destination contains a traversal component"
+            )
+        destination = Path(output_path).expanduser()
+        _ensure_tts_destination_allowed(destination)
+        requested_format = destination.suffix.lower().lstrip(".")
+        if (
+            requested_format not in COMMAND_TTS_OUTPUT_FORMATS
+            or destination.name in {"", ".", ".."}
+        ):
+            raise _TTSDestinationError("TTS destination is invalid")
+        if command_config is not None:
+            destination = _configured_command_tts_output_path(
+                destination, command_config
+            )
+            output_format = _get_command_tts_output_format(command_config)
+        else:
+            output_format = requested_format
+
+    _ensure_tts_destination_allowed(destination)
+    return destination, output_format
+
+
 def _anonymous_voice_compatible(provider: str, tts_config: Dict[str, Any]) -> bool:
     command_config = _resolve_command_provider_config(provider, tts_config)
     if command_config is not None:
@@ -4136,6 +4203,7 @@ def _generate_anonymous_tts(
     speed: Optional[float],
     instructions: Optional[str],
     aggregate_cap: int,
+    output_format: str | None = None,
     durable_consumer: Optional[Callable[[Any], Any]] = None,
 ):
     """GENERATE and SEAL every chunk, then perform exactly one decision."""
@@ -4143,7 +4211,8 @@ def _generate_anonymous_tts(
     from tools.tts_staging import AnonymousAudioStage
     from tools.tts_transaction import TTSTransaction
 
-    output_format = _anonymous_output_format(provider, tts_config)
+    if output_format is None:
+        output_format = _anonymous_output_format(provider, tts_config)
     adapter = _anonymous_adapter_for_provider(provider, tts_config)
     provider_config = tts_config.get(provider)
     if not isinstance(provider_config, dict):
@@ -4218,18 +4287,18 @@ def _text_to_speech_single(
     try:
         tts_config = dict(tts_config_override or _load_tts_config())
         selected = provider.lower().strip() if provider else _get_provider(tts_config)
-        output_format = _anonymous_output_format(selected, tts_config)
-        if output_path:
-            destination = Path(output_path).expanduser()
-        else:
-            destination = Path(DEFAULT_OUTPUT_DIR) / (
-                "tts_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                + f".{output_format}"
-            )
+        destination, output_format = _preflight_tts_destination(
+            output_path,
+            selected,
+            tts_config,
+            timestamp_format="%Y%m%d_%H%M%S_%f",
+        )
 
         def publish_one(permit: Any):
             from tools.tts_publish import publish_durable
 
+            if destination is None:
+                raise ValueError("tts_generation_failed")
             destination.parent.mkdir(parents=True, exist_ok=True)
             return publish_durable(permit, destination)
 
@@ -4240,6 +4309,7 @@ def _text_to_speech_single(
             speed=speed,
             instructions=instructions,
             aggregate_cap=_EPHEMERAL_TTS_MAX_BYTES,
+            output_format=output_format,
             durable_consumer=publish_one,
         )
         from tools.tts_transaction import EphemeralDelivery
@@ -4255,6 +4325,10 @@ def _text_to_speech_single(
             "provider": selected,
             "voice_compatible": False,
         }, ensure_ascii=False)
+    except _TTSDestinationError as exc:
+        return tool_error(str(exc), success=False)
+    except asyncio.CancelledError:
+        raise
     except BaseException:
         return tool_error("TTS generation failed", success=False)
 
@@ -4284,36 +4358,12 @@ def text_to_speech_tool(
             tts_config = dict(tts_config)
             tts_config["speed"] = max(0.25, min(4.0, float(speed)))
         selected = provider.lower().strip() if provider else _get_provider(tts_config)
-        validated_output_path: Path | None = None
-        if output_path:
-            from agent.file_safety import is_write_approval_required, is_write_denied
-            from tools.path_security import has_traversal_component
-
-            if has_traversal_component(output_path):
-                return json.dumps({
-                    "success": False,
-                    "error": (
-                        f"output_path contains '..' traversal component: {output_path}. "
-                        "Use an absolute path or one relative to the current directory "
-                        "without '..'."
-                    ),
-                }, ensure_ascii=False)
-            validated_output_path = Path(output_path).expanduser()
-            command_config = _resolve_command_provider_config(selected, tts_config)
-            if command_config is not None:
-                validated_output_path = _configured_command_tts_output_path(
-                    validated_output_path, command_config
-                )
-            if is_write_denied(str(validated_output_path)) or is_write_approval_required(
-                str(validated_output_path)
-            ):
-                return json.dumps({
-                    "success": False,
-                    "error": (
-                        "output_path targets a protected credential or system path: "
-                        f"{validated_output_path}. Choose a normal audio output location."
-                    ),
-                }, ensure_ascii=False)
+        validated_output_path, output_format = _preflight_tts_destination(
+            output_path,
+            selected,
+            tts_config,
+            timestamp_format="%Y%m%d_%H%M%S_%f",
+        )
         chunks = _split_text_for_tts(
             normalized, _resolve_max_text_length(selected, tts_config)
         )
@@ -4324,15 +4374,10 @@ def text_to_speech_tool(
 
         platform_name = get_session_env("HERMES_SESSION_PLATFORM", "").lower()
         delivery_profile = _resolve_audio_delivery_profile(platform_name, tts_config)
-        output_format = _anonymous_output_format(selected, tts_config)
-        if validated_output_path is not None:
-            base_path = validated_output_path
-        else:
-            base_path = Path(DEFAULT_OUTPUT_DIR) / (
-                "tts_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                + f".{output_format}"
-            )
-        if len(chunks) == 1:
+        base_path = validated_output_path
+        if base_path is None:
+            destinations: tuple[Path, ...] = ()
+        elif len(chunks) == 1:
             destinations = (base_path,)
         else:
             destinations = tuple(
@@ -4343,10 +4388,9 @@ def text_to_speech_tool(
             )
 
         def publish_all(permit: Any):
-            from tools.path_security import has_traversal_component
             from tools.tts_publish import publish_durable_many
 
-            if output_path and has_traversal_component(output_path):
+            if base_path is None:
                 raise ValueError("tts_generation_failed")
             base_path.parent.mkdir(parents=True, exist_ok=True)
             return publish_durable_many(permit, destinations)
@@ -4360,6 +4404,7 @@ def text_to_speech_tool(
             aggregate_cap=min(
                 _EPHEMERAL_TTS_MAX_BYTES, delivery_profile.max_file_bytes
             ),
+            output_format=output_format,
             durable_consumer=publish_all,
         )
 
@@ -4368,6 +4413,8 @@ def text_to_speech_tool(
         if type(decision) is EphemeralDelivery:
             return _ephemeral_tts_result(decision.chunks, selected, public=True)
 
+        if base_path is None:
+            raise ValueError("tts_generation_failed")
         encoded_paths = [str(item.path) for item in decision]
         voice_compatible = _anonymous_voice_compatible(selected, tts_config)
         if platform_name in OPUS_VOICE_PLATFORMS and (
@@ -4403,6 +4450,10 @@ def text_to_speech_tool(
                 "target_file_bytes": delivery_profile.target_file_bytes,
             },
         }, ensure_ascii=False)
+    except _TTSDestinationError as exc:
+        return tool_error(str(exc), success=False)
+    except asyncio.CancelledError:
+        raise
     except BaseException:
         return tool_error("TTS generation failed", success=False)
 

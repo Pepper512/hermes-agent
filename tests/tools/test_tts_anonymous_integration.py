@@ -207,3 +207,95 @@ def test_public_durable_all_chunks_seal_before_first_publish(
         )
     assert result["success"] is True, result
     assert observed_counts == [2]
+
+
+class _ForeignDestination:
+    """A caller-controlled object that must never be coerced or inspected."""
+
+    def __bool__(self):
+        raise AssertionError("foreign destination truthiness was inspected")
+
+    def __fspath__(self):
+        raise AssertionError("foreign destination path protocol was inspected")
+
+    def __str__(self):
+        raise AssertionError("foreign destination string form was inspected")
+
+
+@pytest.mark.parametrize("entry", ["single", "public"])
+@pytest.mark.parametrize("policy", [PersistencePolicy.DURABLE, PersistencePolicy.EPHEMERAL])
+@pytest.mark.parametrize(
+    "destination_kind",
+    ["traversal", "protected", "nul", "foreign", "invalid-extension"],
+)
+def test_destination_preflight_is_policy_first_and_provider_free_when_durable_invalid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+    policy: PersistencePolicy,
+    destination_kind: str,
+) -> None:
+    from tools import tts_tool
+    import agent.file_safety as file_safety
+
+    provider_paths: list[str] = []
+    adapter_resolutions: list[str] = []
+    adapter = RecordingAdapter(provider_paths)
+
+    def resolve_adapter(*_args, **_kwargs):
+        adapter_resolutions.append("resolved")
+        return adapter
+
+    monkeypatch.setattr(tts_tool, "_anonymous_adapter_for_provider", resolve_adapter)
+    monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: {"provider": "edge"})
+    monkeypatch.setattr(file_safety, "is_write_approval_required", lambda _path: False)
+    monkeypatch.setattr(
+        file_safety,
+        "is_write_denied",
+        lambda path: destination_kind == "protected" and "private-token" in path,
+    )
+
+    marker = f"private-destination-{destination_kind}"
+    if destination_kind == "traversal":
+        destination = str(tmp_path / marker / ".." / "voice.mp3")
+    elif destination_kind == "protected":
+        destination = str(tmp_path / f"{marker}-private-token.mp3")
+    elif destination_kind == "nul":
+        destination = str(tmp_path / marker) + "\x00.mp3"
+    elif destination_kind == "foreign":
+        destination = _ForeignDestination()
+    else:
+        destination = str(tmp_path / f"{marker}.txt")
+
+    with bind_persistence_policy(policy):
+        rendered = (
+            tts_tool._text_to_speech_single(
+                "private speech", destination, provider="edge"
+            )
+            if entry == "single"
+            else tts_tool.text_to_speech_tool(
+                "private speech", destination, provider="edge"
+            )
+        )
+
+    result = json.loads(rendered)
+    if policy is PersistencePolicy.EPHEMERAL:
+        assert result["success"] is True, result
+        assert "file_path" not in result
+        assert "MEDIA:" not in rendered
+        assert provider_paths and all(
+            path.startswith(("/dev/fd/", "/proc/self/fd/"))
+            for path in provider_paths
+        )
+        assert adapter_resolutions == ["resolved"]
+    else:
+        expected_error = {
+            "traversal": "TTS destination contains a traversal component",
+            "protected": (
+                "TTS destination targets a protected credential or system location"
+            ),
+        }.get(destination_kind, "TTS destination is invalid")
+        assert result == {"success": False, "error": expected_error}
+        assert provider_paths == []
+        assert adapter_resolutions == []
+        assert marker not in rendered

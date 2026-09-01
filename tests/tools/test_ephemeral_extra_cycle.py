@@ -15,6 +15,13 @@ import pytest
 from hermes_cli.persistence import PersistencePolicy, bind_persistence_policy
 
 
+VALID_MP3 = b"ID3\x04\x00\x00\x00\x00\x00\x00private-audio"
+
+
+def _sink_fd(sink) -> int:
+    return int(Path(sink.path).name)
+
+
 def _invoke(execution: str, call):
     if execution == "direct":
         return call()
@@ -124,14 +131,11 @@ def test_ephemeral_browser_exec_rejects_before_unowned_runtime_or_screenshot(
 def _patch_edge_writer(monkeypatch):
     from tools import tts_tool
 
-    monkeypatch.setattr(tts_tool, "_import_edge_tts", lambda: object())
+    async def generate(_text, sink_path, _config, **_kwargs):
+        os.write(int(Path(sink_path).name), VALID_MP3)
+        return sink_path
 
-    async def generate(_text, output_path, _config):
-        path = Path(output_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"private-audio")
-
-    monkeypatch.setattr(tts_tool, "_generate_edge_tts", generate)
+    monkeypatch.setattr(tts_tool, "_generate_edge_tts_to_sink", generate)
     return tts_tool
 
 
@@ -182,37 +186,43 @@ def _invoke_plugin_candidate(monkeypatch, tmp_path: Path, mode: str):
     monkeypatch.setattr(tts_tool, "_resolve_command_provider_config", lambda *_a: None)
     monkeypatch.setattr(tts_tool, "_plugin_provider_is_voice_compatible", lambda _p: False)
 
-    def provider(_text, output_path, _provider, _config):
-        requested = Path(output_path)
-        observed["requested"] = requested
-        if mode == "in_root":
-            requested.write_bytes(b"private-in-root-audio")
-            return str(requested)
-        if mode == "out_of_root":
-            return str(external)
-        if mode == "symlink":
-            requested.unlink()
-            requested.symlink_to(external)
-            observed["unowned"] = requested
-            return str(requested)
-        if mode == "hardlink":
-            requested.unlink()
-            os.link(external, requested)
-            observed["unowned"] = requested
-            return str(requested)
-        if mode == "replacement":
-            original_root = requested.parent
-            moved_root = original_root.with_name(original_root.name + "-moved")
-            original_root.rename(moved_root)
-            original_root.mkdir()
-            replacement = original_root / requested.name
-            replacement.write_bytes(b"unowned-replacement")
-            observed["replacement"] = replacement
-            observed["moved_root"] = moved_root
-            return str(replacement)
-        raise AssertionError(mode)
+    class SinkAdapter:
+        def generate(self, _request, sink):
+            observed["requested"] = Path(sink.path)
+            observed["fd"] = _sink_fd(sink)
+            if mode == "in_root":
+                os.write(observed["fd"], VALID_MP3)
+                return sink.path
+            if mode == "out_of_root":
+                return str(external)
+            if mode == "symlink":
+                unowned = tmp_path / "unowned-symlink.mp3"
+                unowned.symlink_to(external)
+                observed["unowned"] = unowned
+                return str(unowned)
+            if mode == "hardlink":
+                unowned = tmp_path / "unowned-hardlink.mp3"
+                os.link(external, unowned)
+                observed["unowned"] = unowned
+                return str(unowned)
+            if mode == "replacement":
+                replacement = tmp_path / "unowned-replacement.mp3"
+                replacement.write_bytes(b"unowned-replacement")
+                observed["replacement"] = replacement
+                return str(replacement)
+            raise AssertionError(mode)
 
-    monkeypatch.setattr(tts_tool, "_dispatch_to_plugin_provider", provider)
+        def finish_owned_work(self):
+            return None
+
+        def stop_owned_work(self):
+            return None
+
+    monkeypatch.setattr(
+        tts_tool,
+        "_anonymous_adapter_for_provider",
+        lambda *_args, **_kwargs: SinkAdapter(),
+    )
     with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
         result = json.loads(
             tts_tool._text_to_speech_single(
@@ -248,8 +258,9 @@ def test_ephemeral_tts_accepts_only_proved_in_root_provider_file(
     assert result["success"] is True
     assert result["audio"].startswith("data:audio/mpeg;base64,")
     assert "file_path" not in result
-    assert not observed["requested"].parent.exists()
-    assert str(observed["requested"].parent) not in caplog.text
+    with pytest.raises(OSError):
+        os.fstat(observed["fd"])
+    assert str(observed["requested"]) not in caplog.text
     assert external.read_bytes() == b"unowned-audio"
 
 
@@ -300,7 +311,7 @@ def test_durable_browser_and_tts_internal_contracts_remain_available(tmp_path, m
 
     assert browser["workspace"] == str(home / "cache" / "browser-use" / "workspace" / "durable")
     assert audio["file_path"] == str(audio_path)
-    assert audio_path.read_bytes() == b"private-audio"
+    assert audio_path.read_bytes() == VALID_MP3
 
 
 @pytest.mark.parametrize("outcome", ["error", "timeout", "cancel"])
@@ -312,17 +323,27 @@ def test_ephemeral_tts_reaps_trusted_root_on_failure_or_cancel(
     observed = {}
     monkeypatch.setattr(tts_tool, "_resolve_command_provider_config", lambda *_a: None)
 
-    def provider(_text, output_path, _provider, _config):
-        requested = Path(output_path)
-        observed["root"] = requested.parent
-        requested.write_bytes(b"private-partial-audio")
-        if outcome == "cancel":
-            raise asyncio.CancelledError("private cancel path")
-        if outcome == "timeout":
-            raise TimeoutError("private timeout path")
-        raise RuntimeError("private provider path")
+    class SinkAdapter:
+        def generate(self, _request, sink):
+            observed["fd"] = _sink_fd(sink)
+            os.write(observed["fd"], VALID_MP3)
+            if outcome == "cancel":
+                raise asyncio.CancelledError("private cancel path")
+            if outcome == "timeout":
+                raise TimeoutError("private timeout path")
+            raise RuntimeError("private provider path")
 
-    monkeypatch.setattr(tts_tool, "_dispatch_to_plugin_provider", provider)
+        def finish_owned_work(self):
+            return None
+
+        def stop_owned_work(self):
+            return None
+
+    monkeypatch.setattr(
+        tts_tool,
+        "_anonymous_adapter_for_provider",
+        lambda *_args, **_kwargs: SinkAdapter(),
+    )
     with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
         if outcome == "cancel":
             with pytest.raises(asyncio.CancelledError):
@@ -335,7 +356,8 @@ def test_ephemeral_tts_reaps_trusted_root_on_failure_or_cancel(
                 "private speech", provider="private-plugin"
             )
 
-    assert not observed["root"].exists()
+    with pytest.raises(OSError):
+        os.fstat(observed["fd"])
     if rendered:
         assert json.loads(rendered) == {
             "error": "TTS generation failed",
@@ -354,13 +376,23 @@ def test_ephemeral_tts_never_calls_path_based_final_publication(
     observed = {}
     monkeypatch.setattr(tts_tool, "_resolve_command_provider_config", lambda *_a: None)
 
-    def provider(_text, output_path, _provider, _config):
-        requested = Path(output_path)
-        observed["root"] = requested.parent
-        requested.write_bytes(b"private-audio")
-        return str(requested)
+    class SinkAdapter:
+        def generate(self, _request, sink):
+            observed["fd"] = _sink_fd(sink)
+            os.write(observed["fd"], VALID_MP3)
+            return sink.path
 
-    monkeypatch.setattr(tts_tool, "_dispatch_to_plugin_provider", provider)
+        def finish_owned_work(self):
+            return None
+
+        def stop_owned_work(self):
+            return None
+
+    monkeypatch.setattr(
+        tts_tool,
+        "_anonymous_adapter_for_provider",
+        lambda *_args, **_kwargs: SinkAdapter(),
+    )
     publication_calls = []
     monkeypatch.setattr(
         tts_tool,
@@ -378,7 +410,8 @@ def test_ephemeral_tts_never_calls_path_based_final_publication(
     assert parsed["audio"].startswith("data:audio/mpeg;base64,")
     assert publication_calls == []
     assert external.read_bytes() == b"unowned-final-audio"
-    assert not observed["root"].exists()
+    with pytest.raises(OSError):
+        os.fstat(observed["fd"])
     assert str(tmp_path) not in rendered
 
 
@@ -390,26 +423,37 @@ def test_ephemeral_tts_delivery_cap_and_cleanup_failure_are_path_free(
     observed = {}
     monkeypatch.setattr(tts_tool, "_resolve_command_provider_config", lambda *_a: None)
 
-    def provider(_text, output_path, _provider, _config):
-        requested = Path(output_path)
-        observed["root"] = requested.parent
-        requested.write_bytes(b"private-audio-over-cap")
-        return str(requested)
+    class SinkAdapter:
+        def generate(self, _request, sink):
+            observed["fd"] = _sink_fd(sink)
+            os.write(observed["fd"], VALID_MP3)
+            return sink.path
 
-    monkeypatch.setattr(tts_tool, "_dispatch_to_plugin_provider", provider)
+        def finish_owned_work(self):
+            return None
+
+        def stop_owned_work(self):
+            return None
+
+    monkeypatch.setattr(
+        tts_tool,
+        "_anonymous_adapter_for_provider",
+        lambda *_args, **_kwargs: SinkAdapter(),
+    )
     monkeypatch.setattr(
         tts_tool,
         "_resolve_audio_delivery_profile",
         lambda *_a: tts_tool.AudioDeliveryProfile("test", 4, 1.0),
     )
-    original_unlink = tts_tool.os.unlink
+    from tools.tts_staging import AnonymousAudioStage, AnonymousAudioScrubError
 
-    def fail_owned_unlink(path, *args, **kwargs):
-        if kwargs.get("dir_fd") is not None and Path(path).name.startswith("tts_"):
-            raise OSError("private cleanup failure")
-        return original_unlink(path, *args, **kwargs)
+    original_scrub = AnonymousAudioStage.scrub_and_close
 
-    monkeypatch.setattr(tts_tool.os, "unlink", fail_owned_unlink)
+    def fail_after_scrub(stage):
+        original_scrub(stage)
+        raise AnonymousAudioScrubError("private cleanup failure")
+
+    monkeypatch.setattr(AnonymousAudioStage, "scrub_and_close", fail_after_scrub)
     with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
         rendered = tts_tool.text_to_speech_tool(
             "private speech", provider="private-plugin"
@@ -419,13 +463,10 @@ def test_ephemeral_tts_delivery_cap_and_cleanup_failure_are_path_free(
         "error": "TTS generation failed",
         "success": False,
     }
-    assert observed["root"].exists()
-    assert str(observed["root"]) not in rendered
-    assert str(observed["root"]) not in caplog.text
-    for child in observed["root"].iterdir():
-        original_unlink(child)
-    observed["root"].rmdir()
-    observed["root"].parent.rmdir()
+    with pytest.raises(OSError):
+        os.fstat(observed["fd"])
+    assert str(tmp_path) not in rendered
+    assert str(tmp_path) not in caplog.text
 
 
 def test_ephemeral_tts_private_state_stays_restrictive_after_inner_durable_rebind(
@@ -437,14 +478,24 @@ def test_ephemeral_tts_private_state_stays_restrictive_after_inner_durable_rebin
     observed = {}
     monkeypatch.setattr(tts_tool, "_resolve_command_provider_config", lambda *_a: None)
 
-    def provider(_text, output_path, _provider, _config):
-        activate_invocation_persistence_policy(PersistencePolicy.DURABLE)
-        requested = Path(output_path)
-        observed["root"] = requested.parent
-        requested.write_bytes(b"private-audio")
-        return str(requested)
+    class SinkAdapter:
+        def generate(self, _request, sink):
+            activate_invocation_persistence_policy(PersistencePolicy.DURABLE)
+            observed["fd"] = _sink_fd(sink)
+            os.write(observed["fd"], VALID_MP3)
+            return sink.path
 
-    monkeypatch.setattr(tts_tool, "_dispatch_to_plugin_provider", provider)
+        def finish_owned_work(self):
+            return None
+
+        def stop_owned_work(self):
+            return None
+
+    monkeypatch.setattr(
+        tts_tool,
+        "_anonymous_adapter_for_provider",
+        lambda *_args, **_kwargs: SinkAdapter(),
+    )
     with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
         rendered = tts_tool.text_to_speech_tool(
             "private speech", provider="private-plugin"
@@ -454,5 +505,6 @@ def test_ephemeral_tts_private_state_stays_restrictive_after_inner_durable_rebin
     assert parsed["success"] is True
     assert parsed["audio"].startswith("data:audio/mpeg;base64,")
     assert "file_path" not in parsed
-    assert not observed["root"].exists()
+    with pytest.raises(OSError):
+        os.fstat(observed["fd"])
     assert str(tmp_path) not in rendered
