@@ -61,6 +61,8 @@ class _HeldParent:
     fd: int
     path: Path
     stat: os.stat_result
+    close_state: str = "open"
+    close_proof: int | None = None
 
 
 @dataclass(slots=True)
@@ -71,6 +73,8 @@ class _PublicationTemp:
     destination_name: str
     publication_armed: bool = False
     published: bool = False
+    close_state: str = "open"
+    close_proof: int | None = None
 
 
 @dataclass(slots=True)
@@ -641,6 +645,73 @@ def _close_fd(fd: int) -> None:
         raise TTSPublishUncertain(_PUBLISH_UNCERTAIN) from None
 
 
+def _same_owned_open_description(
+    owner: _HeldParent | _PublicationTemp,
+) -> bool:
+    proof = owner.close_proof
+    if proof is None:
+        return False
+    try:
+        held = os.fstat(owner.fd)
+        offset = os.lseek(owner.fd, 0, os.SEEK_CUR)
+    except (OSError, TypeError, ValueError):
+        return False
+    expected = owner.stat
+    return (
+        expected is not None
+        and held.st_dev == expected.st_dev
+        and held.st_ino == expected.st_ino
+        and stat.S_IFMT(held.st_mode) == stat.S_IFMT(expected.st_mode)
+        and held.st_uid == expected.st_uid
+        and held.st_gid == expected.st_gid
+        and offset == proof
+    )
+
+
+def _close_owned_fd(owner: _HeldParent | _PublicationTemp) -> None:
+    if owner.close_state == "released":
+        return
+    if owner.close_state == "open":
+        proof = (1 << 60) | secrets.randbits(59)
+        os.lseek(owner.fd, proof, os.SEEK_SET)
+        owner.close_proof = proof
+        owner.close_state = "attempted"
+    elif not _same_owned_open_description(owner):
+        owner.close_state = "released"
+        return
+    os.close(owner.fd)
+    owner.close_state = "released"
+
+
+def _scrub_and_close_owned_fd(owner: _PublicationTemp) -> None:
+    if owner.close_state != "open":
+        _close_owned_fd(owner)
+        return
+    failed = False
+    try:
+        os.ftruncate(owner.fd, 0)
+    except BaseException:
+        failed = True
+        try:
+            os.ftruncate(owner.fd, 0)
+        except BaseException:
+            pass
+    try:
+        os.fsync(owner.fd)
+    except BaseException:
+        failed = True
+    try:
+        _close_owned_fd(owner)
+    except BaseException:
+        failed = True
+        try:
+            _close_owned_fd(owner)
+        except BaseException:
+            pass
+    if failed:
+        raise AnonymousAudioScrubError(_SCRUB_ERROR)
+
+
 def _bind_publication_helpers(function: Callable[..., _PublicationOutcome]):
     canonical_prepare = _prepare_publication_call
     canonical_verify = _verify_publication_digest
@@ -679,7 +750,7 @@ def _bind_publication_helpers(function: Callable[..., _PublicationOutcome]):
                     raise
                 except BaseException:
                     pass
-                return outcome
+                return _PublicationOutcome("uncertain")
             raise
 
     return bound
@@ -849,33 +920,33 @@ def _finish_publication_ownership(
                 pass
         try:
             if preserve_temp:
-                os.close(temp.fd)
+                _close_owned_fd(temp)
             else:
-                _scrub_and_close_fd(temp.fd)
+                _scrub_and_close_owned_fd(temp)
         except BaseException as exc:
             if first_stop is None:
                 first_stop = exc
             if preserve_temp:
                 close_failed = True
                 try:
-                    os.close(temp.fd)
+                    _close_owned_fd(temp)
                 except BaseException:
                     pass
             else:
                 scrub_failed = True
                 try:
-                    _scrub_and_close_fd(temp.fd)
+                    _scrub_and_close_owned_fd(temp)
                 except BaseException:
                     pass
     if parent is not None:
         try:
-            os.close(parent.fd)
+            _close_owned_fd(parent)
         except BaseException as exc:
             if first_stop is None:
                 first_stop = exc
             close_failed = True
             try:
-                os.close(parent.fd)
+                _close_owned_fd(parent)
             except BaseException:
                 pass
     try:

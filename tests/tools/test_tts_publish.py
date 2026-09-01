@@ -689,24 +689,24 @@ def test_temp_scrub_cancellation_still_closes_parent_and_scrubs_source(
         pass
 
     destination = tmp_path / "voice.mp3"
-    real_temp_scrub = tts_publish._scrub_and_close_fd
+    real_temp_scrub = tts_publish._scrub_and_close_owned_fd
     real_stage_scrub = tts_publish.AnonymousAudioStage.scrub_and_close
     source_scrubbed = False
     cancelled = False
 
-    def scrub_then_cancel(fd):
+    def scrub_then_cancel(owner):
         nonlocal cancelled
         if not cancelled:
             cancelled = True
             raise Cancelled()
-        return real_temp_scrub(fd)
+        return real_temp_scrub(owner)
 
     def record_source(self):
         nonlocal source_scrubbed
         real_stage_scrub(self)
         source_scrubbed = True
 
-    monkeypatch.setattr(tts_publish, "_scrub_and_close_fd", scrub_then_cancel)
+    monkeypatch.setattr(tts_publish, "_scrub_and_close_owned_fd", scrub_then_cancel)
     monkeypatch.setattr(tts_publish.AnonymousAudioStage, "scrub_and_close", record_source)
     monkeypatch.setattr(
         tts_publish,
@@ -1013,6 +1013,124 @@ def test_every_executed_finish_opcode_emits_fixed_uncertainty(
     assert not (set(os.listdir(descriptor_root)) - baseline)
 
 
+@pytest.mark.parametrize("preexisting", [False, True])
+@pytest.mark.parametrize("close_target", ["temp", "parent"])
+@pytest.mark.parametrize("same_inode", [False, True])
+def test_interrupted_close_never_recloses_reused_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    preexisting: bool,
+    close_target: str,
+    same_inode: bool,
+):
+    from tools import tts_publish
+
+    destination = tmp_path / "voice.mp3"
+    if preexisting:
+        destination.write_bytes(b"old")
+    different_file = tmp_path / "unrelated"
+    different_file.write_bytes(b"sentinel")
+    different_dir = tmp_path / "unrelated-dir"
+    different_dir.mkdir()
+    real_close = os.close
+    close_count = 0
+    sentinel_fd: int | None = None
+
+    def close_then_reuse(fd: int) -> None:
+        nonlocal close_count, sentinel_fd
+        close_count += 1
+        target_count = 1 if close_target == "temp" else 2
+        if close_count != target_count:
+            real_close(fd)
+            return
+        real_close(fd)
+        if close_target == "temp":
+            reopened = destination if same_inode else different_file
+            sentinel_fd = os.open(reopened, os.O_RDONLY)
+        else:
+            reopened = tmp_path if same_inode else different_dir
+            sentinel_fd = os.open(reopened, os.O_RDONLY | os.O_DIRECTORY)
+        assert sentinel_fd == fd
+        raise _OpcodeCancellation()
+
+    monkeypatch.setattr(tts_publish.os, "close", close_then_reuse)
+    try:
+        with pytest.raises(TTSPublishUncertain):
+            _publish_one(tmp_path / "stage", destination)
+        assert sentinel_fd is not None
+        os.fstat(sentinel_fd)
+        assert destination.read_bytes() == VALID_MP3
+        assert not list(tmp_path.glob(".hermes-tts-publish-*"))
+    finally:
+        if sentinel_fd is not None:
+            real_close(sentinel_fd)
+
+
+@pytest.mark.parametrize("preexisting", [False, True])
+@pytest.mark.parametrize("close_target", ["temp", "parent"])
+@pytest.mark.parametrize("same_inode", [False, True])
+def test_close_return_opcode_reuse_preserves_unrelated_descriptor(
+    tmp_path: Path,
+    preexisting: bool,
+    close_target: str,
+    same_inode: bool,
+):
+    from tools import tts_publish
+
+    destination = tmp_path / "voice.mp3"
+    if preexisting:
+        destination.write_bytes(b"old")
+    different_file = tmp_path / "unrelated"
+    different_file.write_bytes(b"sentinel")
+    different_dir = tmp_path / "unrelated-dir"
+    different_dir.mkdir()
+    closer = tts_publish._close_owned_fd
+    target = max(
+        instruction.offset
+        for instruction in dis.get_instructions(closer)
+        if instruction.opname == "POP_TOP"
+    )
+    descriptor_root = Path("/dev/fd" if sys.platform == "darwin" else "/proc/self/fd")
+    baseline = set(os.listdir(descriptor_root))
+    sentinel_fd: int | None = None
+
+    def cancel(frame, event, _arg):
+        nonlocal sentinel_fd
+        if frame.f_code is closer.__code__:
+            frame.f_trace_opcodes = True
+            owner = frame.f_locals["owner"]
+            is_temp = type(owner).__name__ == "_PublicationTemp"
+            selected = (close_target == "temp") == is_temp
+            if selected and event == "opcode" and frame.f_lasti == target:
+                sys.settrace(None)
+                frame.f_trace = None
+                if is_temp:
+                    reopened = destination if same_inode else different_file
+                    sentinel_fd = os.open(reopened, os.O_RDONLY)
+                else:
+                    reopened = tmp_path if same_inode else different_dir
+                    sentinel_fd = os.open(reopened, os.O_RDONLY | os.O_DIRECTORY)
+                assert sentinel_fd == owner.fd
+                raise _OpcodeCancellation()
+        return cancel
+
+    sys.settrace(cancel)
+    try:
+        with pytest.raises(TTSPublishUncertain):
+            _publish_one(tmp_path / "stage", destination)
+    finally:
+        sys.settrace(None)
+    try:
+        assert sentinel_fd is not None
+        os.fstat(sentinel_fd)
+        assert set(os.listdir(descriptor_root)) - baseline == {str(sentinel_fd)}
+        assert destination.read_bytes() == VALID_MP3
+        assert not list(tmp_path.glob(".hermes-tts-publish-*"))
+    finally:
+        if sentinel_fd is not None:
+            os.close(sentinel_fd)
+
+
 @pytest.mark.parametrize("local_name", ["parent", "temp"])
 def test_acquisition_store_gap_releases_registered_descriptors(
     tmp_path: Path,
@@ -1166,7 +1284,7 @@ def test_temp_scrub_failure_has_sticky_stop_precedence_and_source_cleanup_runs(
     destination = tmp_path / "voice.mp3"
     source_closed: list[bool] = []
     real_stage_scrub = tts_publish.AnonymousAudioStage.scrub_and_close
-    real_temp_scrub = tts_publish._scrub_and_close_fd
+    real_temp_scrub = tts_publish._scrub_and_close_owned_fd
 
     def record_source_scrub(self):
         real_stage_scrub(self)
@@ -1178,11 +1296,11 @@ def test_temp_scrub_failure_has_sticky_stop_precedence_and_source_cleanup_runs(
         "_rename_absent_for_host",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("private")),
     )
-    def close_then_fail(fd):
-        real_temp_scrub(fd)
+    def close_then_fail(owner):
+        real_temp_scrub(owner)
         raise AnonymousAudioScrubError("private")
 
-    monkeypatch.setattr(tts_publish, "_scrub_and_close_fd", close_then_fail)
+    monkeypatch.setattr(tts_publish, "_scrub_and_close_owned_fd", close_then_fail)
     with pytest.raises(TTSTransactionStop, match="^tts_anonymous_scrub_failed$"):
         _publish_one(tmp_path / "stage", destination)
     assert source_closed and all(source_closed)
