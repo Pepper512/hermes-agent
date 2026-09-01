@@ -709,7 +709,7 @@ def _close_owned_fd(owner: _HeldParent | _PublicationTemp) -> None:
             if owner.close_state == "open":
                 if owner.stat is None:
                     owner.stat = os.fstat(owner.fd)
-                proof = (1 << 60) | secrets.randbits(59)
+                proof = (1 << 30) | secrets.randbits(30)
                 os.lseek(owner.fd, proof, os.SEEK_SET)
                 owner.close_proof = proof
                 owner.close_state = "attempted"
