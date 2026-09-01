@@ -21,8 +21,15 @@ def _clean_session_platform(monkeypatch):
     _reset_session_context()
 
 
-async def _write_edge_output(_text: str, output_path: str, _tts_config: dict) -> str:
-    Path(output_path).write_bytes(b"mp3")
+async def _write_edge_output(
+    _text: str,
+    output_path: str,
+    _tts_config: dict,
+    **_kwargs,
+) -> str:
+    Path(output_path).write_bytes(
+        b"ID3\x04\x00\x00\x00\x00\x00\x00private-audio"
+    )
     return output_path
 
 
@@ -32,7 +39,7 @@ def test_edge_cli_preserves_native_mp3(tmp_path, monkeypatch):
 
     monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: {"provider": "edge"})
     monkeypatch.setattr(tts_tool, "_import_edge_tts", lambda: object())
-    monkeypatch.setattr(tts_tool, "_generate_edge_tts", _write_edge_output)
+    monkeypatch.setattr(tts_tool, "_generate_edge_tts_to_sink", _write_edge_output)
     monkeypatch.setattr(tts_tool, "_convert_to_opus", convert)
 
     result = json.loads(tts_tool.text_to_speech_tool("hello", output_path=str(out)))
@@ -58,7 +65,7 @@ def test_edge_telegram_converts_to_opus_voice(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
     monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: {"provider": "edge"})
     monkeypatch.setattr(tts_tool, "_import_edge_tts", lambda: object())
-    monkeypatch.setattr(tts_tool, "_generate_edge_tts", _write_edge_output)
+    monkeypatch.setattr(tts_tool, "_generate_edge_tts_to_sink", _write_edge_output)
     monkeypatch.setattr(tts_tool, "_convert_to_opus", convert)
 
     result = json.loads(tts_tool.text_to_speech_tool("hello", output_path=str(out)))
@@ -85,7 +92,7 @@ def test_edge_matrix_converts_to_opus_voice(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "matrix")
     monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: {"provider": "edge"})
     monkeypatch.setattr(tts_tool, "_import_edge_tts", lambda: object())
-    monkeypatch.setattr(tts_tool, "_generate_edge_tts", _write_edge_output)
+    monkeypatch.setattr(tts_tool, "_generate_edge_tts_to_sink", _write_edge_output)
     monkeypatch.setattr(tts_tool, "_convert_to_opus", convert)
 
     result = json.loads(tts_tool.text_to_speech_tool("hello", output_path=str(out)))

@@ -70,6 +70,18 @@ def _python_copy_command(output_placeholder: str = "{output_path}") -> str:
     )
 
 
+def _python_anonymous_audio_command(output_format: str) -> str:
+    payload = (
+        b"OggS\x00payload"
+        if output_format == "ogg"
+        else b"ID3\x04\x00\x00\x00\x00\x00\x00private-audio"
+    )
+    return (
+        f'"{sys.executable}" -c "import pathlib, sys; '
+        f'pathlib.Path(sys.argv[1]).write_bytes({payload!r})" {{output_path}}'
+    )
+
+
 def _shell_command(*args: str) -> str:
     """Return a shell command string for subprocess.Popen(shell=True)."""
     if os.name == "nt":
@@ -927,7 +939,7 @@ class TestTextToSpeechToolWithCommandProvider:
                 "providers": {
                     "py-copy": {
                         "type": "command",
-                        "command": _python_copy_command(),
+                        "command": _python_anonymous_audio_command("mp3"),
                         "output_format": "mp3",
                     },
                 },
@@ -955,7 +967,7 @@ class TestTextToSpeechToolWithCommandProvider:
             "providers": {
                 "py-copy-ogg": {
                     "type": "command",
-                    "command": _python_copy_command(),
+                    "command": _python_anonymous_audio_command("ogg"),
                     "output_format": "ogg",
                     "voice_compatible": True,
                 },

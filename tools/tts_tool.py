@@ -2624,6 +2624,7 @@ def _generate_openai_tts(
     voice: Optional[str] = None,
     speed: Optional[float] = None,
     instructions: Optional[str] = None,
+    response_format_override: Optional[str] = None,
 ) -> str:
     """Generate audio via the OpenAI ``audio.speech.create`` SDK shape.
 
@@ -2699,7 +2700,7 @@ def _generate_openai_tts(
         )
         model = DEFAULT_OPENAI_MODEL
 
-    response_format = _tts_response_format_from_path(output_path)
+    response_format = response_format_override or _tts_response_format_from_path(output_path)
 
     OpenAIClient = _import_openai_client()
     client = OpenAIClient(api_key=api_key, base_url=base_url)
@@ -2738,7 +2739,13 @@ def _generate_openai_tts(
 # catalog is fetched without a patch.
 
 
-def _generate_deepinfra_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+def _generate_deepinfra_tts(
+    text: str,
+    output_path: str,
+    tts_config: Dict[str, Any],
+    *,
+    response_format_override: Optional[str] = None,
+) -> str:
     """Resolve DeepInfra credentials/model, then delegate to the OpenAI handler.
 
     DeepInfra's audio endpoint is OpenAI-compatible, so there's no need
@@ -2782,6 +2789,7 @@ def _generate_deepinfra_tts(text: str, output_path: str, tts_config: Dict[str, A
         model=model,
         voice=di_config.get("voice", DEFAULT_DEEPINFRA_TTS_VOICE),
         speed=float(di_config.get("speed", tts_config.get("speed", 1.0))),
+        response_format_override=response_format_override,
     )
 
 
@@ -2898,7 +2906,13 @@ def _apply_xai_auto_speech_tags(text: str) -> str:
         return local
 
 
-def _generate_xai_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+def _generate_xai_tts(
+    text: str,
+    output_path: str,
+    tts_config: Dict[str, Any],
+    *,
+    output_format_override: Optional[str] = None,
+) -> str:
     """
     Generate audio using xAI TTS.
 
@@ -2971,7 +2985,7 @@ def _generate_xai_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -
 
     # Match the documented minimal POST /v1/tts shape by default. Only send
     # output_format when Hermes actually needs a non-default format/override.
-    codec = "wav" if output_path.endswith(".wav") else "mp3"
+    codec = output_format_override or ("wav" if output_path.endswith(".wav") else "mp3")
     payload: Dict[str, Any] = {
         "text": text,
         "voice_id": voice_id,
@@ -3163,7 +3177,13 @@ def _generate_minimax_tts(text: str, output_path: str, tts_config: Dict[str, Any
 # ===========================================================================
 # Provider: Mistral (Voxtral TTS)
 # ===========================================================================
-def _generate_mistral_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+def _generate_mistral_tts(
+    text: str,
+    output_path: str,
+    tts_config: Dict[str, Any],
+    *,
+    response_format_override: Optional[str] = None,
+) -> str:
     """Generate audio using Mistral Voxtral TTS API.
 
     The API returns base64-encoded audio; this function decodes it
@@ -3181,7 +3201,9 @@ def _generate_mistral_tts(text: str, output_path: str, tts_config: Dict[str, Any
     # base_url. The Mistral SDK calls it server_url.
     base_url = mi_config.get("base_url")
 
-    if output_path.endswith(".ogg"):
+    if response_format_override is not None:
+        response_format = response_format_override
+    elif output_path.endswith(".ogg"):
         response_format = "opus"
     elif output_path.endswith(".wav"):
         response_format = "wav"
@@ -3406,7 +3428,13 @@ def _compose_gemini_tts_prompt(
     return f"{preamble}\n\n{persona_prompt}\n\n#### TRANSCRIPT\n{transcript}".strip()
 
 
-def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+def _generate_gemini_tts(
+    text: str,
+    output_path: str,
+    tts_config: Dict[str, Any],
+    *,
+    output_format_override: Optional[str] = None,
+) -> str:
     """Generate audio using Google Gemini TTS.
 
     Gemini's generateContent endpoint with responseModalities=["AUDIO"] returns
@@ -3530,9 +3558,41 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]
     wav_bytes = _wrap_pcm_as_wav(pcm_bytes)
 
     # Fast path: caller wants WAV directly, just write.
-    if output_path.lower().endswith(".wav"):
+    requested_format = output_format_override or (
+        "wav" if output_path.lower().endswith(".wav") else
+        "ogg" if output_path.lower().endswith(".ogg") else "mp3"
+    )
+    if requested_format == "wav":
         with open(output_path, "wb") as f:
             f.write(wav_bytes)
+        return output_path
+
+    if output_format_override is not None:
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise RuntimeError("anonymous Gemini conversion unavailable")
+        codec_args = (
+            ["-acodec", "libopus", "-ac", "1", "-b:a", "48k"]
+            if requested_format in {"ogg", "opus"}
+            else ["-f", requested_format]
+        )
+        with open(output_path, "wb") as output:
+            result = subprocess.run(
+                [
+                    ffmpeg,
+                    "-f", "wav", "-i", "pipe:0",
+                    *codec_args,
+                    "-loglevel", "error", "pipe:1",
+                ],
+                input=wav_bytes,
+                stdout=output,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+                check=False,
+                creationflags=windows_hide_flags(),
+            )
+        if result.returncode != 0:
+            raise RuntimeError("anonymous Gemini conversion failed")
         return output_path
 
     # Otherwise write WAV to a temp file and ffmpeg-convert to the target
@@ -3944,6 +4004,206 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
 _EPHEMERAL_TTS_MAX_BYTES = 25 * 1024 * 1024
 
 
+def _anonymous_adapter_for_provider(
+    provider: str,
+    tts_config: Dict[str, Any],
+):
+    """Resolve exactly one reviewed anonymous-sink adapter."""
+    from tools.tts_adapters import builtin_adapter, command_adapter, plugin_adapter
+
+    key = provider.lower().strip()
+    command_config = _resolve_command_provider_config(key, tts_config)
+    if command_config is not None:
+        return command_adapter(key, command_config, tts_config)
+    if key in BUILTIN_TTS_PROVIDERS:
+        return builtin_adapter(key, tts_config)
+    try:
+        from agent.tts_registry import get_provider
+        from hermes_cli.plugins import _ensure_plugins_discovered
+
+        _ensure_plugins_discovered()
+        selected = get_provider(key)
+        if selected is None:
+            _ensure_plugins_discovered(force=True)
+            selected = get_provider(key)
+    except Exception:
+        selected = None
+    if selected is None:
+        raise ValueError("tts_anonymous_sink_unsupported")
+    return plugin_adapter(selected)
+
+
+def _generate_builtin_tts_to_sink(
+    provider: str,
+    request: Any,
+    sink_path: str,
+    tts_config: Dict[str, Any],
+    *,
+    output_format: str,
+    maximum_bytes: int,
+) -> str:
+    """Invoke one built-in with a copied descriptor path and explicit format."""
+    if (
+        provider not in BUILTIN_TTS_PROVIDERS
+        or provider in {"neutts", "piper", "kittentts", "edge", "elevenlabs"}
+        or output_format not in COMMAND_TTS_OUTPUT_FORMATS
+        or not isinstance(maximum_bytes, int)
+        or isinstance(maximum_bytes, bool)
+        or maximum_bytes <= 0
+    ):
+        raise ValueError("tts_anonymous_sink_unsupported")
+    response_format = "opus" if output_format in {"ogg", "opus"} else output_format
+    if provider == "openai":
+        result = _generate_openai_tts(
+            request.text,
+            sink_path,
+            tts_config,
+            model=request.model,
+            voice=request.voice,
+            speed=request.speed,
+            instructions=request.instructions,
+            response_format_override=response_format,
+        )
+    elif provider == "deepinfra":
+        result = _generate_deepinfra_tts(
+            request.text,
+            sink_path,
+            tts_config,
+            response_format_override=response_format,
+        )
+    elif provider == "xai":
+        if output_format not in {"mp3", "wav"}:
+            raise ValueError("tts_anonymous_sink_unsupported")
+        result = _generate_xai_tts(
+            request.text,
+            sink_path,
+            tts_config,
+            output_format_override=output_format,
+        )
+    elif provider == "minimax":
+        if output_format != "mp3":
+            raise ValueError("tts_anonymous_sink_unsupported")
+        result = _generate_minimax_tts(request.text, sink_path, tts_config)
+    elif provider == "mistral":
+        result = _generate_mistral_tts(
+            request.text,
+            sink_path,
+            tts_config,
+            response_format_override=response_format,
+        )
+    elif provider == "gemini":
+        result = _generate_gemini_tts(
+            request.text,
+            sink_path,
+            tts_config,
+            output_format_override=output_format,
+        )
+    else:
+        raise ValueError("tts_anonymous_sink_unsupported")
+    sink_fd = _descriptor_number_from_sink_path(sink_path)
+    if os.fstat(sink_fd).st_size > maximum_bytes:
+        raise ValueError("tts_anonymous_provider_failed")
+    return result
+
+
+def _anonymous_output_format(
+    provider: str,
+    tts_config: Dict[str, Any],
+) -> str:
+    command_config = _resolve_command_provider_config(provider, tts_config)
+    if command_config is not None:
+        return _get_command_tts_output_format(command_config)
+    configured = tts_config.get("output_format")
+    if isinstance(configured, str) and configured.lower() in {
+        "mp3", "wav", "ogg", "flac", "m4a", "aac", "amr", "opus"
+    }:
+        return configured.lower()
+    return "mp3"
+
+
+def _anonymous_voice_compatible(provider: str, tts_config: Dict[str, Any]) -> bool:
+    command_config = _resolve_command_provider_config(provider, tts_config)
+    if command_config is not None:
+        return _is_command_tts_voice_compatible(command_config)
+    return _plugin_provider_is_voice_compatible(provider)
+
+
+def _generate_anonymous_tts(
+    chunks: List[str],
+    *,
+    provider: str,
+    tts_config: Dict[str, Any],
+    speed: Optional[float],
+    instructions: Optional[str],
+    aggregate_cap: int,
+    durable_consumer: Optional[Callable[[Any], Any]] = None,
+):
+    """GENERATE and SEAL every chunk, then perform exactly one decision."""
+    from tools.tts_adapters import ProviderRequest, generate_and_seal
+    from tools.tts_staging import AnonymousAudioStage
+    from tools.tts_transaction import TTSTransaction
+
+    output_format = _anonymous_output_format(provider, tts_config)
+    adapter = _anonymous_adapter_for_provider(provider, tts_config)
+    provider_config = tts_config.get(provider)
+    if not isinstance(provider_config, dict):
+        provider_config = {}
+    voice = provider_config.get("voice") or provider_config.get("voice_id")
+    model = provider_config.get("model") or provider_config.get("model_id")
+    if voice is None:
+        voice = tts_config.get("voice")
+    if model is None:
+        model = tts_config.get("model")
+    request_speed = speed if speed is not None else tts_config.get("speed")
+    if not isinstance(request_speed, (int, float)) or isinstance(request_speed, bool):
+        request_speed = None
+
+    with TTSTransaction.begin(aggregate_cap) as transaction:
+        for chunk in chunks:
+            stage = AnonymousAudioStage.create(output_format, aggregate_cap)
+            request = ProviderRequest(
+                text=chunk,
+                voice=voice if isinstance(voice, str) else None,
+                model=model if isinstance(model, str) else None,
+                speed=float(request_speed) if request_speed is not None else None,
+                instructions=instructions,
+            )
+            sealed = generate_and_seal(adapter, request, stage)
+            transaction.add_sealed(stage, sealed)
+        decision = transaction.decide()
+        from tools.tts_transaction import DurablePublicationPermit
+
+        if type(decision) is DurablePublicationPermit:
+            if durable_consumer is None:
+                raise ValueError("tts_generation_failed")
+            decision = durable_consumer(decision)
+        return decision, output_format
+
+
+def _ephemeral_tts_result(
+    chunks: tuple[bytes, ...], provider: str, *, public: bool
+) -> str:
+    audio_parts = [
+        "data:audio/mpeg;base64," + base64.b64encode(chunk).decode("ascii")
+        for chunk in chunks
+    ]
+    payload: Dict[str, Any] = {
+        "success": True,
+        "audio": audio_parts[0],
+        "provider": provider,
+        "voice_compatible": False,
+    }
+    if public:
+        payload.update({
+            "audio_parts": audio_parts,
+            "chunk_count": len(chunks),
+            "delivery_file_count": len(chunks),
+            "combined_chunks": False,
+        })
+    return json.dumps(payload, ensure_ascii=False)
+
+
+# Task 7 cutover entry preserving the public/internal call signature.
 def _text_to_speech_single(
     text: str,
     output_path: Optional[str] = None,
@@ -3953,997 +4213,50 @@ def _text_to_speech_single(
     provider: Optional[str] = None,
     tts_config_override: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Synthesize one provider-safe text chunk and return one final-encoded file.
-
-    The public :func:`text_to_speech_tool` wrapper owns long-form splitting,
-    delivery packing, and post-encoding size enforcement.
-    """
     if not text or not text.strip():
         return tool_error("Text is required", success=False)
-
-    from hermes_cli.persistence import persistence_disabled
-    ephemeral = persistence_disabled()
-
-    # This class and its sole instance exist only in this invocation's lexical
-    # scope.  No module global, caller parameter, result token, or importable
-    # helper can manufacture or recover its cleanup authority.
-    class EphemeralOwner:
-        def __init__(self) -> None:
-            persistence_disabled()
-            if (
-                not getattr(os, "O_NOFOLLOW", 0)
-                or not getattr(os, "O_DIRECTORY", 0)
-                or os.open not in os.supports_dir_fd
-                or os.stat not in os.supports_dir_fd
-                or os.stat not in os.supports_follow_symlinks
-            ):
-                raise RuntimeError("ephemeral TTS ownership unavailable")
-            self.parent = Path(tempfile.mkdtemp(prefix="hermes-tts-owned-"))
-            self.root = self.parent / "audio"
-            self.basename = (
-                "tts_"
-                + datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                + ".mp3"
-            )
-            self.path = self.root / self.basename
-            self.parent_fd = -1
-            self.root_fd = -1
-            self.file_fd = -1
-            self.closed = False
-            try:
-                persistence_disabled()
-                self.root.mkdir(mode=0o700)
-                directory_flags = (
-                    os.O_RDONLY
-                    | getattr(os, "O_DIRECTORY", 0)
-                    | getattr(os, "O_NOFOLLOW", 0)
-                )
-                persistence_disabled()
-                self.parent_fd = os.open(self.parent, directory_flags)
-                os.fchmod(self.parent_fd, 0o700)
-                self.parent_identity = self._identity(os.fstat(self.parent_fd))
-                self.root_fd = os.open(
-                    self.root.name, directory_flags, dir_fd=self.parent_fd
-                )
-                os.fchmod(self.root_fd, 0o700)
-                persistence_disabled()
-                self.file_fd = os.open(
-                    self.basename,
-                    os.O_RDWR
-                    | os.O_CREAT
-                    | os.O_EXCL
-                    | getattr(os, "O_NOFOLLOW", 0),
-                    0o600,
-                    dir_fd=self.root_fd,
-                )
-                os.fchmod(self.file_fd, 0o600)
-                self.root_identity = self._identity(os.fstat(self.root_fd))
-                self.file_identity = self._identity(os.fstat(self.file_fd))
-                if not self._directories_valid() or not self._file_valid():
-                    raise ValueError("ephemeral TTS ownership unavailable")
-            except BaseException:
-                self.cleanup()
-                raise
-
-        @staticmethod
-        def _identity(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
-            return (
-                info.st_dev,
-                info.st_ino,
-                info.st_uid,
-                info.st_gid,
-                stat.S_IMODE(info.st_mode),
-                info.st_nlink,
-            )
-
-        @staticmethod
-        def _matches(
-            info: os.stat_result,
-            identity: tuple[int, int, int, int, int, int],
-            *,
-            directory: bool,
-        ) -> bool:
-            kind_ok = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
-            expected_mode = 0o700 if directory else 0o600
-            return (
-                kind_ok
-                and not stat.S_ISLNK(info.st_mode)
-                and (info.st_dev, info.st_ino, info.st_uid, info.st_gid,
-                     stat.S_IMODE(info.st_mode), info.st_nlink) == identity
-                and stat.S_IMODE(info.st_mode) == expected_mode
-                and (directory or info.st_nlink == 1)
-            )
-
-        def _directories_valid(self) -> bool:
-            if self.parent_fd < 0 or self.root_fd < 0:
-                return False
-            try:
-                parent_fd_info = os.fstat(self.parent_fd)
-                root_fd_info = os.fstat(self.root_fd)
-                parent_path_info = self.parent.lstat()
-                root_path_info = os.stat(
-                    self.root.name,
-                    dir_fd=self.parent_fd,
-                    follow_symlinks=False,
-                )
-            except OSError:
-                return False
-            return (
-                self._matches(parent_fd_info, self.parent_identity, directory=True)
-                and self._matches(parent_path_info, self.parent_identity, directory=True)
-                and self._matches(root_fd_info, self.root_identity, directory=True)
-                and self._matches(root_path_info, self.root_identity, directory=True)
-            )
-
-        def _file_valid(self) -> bool:
-            if self.file_fd < 0:
-                return False
-            try:
-                held = os.fstat(self.file_fd)
-                named = os.stat(
-                    self.basename, dir_fd=self.root_fd, follow_symlinks=False
-                )
-            except OSError:
-                return False
-            return (
-                self._matches(held, self.file_identity, directory=False)
-                and self._matches(named, self.file_identity, directory=False)
-            )
-
-        def _held_directories_owned(self) -> bool:
-            if self.parent_fd < 0 or self.root_fd < 0:
-                return False
-            try:
-                parent = os.fstat(self.parent_fd)
-                root = os.fstat(self.root_fd)
-            except OSError:
-                return False
-            return (
-                stat.S_ISDIR(parent.st_mode)
-                and stat.S_ISDIR(root.st_mode)
-                and (parent.st_dev, parent.st_ino, parent.st_uid, parent.st_gid)
-                == self.parent_identity[:4]
-                and (root.st_dev, root.st_ino, root.st_uid, root.st_gid)
-                == self.root_identity[:4]
-            )
-
-        @staticmethod
-        def _directory_owned_after_child_removal(
-            info: os.stat_result,
-            identity: tuple[int, int, int, int, int, int],
-        ) -> bool:
-            return (
-                stat.S_ISDIR(info.st_mode)
-                and not stat.S_ISLNK(info.st_mode)
-                and (info.st_dev, info.st_ino, info.st_uid, info.st_gid,
-                     stat.S_IMODE(info.st_mode)) == identity[:5]
-                and info.st_nlink in {identity[5], max(1, identity[5] - 1)}
-            )
-
-        def _held_file_owned(self) -> bool:
-            if self.file_fd < 0:
-                return False
-            try:
-                held = os.fstat(self.file_fd)
-            except OSError:
-                return False
-            return (
-                stat.S_ISREG(held.st_mode)
-                and (held.st_dev, held.st_ino, held.st_uid, held.st_gid)
-                == self.file_identity[:4]
-            )
-
-        def _named_file_owned(self) -> bool:
-            try:
-                named = os.stat(
-                    self.basename, dir_fd=self.root_fd, follow_symlinks=False
-                )
-            except OSError:
-                return False
-            return (
-                stat.S_ISREG(named.st_mode)
-                and (named.st_dev, named.st_ino, named.st_uid, named.st_gid)
-                == self.file_identity[:4]
-            )
-
-        def read(self, returned_path: object, limit: int) -> bytes:
-            # The typed policy is consulted at every trust boundary.  The
-            # invocation remains restrictive if inner code rebinds it later.
-            persistence_disabled()
-            if str(returned_path) != str(self.path):
-                raise ValueError("unproved ephemeral TTS path")
-            if not self._directories_valid() or not self._file_valid():
-                raise ValueError("ephemeral TTS ownership changed")
-            if os.listdir(self.root_fd) != [self.basename]:
-                raise ValueError("unexpected ephemeral TTS artifact")
-            os.lseek(self.file_fd, 0, os.SEEK_SET)
-            chunks: list[bytes] = []
-            total = 0
-            while True:
-                chunk = os.read(self.file_fd, min(65536, limit + 1 - total))
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > limit:
-                    raise ValueError("ephemeral audio exceeds in-memory cap")
-                chunks.append(chunk)
-            if not self._directories_valid() or not self._file_valid():
-                raise ValueError("ephemeral TTS output changed during read")
-            return b"".join(chunks)
-
-        def cleanup(self) -> bool:
-            if self.closed:
-                return True
-            self.closed = True
-            persistence_disabled()
-            valid_result = False
-            remove_directories = False
-            try:
-                fully_valid = (
-                    hasattr(self, "parent_identity")
-                    and hasattr(self, "root_identity")
-                    and hasattr(self, "file_identity")
-                    and self._directories_valid()
-                    and self._file_valid()
-                    and os.listdir(self.root_fd) == [self.basename]
-                )
-                held_owned = (
-                    hasattr(self, "parent_identity")
-                    and hasattr(self, "root_identity")
-                    and self._held_directories_owned()
-                )
-                file_owned = (
-                    held_owned
-                    and hasattr(self, "file_identity")
-                    and self._held_file_owned()
-                )
-                # Scrub the exact invocation-owned inode before unlinking so a
-                # hostile hard-link created during provider execution cannot
-                # retain private audio. A replacement inode is never touched.
-                if file_owned:
-                    os.ftruncate(self.file_fd, 0)
-                    os.fsync(self.file_fd)
-                    if self._named_file_owned():
-                        os.unlink(self.basename, dir_fd=self.root_fd)
-                remaining = os.listdir(self.root_fd) if held_owned else []
-                valid_result = fully_valid and not remaining
-                remove_directories = held_owned and file_owned and not remaining
-                if (
-                    not hasattr(self, "file_identity")
-                    and held_owned
-                    and not remaining
-                ):
-                    # Constructor failed before creating the artifact; the two
-                    # exact empty directories are still wholly invocation-owned.
-                    remove_directories = True
-            except OSError:
-                valid_result = False
-                remove_directories = False
-            finally:
-                for descriptor_name in ("file_fd", "root_fd"):
-                    descriptor = getattr(self, descriptor_name, -1)
-                    if descriptor >= 0:
-                        try:
-                            os.close(descriptor)
-                        except OSError:
-                            valid_result = False
-                            remove_directories = False
-                        setattr(self, descriptor_name, -1)
-
-            if remove_directories:
-                try:
-                    current = os.stat(
-                        self.root.name,
-                        dir_fd=self.parent_fd,
-                        follow_symlinks=False,
-                    )
-                    if not self._directory_owned_after_child_removal(
-                        current, self.root_identity
-                    ):
-                        valid_result = False
-                        remove_directories = False
-                    else:
-                        os.rmdir(self.root.name, dir_fd=self.parent_fd)
-                except OSError:
-                    valid_result = False
-                    remove_directories = False
-
-            if self.parent_fd >= 0:
-                try:
-                    os.close(self.parent_fd)
-                except OSError:
-                    valid_result = False
-                    remove_directories = False
-                self.parent_fd = -1
-            if remove_directories:
-                try:
-                    current = self.parent.lstat()
-                    if not self._directory_owned_after_child_removal(
-                        current, self.parent_identity
-                    ):
-                        valid_result = False
-                        remove_directories = False
-                    else:
-                        self.parent.rmdir()
-                except OSError:
-                    valid_result = False
-                    remove_directories = False
-            return valid_result and remove_directories
-
-    class LateRebindArtifact:
-        """Lexically private evidence for one durable requested destination."""
-
-        def __init__(self) -> None:
-            if (
-                not getattr(os, "O_NOFOLLOW", 0)
-                or not getattr(os, "O_DIRECTORY", 0)
-                or os.open not in os.supports_dir_fd
-                or os.stat not in os.supports_dir_fd
-                or os.stat not in os.supports_follow_symlinks
-            ):
-                raise ValueError("requested destination cannot be attested")
-            self.parent = Path(os.path.abspath(file_path.parent))
-            self.basename = file_path.name
-            if (
-                not self.basename
-                or self.basename in {".", ".."}
-                or Path(self.basename).name != self.basename
-            ):
-                raise ValueError("requested destination cannot be attested")
-            self.parent_fd = -1
-            self.artifact_fd = -1
-            self.closed = False
-            directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-            try:
-                self.parent_fd = os.open(self.parent, directory_flags)
-                parent_held = os.fstat(self.parent_fd)
-                parent_named = self.parent.lstat()
-                self.parent_before = self._full_identity(parent_held)
-                if (
-                    not self._same_full(parent_named, self.parent_before)
-                    or not self._safe_parent(parent_held)
-                ):
-                    raise ValueError("requested destination cannot be attested")
-                try:
-                    existing = os.stat(
-                        self.basename,
-                        dir_fd=self.parent_fd,
-                        follow_symlinks=False,
-                    )
-                except FileNotFoundError:
-                    self.preexisting = False
-                    self.preexisting_identity = None
-                else:
-                    self.preexisting = True
-                    self.preexisting_identity = self._full_identity(existing)
-
-                if not self.preexisting:
-                    self.artifact_fd = os.open(
-                        self.basename,
-                        os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                        0o600,
-                        dir_fd=self.parent_fd,
-                    )
-                    os.fchmod(self.artifact_fd, 0o600)
-                    os.fchown(self.artifact_fd, -1, os.getgid())
-                    artifact = os.fstat(self.artifact_fd)
-                    self.artifact_identity = self._artifact_identity(artifact)
-                    self.artifact_initial = self._full_identity(artifact)
-                    self.parent_during = self._full_identity(
-                        os.fstat(self.parent_fd)
-                    )
-                    if not self._parent_path_matches(self.parent_during):
-                        raise ValueError("requested destination cannot be attested")
-            except BaseException:
-                self._abort()
-                raise
-
-        @staticmethod
-        def _full_identity(info: os.stat_result) -> tuple[int, ...]:
-            return (
-                info.st_dev,
-                info.st_ino,
-                info.st_uid,
-                info.st_gid,
-                stat.S_IMODE(info.st_mode),
-                info.st_nlink,
-                info.st_size,
-                info.st_mtime_ns,
-                info.st_ctime_ns,
-            )
-
-        @staticmethod
-        def _artifact_identity(info: os.stat_result) -> tuple[int, ...]:
-            return (
-                info.st_dev,
-                info.st_ino,
-                info.st_uid,
-                info.st_gid,
-                stat.S_IMODE(info.st_mode),
-                info.st_nlink,
-            )
-
-        @staticmethod
-        def _same_full(info: os.stat_result, identity: tuple[int, ...]) -> bool:
-            return LateRebindArtifact._full_identity(info) == identity
-
-        @staticmethod
-        def _safe_parent(info: os.stat_result) -> bool:
-            return (
-                stat.S_ISDIR(info.st_mode)
-                and not stat.S_ISLNK(info.st_mode)
-                and info.st_uid == os.getuid()
-                and stat.S_IMODE(info.st_mode) & 0o022 == 0
-            )
-
-        def _parent_path_matches(self, identity: tuple[int, ...]) -> bool:
-            try:
-                held = os.fstat(self.parent_fd)
-                named = self.parent.lstat()
-            except OSError:
-                return False
-            return (
-                self._safe_parent(held)
-                and self._same_full(held, identity)
-                and self._same_full(named, identity)
-            )
-
-        def _artifact_matches(self) -> bool:
-            if self.artifact_fd < 0:
-                return False
-            try:
-                held = os.fstat(self.artifact_fd)
-                named = os.stat(
-                    self.basename,
-                    dir_fd=self.parent_fd,
-                    follow_symlinks=False,
-                )
-            except OSError:
-                return False
-            return (
-                stat.S_ISREG(held.st_mode)
-                and stat.S_ISREG(named.st_mode)
-                and not stat.S_ISLNK(named.st_mode)
-                and self._artifact_identity(held) == self.artifact_identity
-                and self._artifact_identity(named) == self.artifact_identity
-                and self.artifact_identity[2] == os.getuid()
-                and self.artifact_identity[3] == os.getgid()
-                and self.artifact_identity[4] == 0o600
-                and self.artifact_identity[5] == 1
-            )
-
-        def _unlink_exact_artifact(self) -> bool:
-            if (
-                self.preexisting
-                or not self._parent_path_matches(self.parent_during)
-                or not self._artifact_matches()
-            ):
-                return False
-            try:
-                # Revalidate immediately before the descriptor-relative unlink.
-                named = os.stat(
-                    self.basename,
-                    dir_fd=self.parent_fd,
-                    follow_symlinks=False,
-                )
-                held = os.fstat(self.artifact_fd)
-                if (
-                    self._artifact_identity(named) != self.artifact_identity
-                    or self._artifact_identity(held) != self.artifact_identity
-                ):
-                    return False
-                os.unlink(self.basename, dir_fd=self.parent_fd)
-                try:
-                    os.stat(
-                        self.basename,
-                        dir_fd=self.parent_fd,
-                        follow_symlinks=False,
-                    )
-                except FileNotFoundError:
-                    pass
-                else:
-                    return False
-                parent_held = os.fstat(self.parent_fd)
-                parent_named = self.parent.lstat()
-                return (
-                    self._safe_parent(parent_held)
-                    and self._artifact_identity(parent_held)
-                    == self._artifact_identity_from_full(self.parent_before)
-                    and self._artifact_identity(parent_named)
-                    == self._artifact_identity_from_full(self.parent_before)
-                )
-            except OSError:
-                return False
-
-        @staticmethod
-        def _artifact_identity_from_full(identity: tuple[int, ...]) -> tuple[int, ...]:
-            return identity[:6]
-
-        def _abort(self) -> None:
-            # Constructor failure may occur after exclusive placeholder creation.
-            # Remove only that exact object when its held and named identities
-            # agree, including failures before artifact_identity was assigned.
-            try:
-                held = os.fstat(self.artifact_fd)
-                named = os.stat(
-                    self.basename,
-                    dir_fd=self.parent_fd,
-                    follow_symlinks=False,
-                )
-                parent_held = os.fstat(self.parent_fd)
-                parent_named = self.parent.lstat()
-                exact_created_artifact = (
-                    self.artifact_fd >= 0
-                    and stat.S_ISREG(held.st_mode)
-                    and stat.S_ISREG(named.st_mode)
-                    and not stat.S_ISLNK(named.st_mode)
-                    and (held.st_dev, held.st_ino)
-                    == (named.st_dev, named.st_ino)
-                    and held.st_uid == os.getuid()
-                    and named.st_uid == os.getuid()
-                    and held.st_nlink == 1
-                    and named.st_nlink == 1
-                )
-                exact_parent = (
-                    hasattr(self, "parent_before")
-                    and stat.S_ISDIR(parent_held.st_mode)
-                    and stat.S_ISDIR(parent_named.st_mode)
-                    and (parent_held.st_dev, parent_held.st_ino)
-                    == self.parent_before[:2]
-                    and (parent_named.st_dev, parent_named.st_ino)
-                    == self.parent_before[:2]
-                    and parent_held.st_uid == os.getuid()
-                    and parent_named.st_uid == os.getuid()
-                )
-                if exact_created_artifact and exact_parent:
-                    os.unlink(self.basename, dir_fd=self.parent_fd)
-            except BaseException:
-                pass
-            self._close_descriptors()
-
-        def _close_descriptors(self) -> bool:
-            closed = True
-            for name in ("artifact_fd", "parent_fd"):
-                descriptor = getattr(self, name, -1)
-                if descriptor >= 0:
-                    try:
-                        os.close(descriptor)
-                    except OSError:
-                        closed = False
-                    setattr(self, name, -1)
-            return closed
-
-        def finish(self) -> tuple[bool, bool]:
-            if self.closed:
-                return persistence_disabled(), False
-            self.closed = True
-            late_ephemeral = persistence_disabled()
-            cleanup_ok = True
-            try:
-                if late_ephemeral:
-                    if self.preexisting:
-                        cleanup_ok = True
-                    else:
-                        cleanup_ok = self._unlink_exact_artifact()
-                elif not self.preexisting:
-                    # Preserve durable no-write behavior by removing only the
-                    # untouched placeholder created by this boundary.
-                    try:
-                        unchanged = (
-                            self._same_full(
-                                os.fstat(self.artifact_fd), self.artifact_initial
-                            )
-                            and self._artifact_matches()
-                            and self._parent_path_matches(self.parent_during)
-                        )
-                    except OSError:
-                        unchanged = False
-                    if unchanged:
-                        cleanup_ok = self._unlink_exact_artifact()
-            finally:
-                cleanup_ok = self._close_descriptors() and cleanup_ok
-            return late_ephemeral, cleanup_ok
-
-    owner: Optional[EphemeralOwner] = None
-    late_rebind_artifact: Optional[LateRebindArtifact] = None
-
-    # The wrapper already normalizes text via prepare_spoken_text; the inner
-    # function should not re-normalize or truncate.
-    tts_config = (
-        tts_config_override
-        if tts_config_override is not None
-        else _load_tts_config()
-    )
-
-    # When the model supplies a speed parameter, inject it into the config
-    # so all downstream provider functions pick it up uniformly.
-    if speed is not None:
-        clamped = max(0.25, min(4.0, float(speed)))
-        tts_config = dict(tts_config)  # shallow copy to avoid mutating the cache
-        tts_config["speed"] = clamped
-
-    # Allow per-call provider override; fall back to the configured default.
-    if provider:
-        provider = provider.lower().strip()
-    else:
-        provider = _get_provider(tts_config)
-
-    # User-declared command provider (type: command under tts.providers.<name>)
-    # resolves BEFORE the built-in dispatch. Built-in names short-circuit here
-    # so a user's ``tts.providers.openai.command`` can't override the real
-    # OpenAI handler.
-    command_provider_config = _resolve_command_provider_config(provider, tts_config)
-
-    # The wrapper splits text into provider-safe chunks before calling this
-    # function. If text exceeds the cap here, it means the caller bypassed
-    # the wrapper — log a warning but don't silently truncate.
-    max_len = _resolve_max_text_length(provider, tts_config)
-    if len(text) > max_len:
-        logger.warning(
-            "TTS text exceeds provider %s cap (%d > %d chars) — "
-            "use text_to_speech_tool() for automatic chunking",
-            provider, len(text), max_len,
-        )
-
-    # Detect platform from gateway env var to choose the best output format.
-    # Several platforms deliver native voice bubbles only for Ogg/Opus
-    # (Telegram, Matrix, Feishu/Lark, WhatsApp, Signal); OpenAI and
-    # ElevenLabs can produce Opus natively (no ffmpeg needed). Edge TTS
-    # always outputs MP3 and needs ffmpeg for conversion.
-    from gateway.session_context import get_session_env
-    platform = get_session_env("HERMES_SESSION_PLATFORM", "").lower()
-    want_opus = platform in OPUS_VOICE_PLATFORMS
-
-    # Determine output path. Ephemeral invocations ignore caller-supplied paths
-    # and allocate exactly one private, pre-opened artifact.
-    if ephemeral:
-        try:
-            owner = EphemeralOwner()
-        except BaseException:
-            return tool_error("TTS generation failed", success=False)
-        file_path = owner.path
-    elif output_path:
-        # Reject '..' traversal components in the user-supplied path. An
-        # explicit absolute path is fine (the agent legitimately writes
-        # audio to user-specified locations), but a path that uses ``..``
-        # to escape its declared base is almost always either a bug or
-        # prompt-injection-controlled — e.g.
-        # ``output_path="audio/../../etc/cron.d/x"``. The terminal tool
-        # can still write anywhere with approval; this just keeps the
-        # unattended TTS surface from materializing files via traversal.
-        from tools.path_security import has_traversal_component
-        if has_traversal_component(output_path):
-            return json.dumps({
-                "success": False,
-                "error": (
-                    f"output_path contains '..' traversal component: "
-                    f"{output_path}. Use an absolute path or one relative "
-                    "to the current directory without '..'."
-                ),
-            }, ensure_ascii=False)
-        file_path = Path(output_path).expanduser()
-        if command_provider_config is not None:
-            # Respect caller-supplied path but align the extension with the
-            # provider's configured output_format so the command writes to a
-            # path the caller actually expects.
-            file_path = _configured_command_tts_output_path(
-                file_path, command_provider_config
-            )
-        from agent.file_safety import is_write_approval_required, is_write_denied
-
-        if is_write_denied(str(file_path)) or is_write_approval_required(str(file_path)):
-            return json.dumps({
-                "success": False,
-                "error": (
-                    f"output_path targets a protected credential or system path: "
-                    f"{file_path}. Choose a normal audio output location."
-                ),
-            }, ensure_ascii=False)
-    else:
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        out_dir = Path(DEFAULT_OUTPUT_DIR)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        if command_provider_config is not None:
-            fmt = _get_command_tts_output_format(command_provider_config)
-            file_path = out_dir / f"tts_{timestamp}.{fmt}"
-        # Use .ogg for Telegram with providers that support native Opus output,
-        # otherwise fall back to .mp3 (Edge TTS will attempt ffmpeg conversion later).
-        elif want_opus and provider in {"openai", "elevenlabs", "mistral", "gemini"}:
-            file_path = out_dir / f"tts_{timestamp}.ogg"
-        else:
-            file_path = out_dir / f"tts_{timestamp}.mp3"
-
-    # Ensure parent directory exists
-    if not ephemeral:
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-    file_str = str(file_path)
-    if not ephemeral:
-        try:
-            late_rebind_artifact = LateRebindArtifact()
-        except BaseException:
-            return tool_error("TTS generation failed", success=False)
-
     try:
-        if not ephemeral and persistence_disabled():
-            return tool_error("TTS generation failed", success=False)
-        # Generate audio with the configured provider
-        if command_provider_config is not None:
-            logger.info(
-                "Generating speech with command TTS provider '%s'...", provider,
-            )
-            file_str = _generate_command_tts(
-                text, file_str, provider, command_provider_config, tts_config,
-            )
-
-        # Plugin-registered TTS backend (issue #30398). Fires when the
-        # configured provider is neither a built-in nor a command-type
-        # entry, AND a plugin is registered under that name. The walrus
-        # binds `_plugin_path` only when the dispatcher returns a path
-        # (i.e. a plugin was actually found); a None return falls
-        # through to the built-in elif chain so unknown names hit the
-        # Edge TTS default at the bottom. The dispatcher itself enforces
-        # built-ins-always-win + command-wins-over-plugin defensively.
-        elif provider not in BUILTIN_TTS_PROVIDERS and (
-            _plugin_path := _dispatch_to_plugin_provider(
-                text, file_str, provider, tts_config,
-            )
-        ) is not None:
-            file_str = _plugin_path
-
-        elif provider == "elevenlabs":
-            try:
-                _import_elevenlabs()
-            except ImportError:
-                return json.dumps({
-                    "success": False,
-                    "error": "ElevenLabs provider selected but 'elevenlabs' package not installed. Run: pip install elevenlabs"
-                }, ensure_ascii=False)
-            logger.info("Generating speech with ElevenLabs...")
-            _generate_elevenlabs(text, file_str, tts_config)
-
-        elif provider == "openai":
-            try:
-                _import_openai_client()
-            except ImportError:
-                return json.dumps({
-                    "success": False,
-                    "error": "OpenAI provider selected but 'openai' package not installed."
-                }, ensure_ascii=False)
-            logger.info("Generating speech with OpenAI TTS...")
-            _generate_openai_tts(text, file_str, tts_config, instructions=instructions)
-
-        elif provider == "deepinfra":
-            try:
-                _import_openai_client()
-            except ImportError:
-                return json.dumps({
-                    "success": False,
-                    "error": "DeepInfra TTS uses the 'openai' SDK but it isn't installed."
-                }, ensure_ascii=False)
-            logger.info("Generating speech with DeepInfra TTS...")
-            _generate_deepinfra_tts(text, file_str, tts_config)
-
-        elif provider == "minimax":
-            logger.info("Generating speech with MiniMax TTS...")
-            _generate_minimax_tts(text, file_str, tts_config)
-
-        elif provider == "xai":
-            logger.info("Generating speech with xAI TTS...")
-            _generate_xai_tts(text, file_str, tts_config)
-
-        elif provider == "mistral":
-            try:
-                _import_mistral_client()
-            except ImportError:
-                return json.dumps({
-                    "success": False,
-                    "error": "Mistral provider selected but 'mistralai' package not installed. "
-                             "Run `hermes setup` to install Mistral support."
-                }, ensure_ascii=False)
-            logger.info("Generating speech with Mistral Voxtral TTS...")
-            _generate_mistral_tts(text, file_str, tts_config)
-
-        elif provider == "gemini":
-            logger.info("Generating speech with Google Gemini TTS...")
-            _generate_gemini_tts(text, file_str, tts_config)
-
-        elif provider == "neutts":
-            if not _check_neutts_available():
-                return json.dumps({
-                    "success": False,
-                    "error": "NeuTTS provider selected but neutts is not installed. "
-                             "Run hermes setup and choose NeuTTS, or install espeak-ng and run python -m pip install -U neutts[all]."
-                }, ensure_ascii=False)
-            logger.info("Generating speech with NeuTTS (local)...")
-            _generate_neutts(text, file_str, tts_config)
-
-        elif provider == "kittentts":
-            try:
-                _import_kittentts()
-            except ImportError:
-                return json.dumps({
-                    "success": False,
-                    "error": "KittenTTS provider selected but 'kittentts' package not installed. "
-                             "Run 'hermes setup tts' and choose KittenTTS, or install manually: "
-                             "pip install https://github.com/KittenML/KittenTTS/releases/download/0.8.1/kittentts-0.8.1-py3-none-any.whl"
-                }, ensure_ascii=False)
-            logger.info("Generating speech with KittenTTS (local, ~25MB)...")
-            _generate_kittentts(text, file_str, tts_config)
-
-        elif provider == "piper":
-            try:
-                _import_piper()
-            except ImportError:
-                return json.dumps({
-                    "success": False,
-                    "error": "Piper provider selected but 'piper-tts' package not installed. "
-                             "Run 'hermes tools' and select Piper under TTS, or install manually: "
-                             "pip install piper-tts",
-                }, ensure_ascii=False)
-            logger.info("Generating speech with Piper (local)...")
-            _generate_piper_tts(text, file_str, tts_config)
-
+        tts_config = dict(tts_config_override or _load_tts_config())
+        selected = provider.lower().strip() if provider else _get_provider(tts_config)
+        output_format = _anonymous_output_format(selected, tts_config)
+        if output_path:
+            destination = Path(output_path).expanduser()
         else:
-            # Default: Edge TTS (free), with NeuTTS as local fallback
-            edge_available = True
-            try:
-                _import_edge_tts()
-            except ImportError:
-                edge_available = False
+            destination = Path(DEFAULT_OUTPUT_DIR) / (
+                "tts_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                + f".{output_format}"
+            )
 
-            if edge_available:
-                logger.info("Generating speech with Edge TTS...")
-                try:
-                    import concurrent.futures
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                        pool.submit(
-                            lambda: asyncio.run(_generate_edge_tts(text, file_str, tts_config))
-                        ).result(timeout=60)
-                except RuntimeError:
-                    asyncio.run(_generate_edge_tts(text, file_str, tts_config))
-            elif _check_neutts_available():
-                logger.info("Edge TTS not available, falling back to NeuTTS (local)...")
-                provider = "neutts"
-                _generate_neutts(text, file_str, tts_config)
-            else:
-                return json.dumps({
-                    "success": False,
-                    "error": "No TTS provider available. Install edge-tts (pip install edge-tts) "
-                             "or set up NeuTTS for local synthesis."
-                }, ensure_ascii=False)
+        def publish_one(permit: Any):
+            from tools.tts_publish import publish_durable
 
-        if not ephemeral and persistence_disabled():
-            return tool_error("TTS generation failed", success=False)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            return publish_durable(permit, destination)
 
-        # Prove provider-returned paths before any repair, conversion, result,
-        # or cleanup operation can trust them.
-        if ephemeral:
-            try:
-                if owner is None or not owner.read(file_str, _EPHEMERAL_TTS_MAX_BYTES):
-                    raise ValueError("empty ephemeral TTS output")
-            except (OSError, ValueError, TypeError):
-                return tool_error("TTS generation failed", success=False)
-        elif not os.path.exists(file_str) or os.path.getsize(file_str) == 0:
-            return json.dumps({
-                "success": False,
-                "error": f"TTS generation produced no output (provider: {provider})"
-            }, ensure_ascii=False)
+        decision, output_format = _generate_anonymous_tts(
+            [text],
+            provider=selected,
+            tts_config=tts_config,
+            speed=speed,
+            instructions=instructions,
+            aggregate_cap=_EPHEMERAL_TTS_MAX_BYTES,
+            durable_consumer=publish_one,
+        )
+        from tools.tts_transaction import EphemeralDelivery
 
-        # Class-level container repair: several backends silently write
-        # MP3/WAV bytes into a .ogg output path (Edge, Piper, xAI,
-        # OpenAI-compatible servers without opus support), which platforms
-        # like Telegram render as broken 0-second voice bubbles. Sniff the
-        # magic bytes once here — covering every current and future
-        # provider — and transcode in place when they don't match.
-        if not ephemeral:
-            file_str = _repair_ogg_container(file_str)
+        if type(decision) is EphemeralDelivery:
+            return _ephemeral_tts_result(decision.chunks, selected, public=False)
 
-        # Try Opus conversion for Telegram compatibility.
-        # Edge TTS outputs MP3, NeuTTS/KittenTTS output WAV. Keep those native
-        # formats for local/CLI playback and only convert when the current
-        # platform actually needs Opus voice delivery.
-        voice_compatible = False
-        if not ephemeral and command_provider_config is not None:
-            # Command providers are documents by default. Voice-bubble
-            # delivery only kicks in when the user explicitly opts in
-            # via ``voice_compatible: true`` in their provider config.
-            if _is_command_tts_voice_compatible(command_provider_config):
-                if not file_str.endswith(".ogg"):
-                    opus_path = _convert_to_opus(file_str)
-                    if opus_path:
-                        file_str = opus_path
-                voice_compatible = file_str.endswith(".ogg")
-        elif not ephemeral and provider not in BUILTIN_TTS_PROVIDERS:
-            # Plugin-registered provider (issue #30398). Voice-bubble
-            # delivery opts in via ``TTSProvider.voice_compatible``
-            # (mirrors the command-provider opt-in). Plugins that
-            # already write Opus skip the ffmpeg conversion.
-            plugin_voice_compatible = _plugin_provider_is_voice_compatible(provider)
-            if plugin_voice_compatible:
-                if not file_str.endswith(".ogg"):
-                    opus_path = _convert_to_opus(file_str)
-                    if opus_path:
-                        file_str = opus_path
-                voice_compatible = file_str.endswith(".ogg")
-        elif (
-            not ephemeral
-            and want_opus
-            and provider in {"edge", "neutts", "minimax", "xai", "kittentts", "piper"}
-            and not file_str.endswith(".ogg")
-        ):
-            opus_path = _convert_to_opus(file_str)
-            if opus_path:
-                file_str = opus_path
-                voice_compatible = True
-        elif not ephemeral and provider in {"elevenlabs", "openai", "mistral", "gemini"}:
-            voice_compatible = want_opus and file_str.endswith(".ogg")
-
-        if ephemeral:
-            try:
-                if owner is None:
-                    raise ValueError("ephemeral TTS ownership unavailable")
-                raw_audio = owner.read(file_str, _EPHEMERAL_TTS_MAX_BYTES)
-                file_size = len(raw_audio)
-            except (OSError, ValueError, TypeError):
-                return tool_error("TTS generation failed", success=False)
-            logger.info("TTS audio materialized in memory (%s bytes, provider: %s)", f"{file_size:,}", provider)
-        else:
-            file_size = os.path.getsize(file_str)
-            logger.info("TTS audio saved: %s (%s bytes, provider: %s)", file_str, f"{file_size:,}", provider)
-
-        if ephemeral:
-            persistence_disabled()
-            return json.dumps({
-                "success": True,
-                "audio": (
-                    "data:audio/mpeg;base64,"
-                    + base64.b64encode(raw_audio).decode("ascii")
-                ),
-                "provider": provider,
-                "voice_compatible": False,
-            }, ensure_ascii=False)
-
-        # Build the durable response with MEDIA tag for platform delivery.
-        media_tag = f"MEDIA:{file_str}"
-        if voice_compatible:
-            media_tag = f"[[audio_as_voice]]\n{media_tag}"
-
+        file_str = str(decision.path)
         return json.dumps({
             "success": True,
             "file_path": file_str,
-            "media_tag": media_tag,
-            "provider": provider,
-            "voice_compatible": voice_compatible,
+            "media_tag": f"MEDIA:{file_str}",
+            "provider": selected,
+            "voice_compatible": False,
         }, ensure_ascii=False)
-
-    except ValueError as e:
-        if ephemeral or persistence_disabled():
-            return tool_error("TTS generation failed", success=False)
-        # Configuration errors (missing API keys, etc.)
-        error_msg = f"TTS configuration error ({provider}): {e}"
-        logger.error("%s", error_msg)
-        return tool_error(error_msg, success=False)
-    except FileNotFoundError as e:
-        if ephemeral or persistence_disabled():
-            return tool_error("TTS generation failed", success=False)
-        # Missing dependencies or files
-        error_msg = f"TTS dependency missing ({provider}): {e}"
-        logger.error("%s", error_msg, exc_info=True)
-        return tool_error(error_msg, success=False)
-    except Exception as e:
-        if ephemeral or persistence_disabled():
-            return tool_error("TTS generation failed", success=False)
-        # Unexpected errors
-        error_msg = f"TTS generation failed ({provider}): {e}"
-        logger.error("%s", error_msg, exc_info=True)
-        return tool_error(error_msg, success=False)
-    finally:
-        if late_rebind_artifact is not None:
-            late_ephemeral, cleanup_ok = late_rebind_artifact.finish()
-            if late_ephemeral or not cleanup_ok:
-                return tool_error("TTS generation failed", success=False)
-        if owner is not None and not owner.cleanup():
-            return tool_error("TTS generation failed", success=False)
+    except BaseException:
+        return tool_error("TTS generation failed", success=False)
 
 
 def text_to_speech_tool(
@@ -4953,216 +4266,117 @@ def text_to_speech_tool(
     instructions: Optional[str] = None,
     provider: Optional[str] = None,
 ) -> str:
-    """Convert text to speech audio with long-form chunking.
-
-    Long text is normalized, split into provider-safe chunks, synthesized
-    sequentially, and packed against destination platform upload limits.
-    Each provider request is encoded to its final format before files are
-    packed. Multi-chunk voice output is re-encoded when combined; failed
-    combines preserve separate valid files, and no over-limit final artifact
-    is returned.
-
-    On messaging platforms, the returned MEDIA:<path> tag is intercepted
-    by the send pipeline and delivered as a native voice message.
-    In CLI mode, the file is saved to ~/voice-memos/.
-
-    Args:
-        text: The text to convert to speech. Provider-specific per-request
-            character caps apply automatically (OpenAI 4096, xAI 15000,
-            MiniMax 10000, ElevenLabs 5k-40k depending on model); longer
-            input is split into ordered chunks without silent truncation.
-        output_path: Optional custom save path.
-        speed: Optional playback speed multiplier (0.25-4.0).
-        instructions: Optional voice-design guidance (tone, emotion, pacing).
-        provider: Optional TTS provider override.
-
-    Returns:
-        str: JSON result with success, file_path, file_paths, and MEDIA tag.
-    """
+    """Generate every chunk anonymously and cross one common decision gate."""
     if not text or not text.strip():
         return tool_error("Text is required", success=False)
-
-    from hermes_cli.persistence import persistence_disabled
-    ephemeral = persistence_disabled()
-
-    # Normalize text via the shared cleaner: markdown, emoji, think blocks,
-    # verifier footer, units, newline flattening.
     try:
-        from tools.tts_text_normalize import prepare_spoken_text
-        text = prepare_spoken_text(text, max_chars=None)
-    except Exception:
-        text = text.strip()
-    if not text:
-        return tool_error("Text is empty after TTS cleanup", success=False)
-
-    tts_config = _load_tts_config()
-
-    # When the model supplies a speed parameter, inject it into the config
-    # so all downstream provider functions pick it up uniformly.
-    if speed is not None:
-        clamped = max(0.25, min(4.0, float(speed)))
-        tts_config = dict(tts_config)  # shallow copy to avoid mutating the cache
-        tts_config["speed"] = clamped
-
-    # Allow per-call provider override; fall back to the configured default.
-    if provider:
-        provider = provider.lower().strip()
-    else:
-        provider = _get_provider(tts_config)
-
-    command_provider_config = _resolve_command_provider_config(provider, tts_config)
-    max_len = _resolve_max_text_length(provider, tts_config)
-    chunks = _split_text_for_tts(text, max_len)
-    if not chunks:
-        return tool_error("Text is required", success=False)
-    if len(chunks) > 1:
-        logger.info(
-            "TTS text for provider %s split into %d chunks (input=%d chars, cap=%d)",
-            provider,
-            len(chunks),
-            len(text),
-            max_len,
-        )
-
-    from gateway.session_context import get_session_env
-    platform = get_session_env("HERMES_SESSION_PLATFORM", "").lower()
-    want_opus = platform in OPUS_VOICE_PLATFORMS
-    delivery_profile = _resolve_audio_delivery_profile(platform, tts_config)
-
-    # Ephemeral long-form delivery is assembled only from bounded data
-    # envelopes returned after each private single-chunk lifecycle has already
-    # cleaned its owned artifact. No path or cleanup authority crosses calls.
-    if ephemeral:
-        audio_data: List[str] = []
-        total_bytes = 0
-        chunk_results: List[Dict[str, Any]] = []
         try:
-            for chunk in chunks:
-                persistence_disabled()
-                raw_result = _text_to_speech_single(
-                    text=chunk,
-                    output_path=None,
-                    speed=speed,
-                    instructions=instructions,
-                    provider=provider,
-                    tts_config_override=tts_config,
+            from tools.tts_text_normalize import prepare_spoken_text
+
+            normalized = prepare_spoken_text(text, max_chars=None)
+        except Exception:
+            normalized = text.strip()
+        if not normalized:
+            return tool_error("Text is empty after TTS cleanup", success=False)
+
+        tts_config = _load_tts_config()
+        if speed is not None:
+            tts_config = dict(tts_config)
+            tts_config["speed"] = max(0.25, min(4.0, float(speed)))
+        selected = provider.lower().strip() if provider else _get_provider(tts_config)
+        validated_output_path: Path | None = None
+        if output_path:
+            from agent.file_safety import is_write_approval_required, is_write_denied
+            from tools.path_security import has_traversal_component
+
+            if has_traversal_component(output_path):
+                return json.dumps({
+                    "success": False,
+                    "error": (
+                        f"output_path contains '..' traversal component: {output_path}. "
+                        "Use an absolute path or one relative to the current directory "
+                        "without '..'."
+                    ),
+                }, ensure_ascii=False)
+            validated_output_path = Path(output_path).expanduser()
+            command_config = _resolve_command_provider_config(selected, tts_config)
+            if command_config is not None:
+                validated_output_path = _configured_command_tts_output_path(
+                    validated_output_path, command_config
                 )
-                parsed = json.loads(raw_result)
-                audio = parsed.get("audio")
-                if not parsed.get("success") or not isinstance(audio, str):
-                    raise ValueError("invalid ephemeral TTS result")
-                prefix = "data:audio/mpeg;base64,"
-                if not audio.startswith(prefix):
-                    raise ValueError("invalid ephemeral TTS envelope")
-                decoded = base64.b64decode(audio[len(prefix):], validate=True)
-                total_bytes += len(decoded)
-                if total_bytes > delivery_profile.max_file_bytes:
-                    raise ValueError("ephemeral audio exceeds delivery cap")
-                persistence_disabled()
-                audio_data.append(audio)
-                chunk_results.append(parsed)
-            return json.dumps({
-                "success": True,
-                "audio": audio_data[0],
-                "audio_parts": audio_data,
-                "provider": chunk_results[0].get("provider", provider),
-                "voice_compatible": False,
-                "chunk_count": len(chunks),
-                "delivery_file_count": len(audio_data),
-                "combined_chunks": False,
-            }, ensure_ascii=False)
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            return tool_error("TTS generation failed", success=False)
+            if is_write_denied(str(validated_output_path)) or is_write_approval_required(
+                str(validated_output_path)
+            ):
+                return json.dumps({
+                    "success": False,
+                    "error": (
+                        "output_path targets a protected credential or system path: "
+                        f"{validated_output_path}. Choose a normal audio output location."
+                    ),
+                }, ensure_ascii=False)
+        chunks = _split_text_for_tts(
+            normalized, _resolve_max_text_length(selected, tts_config)
+        )
+        if not chunks:
+            return tool_error("Text is required", success=False)
 
-    # Determine output path (single-chunk short-circuit uses the final path).
-    if output_path:
-        from tools.path_security import has_traversal_component
-        if has_traversal_component(output_path):
-            return json.dumps({
-                "success": False,
-                "error": (
-                    f"output_path contains '..' traversal component: {output_path}. "
-                    "Use an absolute path or one relative to the current directory "
-                    "without '..'."
-                ),
-            }, ensure_ascii=False)
-        base_path = Path(output_path).expanduser()
-        if command_provider_config is not None:
-            base_path = _configured_command_tts_output_path(
-                base_path, command_provider_config,
-            )
-        from agent.file_safety import is_write_approval_required, is_write_denied
-        if is_write_denied(str(base_path)) or is_write_approval_required(str(base_path)):
-            return json.dumps({
-                "success": False,
-                "error": (
-                    f"output_path targets a protected credential or system path: "
-                    f"{base_path}. Choose a normal audio output location."
-                ),
-            }, ensure_ascii=False)
-    else:
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        out_dir = Path(DEFAULT_OUTPUT_DIR)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        if command_provider_config is not None:
-            fmt = _get_command_tts_output_format(command_provider_config)
-            base_path = out_dir / f"tts_{timestamp}.{fmt}"
-        elif want_opus and provider in {"openai", "elevenlabs", "mistral", "gemini"}:
-            base_path = out_dir / f"tts_{timestamp}.ogg"
+        from gateway.session_context import get_session_env
+
+        platform_name = get_session_env("HERMES_SESSION_PLATFORM", "").lower()
+        delivery_profile = _resolve_audio_delivery_profile(platform_name, tts_config)
+        output_format = _anonymous_output_format(selected, tts_config)
+        if validated_output_path is not None:
+            base_path = validated_output_path
         else:
-            base_path = out_dir / f"tts_{timestamp}.mp3"
-    base_path.parent.mkdir(parents=True, exist_ok=True)
-
-    generated_artifacts: set[str] = set()
-    final_paths: List[str] = []
-    chunk_results: List[Dict[str, Any]] = []
-    try:
-        encoded_paths: List[str] = []
-        for index, chunk in enumerate(chunks, start=1):
-            if len(chunks) == 1:
-                chunk_path = base_path
-            else:
-                chunk_path = base_path.with_name(
+            base_path = Path(DEFAULT_OUTPUT_DIR) / (
+                "tts_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                + f".{output_format}"
+            )
+        if len(chunks) == 1:
+            destinations = (base_path,)
+        else:
+            destinations = tuple(
+                base_path.with_name(
                     f"{base_path.stem}.chunk{index:03d}{base_path.suffix}"
                 )
-            generated_artifacts.add(str(chunk_path))
-            single_kwargs = {
-                "text": chunk,
-                "output_path": str(chunk_path),
-                "speed": speed,
-                "instructions": instructions,
-                "provider": provider,
-                "tts_config_override": tts_config,
-            }
-            raw_result = _text_to_speech_single(**single_kwargs)
-            if persistence_disabled():
-                return tool_error("TTS generation failed", success=False)
-            try:
-                chunk_result = json.loads(raw_result)
-            except (json.JSONDecodeError, TypeError):
-                raise RuntimeError(
-                    f"TTS chunk {index} returned invalid JSON: {str(raw_result)[:200]}"
-                )
-            if not chunk_result.get("success"):
-                error_msg = chunk_result.get("error", "unknown error")
-                if error_msg == "TTS generation failed":
-                    return tool_error("TTS generation failed", success=False)
-                return tool_error(
-                    f"TTS chunk {index} failed ({provider}): {error_msg}",
-                    success=False,
-                )
-            actual_path = str(chunk_result.get("file_path") or chunk_path)
-            if not os.path.isfile(actual_path) or os.path.getsize(actual_path) <= 0:
-                raise RuntimeError(
-                    f"TTS chunk {index} produced no final audio: {actual_path}"
-                )
-            generated_artifacts.add(actual_path)
-            encoded_paths.append(actual_path)
-            chunk_results.append(chunk_result)
+                for index in range(1, len(chunks) + 1)
+            )
 
-        voice_compatible = bool(chunk_results) and all(
-            bool(result.get("voice_compatible")) for result in chunk_results
+        def publish_all(permit: Any):
+            from tools.path_security import has_traversal_component
+            from tools.tts_publish import publish_durable_many
+
+            if output_path and has_traversal_component(output_path):
+                raise ValueError("tts_generation_failed")
+            base_path.parent.mkdir(parents=True, exist_ok=True)
+            return publish_durable_many(permit, destinations)
+
+        decision, output_format = _generate_anonymous_tts(
+            chunks,
+            provider=selected,
+            tts_config=tts_config,
+            speed=speed,
+            instructions=instructions,
+            aggregate_cap=min(
+                _EPHEMERAL_TTS_MAX_BYTES, delivery_profile.max_file_bytes
+            ),
+            durable_consumer=publish_all,
         )
+
+        from tools.tts_transaction import EphemeralDelivery
+
+        if type(decision) is EphemeralDelivery:
+            return _ephemeral_tts_result(decision.chunks, selected, public=True)
+
+        encoded_paths = [str(item.path) for item in decision]
+        voice_compatible = _anonymous_voice_compatible(selected, tts_config)
+        if platform_name in OPUS_VOICE_PLATFORMS and (
+            selected == "edge" or voice_compatible
+        ):
+            converted = [_convert_to_opus(path) for path in encoded_paths]
+            if all(isinstance(path, str) and path for path in converted):
+                encoded_paths = [str(path) for path in converted]
+                voice_compatible = True
         delivery_base = base_path.with_suffix(Path(encoded_paths[0]).suffix)
         final_paths, combined_chunks = _build_audio_delivery_files(
             encoded_paths,
@@ -5170,25 +4384,15 @@ def text_to_speech_tool(
             delivery_profile,
             voice_compatible=voice_compatible,
         )
-
-        for path in final_paths:
-            logger.info(
-                "TTS audio saved: %s (%s bytes, provider: %s)",
-                path,
-                f"{os.path.getsize(path):,}",
-                provider,
-            )
-
         media_tag = "\n".join(f"MEDIA:{path}" for path in final_paths)
         if voice_compatible:
             media_tag = f"[[audio_as_voice]]\n{media_tag}"
-
         return json.dumps({
             "success": True,
             "file_path": final_paths[0],
             "file_paths": final_paths,
             "media_tag": media_tag,
-            "provider": chunk_results[0].get("provider", provider),
+            "provider": selected,
             "voice_compatible": voice_compatible,
             "chunk_count": len(chunks),
             "delivery_file_count": len(final_paths),
@@ -5199,30 +4403,10 @@ def text_to_speech_tool(
                 "target_file_bytes": delivery_profile.target_file_bytes,
             },
         }, ensure_ascii=False)
-    except ValueError as exc:
-        error_msg = f"TTS delivery error ({provider}): {exc}"
-        logger.error("%s", error_msg)
-        return tool_error(error_msg, success=False)
-    except Exception as exc:
-        error_msg = f"TTS long-form generation failed ({provider}): {exc}"
-        logger.error("%s", error_msg, exc_info=True)
-        return tool_error(error_msg, success=False)
-    finally:
-        if persistence_disabled():
-            generated_artifacts.clear()
-        final_absolute = {os.path.abspath(path) for path in final_paths}
-        for artifact in generated_artifacts:
-            if os.path.abspath(artifact) in final_absolute:
-                continue
-            try:
-                os.unlink(artifact)
-            except OSError:
-                pass
+    except BaseException:
+        return tool_error("TTS generation failed", success=False)
 
 
-# ===========================================================================
-# Requirements check
-# ===========================================================================
 def check_tts_requirements() -> bool:
     """Return whether the explicitly resolved TTS provider can run.
 

@@ -68,7 +68,7 @@ class TestTextToSpeechToolChunking:
         def fake_openai(t, out, cfg, **_kw):
             captured_text.append(t)
             with open(out, "wb") as f:
-                f.write(b"\x00")
+                f.write(b"ID3\x04\x00\x00\x00\x00\x00\x00private-audio")
             return out
 
         def fake_combine(paths, output_path, *, voice_compatible=False):
@@ -97,10 +97,10 @@ class TestTextToSpeechToolChunking:
         text = "B" * 12000
         captured_text = {}
 
-        def fake_xai(t, out, cfg):
+        def fake_xai(t, out, cfg, **_kw):
             captured_text["text"] = t
             with open(out, "wb") as f:
-                f.write(b"\x00")
+                f.write(b"ID3\x04\x00\x00\x00\x00\x00\x00private-audio")
             return out
 
         monkeypatch.setattr("tools.tts_tool._generate_xai_tts", fake_xai)
@@ -123,7 +123,7 @@ class TestTextToSpeechToolChunking:
         def fake_openai(t, out, cfg, **_kw):
             captured_text.append(t)
             with open(out, "wb") as f:
-                f.write(b"\x00")
+                f.write(b"ID3\x04\x00\x00\x00\x00\x00\x00private-audio")
             return out
 
         def fake_combine(paths, output_path, *, voice_compatible=False):

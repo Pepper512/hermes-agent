@@ -448,7 +448,9 @@ class AnonymousAudioStage:
 
         try:
             parent_path = (
-                Path(tempfile.gettempdir()) if parent is None else Path(parent)
+                Path(tempfile.gettempdir()).resolve(strict=True)
+                if parent is None
+                else Path(parent)
             )
         except (OSError, TypeError, ValueError):
             raise AnonymousAudioStageError(_STAGE_ERROR) from None

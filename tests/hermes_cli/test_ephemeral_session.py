@@ -209,12 +209,14 @@ def fake_run_conversation(self, prompt):
         tts_tool._load_tts_config = lambda: {"provider": "edge"}
         tts_tool._get_provider = lambda _cfg: "edge"
         tts_tool._resolve_max_text_length = lambda *_a: 10000
-        tts_tool._import_edge_tts = lambda: object()
-        async def fake_tts(text, output_path, _config):
-            path = Path(output_path)
-            path.write_bytes(b"private-audio")
-            return str(path)
-        tts_tool._generate_edge_tts = fake_tts
+        async def fake_tts(_request, sink_path, _config, **_kwargs):
+            sink_fd = int(Path(sink_path).name)
+            __import__("os").write(
+                sink_fd,
+                b"ID3\x04\x00\x00\x00\x00\x00\x00private-audio",
+            )
+            return sink_path
+        tts_tool._generate_edge_tts_to_sink = fake_tts
         speech = json.loads(tts_tool.text_to_speech_tool(prompt))
         assert speech["audio"].startswith("data:audio/")
         assert "file_path" not in speech

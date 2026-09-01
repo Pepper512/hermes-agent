@@ -1,8 +1,4 @@
-"""Pre-cutover provider adapters for anonymous TTS audio sinks.
-
-These internals are intentionally unreachable from the public TTS entries
-until the full GENERATE -> SEAL -> DECIDE -> PUBLISH transaction cuts over.
-"""
+"""Provider adapters for anonymous TTS audio sinks."""
 
 from __future__ import annotations
 
@@ -190,14 +186,23 @@ class _RejectedBuiltInAdapter(_SynchronousLifecycle):
 
 
 @dataclass(frozen=True)
-class _DeferredBuiltInAdapter(_SynchronousLifecycle):
+class _BuiltInAdapter(_SynchronousLifecycle):
     provider_name: str
+    tts_config: Mapping[str, Any]
 
     def generate(self, request: ProviderRequest, sink: ProviderAudioSink) -> object:
-        _validate_provider_audio_sink(sink)
-        # Task 7 supplies the remaining audited built-in writers.  Until then,
-        # this parallel boundary is deliberately fail-closed and unreachable.
-        raise AnonymousSinkUnsupported(_UNSUPPORTED)
+        from tools.tts_tool import _generate_builtin_tts_to_sink
+
+        path, output_format, maximum_bytes = _validate_provider_audio_sink(sink)
+        acknowledgement = _generate_builtin_tts_to_sink(
+            self.provider_name,
+            request,
+            path,
+            dict(self.tts_config),
+            output_format=output_format,
+            maximum_bytes=maximum_bytes,
+        )
+        return _validate_acknowledgement(acknowledgement, path)
 
 
 @dataclass(frozen=True)
@@ -305,4 +310,4 @@ def builtin_adapter(provider_name: str, tts_config: Mapping[str, Any]) -> TTSPro
         return _EdgeAdapter(tts_config)
     if key == "elevenlabs":
         return _ElevenLabsAdapter(tts_config)
-    return _DeferredBuiltInAdapter(key)
+    return _BuiltInAdapter(key, MappingProxyType(dict(tts_config)))

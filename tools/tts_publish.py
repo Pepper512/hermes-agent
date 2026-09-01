@@ -1046,9 +1046,54 @@ def publish_durable(
     raise TTSPublishError(_PUBLISH_ERROR)
 
 
+def publish_durable_many(
+    permit: DurablePublicationPermit,
+    destinations: tuple[Path, ...],
+) -> tuple[PublishedAudio, ...]:
+    """Consume one transaction permit and publish its ordered sealed stages.
+
+    Every provider stage has already sealed before this function can consume
+    the permit.  Destinations are trusted only after the transaction's single
+    durable decision and are paired positionally; provider acknowledgements
+    never participate in publication selection.
+    """
+
+    if not destinations:
+        raise TTSPublishError(_PUBLISH_ERROR)
+
+    def consume(
+        stages: tuple[tuple[AnonymousAudioStage, SealedAudio], ...],
+        observation: PersistenceObservation,
+    ) -> tuple[_PublicationOutcome, ...]:
+        if len(stages) != len(destinations):
+            _scrub_all_stages(stages)
+            return (_PublicationOutcome("failed"),)
+        outcomes: list[_PublicationOutcome] = []
+        for (stage, sealed), destination in zip(stages, destinations):
+            authorized_destination = _validate_destination(destination)
+            outcomes.append(
+                _publish_one(stage, sealed, observation, authorized_destination)
+            )
+        return tuple(outcomes)
+
+    outcomes = permit._consume_for_publication(consume)
+    if (
+        type(outcomes) is not tuple
+        or len(outcomes) != len(destinations)
+        or any(type(outcome) is not _PublicationOutcome for outcome in outcomes)
+    ):
+        raise TTSPublishError(_PUBLISH_ERROR)
+    if any(outcome.status == "uncertain" for outcome in outcomes):
+        raise TTSPublishUncertain(_PUBLISH_UNCERTAIN)
+    if any(outcome.status != "published" for outcome in outcomes):
+        raise TTSPublishError(_PUBLISH_ERROR)
+    return tuple(PublishedAudio(path=path) for path in destinations)
+
+
 __all__ = [
     "PublishedAudio",
     "TTSPublishError",
     "TTSPublishUncertain",
     "publish_durable",
+    "publish_durable_many",
 ]
