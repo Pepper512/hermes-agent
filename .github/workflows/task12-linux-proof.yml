@@ -44,6 +44,36 @@ jobs:
         with:
           command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
 
+      - name: Diagnose Linux seek-proof limits
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run --no-sync python - <<'PY'
+          import errno
+          import os
+          import tempfile
+
+          offsets = (1 << 20, 1 << 30, 1 << 40, 1 << 50, 1 << 60)
+          with tempfile.TemporaryDirectory() as root:
+              regular_path = os.path.join(root, "regular")
+              regular_fd = os.open(regular_path, os.O_CREAT | os.O_RDWR, 0o600)
+              directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+              try:
+                  for offset in offsets:
+                      results = []
+                      for descriptor in (regular_fd, directory_fd):
+                          try:
+                              os.lseek(descriptor, offset, os.SEEK_SET)
+                          except OSError as exc:
+                              results.append(errno.errorcode.get(exc.errno, str(exc.errno)))
+                          else:
+                              results.append("ok")
+                      print(f"seek-proof offset={offset}: regular={results[0]} directory={results[1]}")
+              finally:
+                  os.close(directory_fd)
+                  os.close(regular_fd)
+          PY
+
       - name: Run the approved Linux architecture gate
         shell: bash
         env:
