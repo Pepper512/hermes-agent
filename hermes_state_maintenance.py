@@ -931,17 +931,21 @@ def retire_recovery_barrier(
         if barrier is None:
             raise UnsafeRecoveryBarrier
         barrier_fd, identity, nonce = barrier
-        moved = False
+        retirement_attempted = False
         try:
             if nonce != operation_nonce:
                 raise UnsafeRecoveryBarrier
             retired_name = _RECOVERY_BARRIER_RETIRED_PREFIX + secrets.token_hex(16)
+            # Record uncertainty before entering the mutating syscall.  A
+            # catchable signal can arrive after the kernel rename succeeds but
+            # before the helper returns; every exception from this point must
+            # conservatively attempt no-replace republication.
+            retirement_attempted = True
             _rename_barrier_no_replace(
                 profile_fd,
                 _RECOVERY_BARRIER_NAME,
                 retired_name,
             )
-            moved = True
             _validate_retired_barrier(
                 profile_fd,
                 barrier_fd,
@@ -956,15 +960,15 @@ def retire_recovery_barrier(
                 retired_name,
             )
         except ProfileStateMaintenanceError:
-            if moved:
+            if retirement_attempted:
                 _republish_barrier_after_failed_retirement(profile_fd, payload)
             raise
         except (OSError, TypeError, ValueError, OverflowError):
-            if moved:
+            if retirement_attempted:
                 _republish_barrier_after_failed_retirement(profile_fd, payload)
             raise UnsafeRecoveryBarrier from None
         except BaseException:
-            if moved:
+            if retirement_attempted:
                 try:
                     _republish_barrier_after_failed_retirement(profile_fd, payload)
                 except BaseException:
@@ -998,7 +1002,7 @@ def _profile_state_mutation_scope(
             leases.append(lease)
         for lease in leases:
             require_no_recovery_barrier(lease)
-        yield
+        yield tuple(leases)
     finally:
         for lease in reversed(leases):
             lease.close()

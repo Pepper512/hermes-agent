@@ -459,6 +459,47 @@ def test_recovery_barrier_retirement_baseexception_republishes(tmp_path, monkeyp
         exclusive.close()
 
 
+def test_recovery_barrier_retirement_republishes_when_rename_returns_cancellation(
+    tmp_path, monkeypatch
+):
+    profile = _profile(tmp_path)
+    nonce = _operation_nonce()
+    exclusive = maintenance.acquire_profile_state_exclusive(
+        profile, timeout_seconds=1.0
+    )
+    maintenance.publish_recovery_barrier(exclusive, nonce)
+    original_identity = (
+        _barrier_path(profile).stat().st_dev,
+        _barrier_path(profile).stat().st_ino,
+    )
+    real_rename = maintenance._rename_barrier_no_replace
+
+    def rename_then_cancel(profile_fd: int, source: str, destination: str) -> None:
+        real_rename(profile_fd, source, destination)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        maintenance,
+        "_rename_barrier_no_replace",
+        rename_then_cancel,
+    )
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            maintenance.retire_recovery_barrier(exclusive, nonce)
+    finally:
+        exclusive.close()
+
+    assert _barrier_path(profile).exists()
+    retired = list(profile.glob(maintenance._RECOVERY_BARRIER_RETIRED_PREFIX + "*"))
+    assert len(retired) == 1
+    assert (retired[0].stat().st_dev, retired[0].stat().st_ino) == original_identity
+    with maintenance.acquire_profile_state_shared(
+        profile, timeout_seconds=1.0
+    ) as shared:
+        with pytest.raises(maintenance.ProfileStateRecoveryRequired):
+            maintenance.require_no_recovery_barrier(shared)
+
+
 def test_recovery_barrier_close_failure_preserves_category_and_fd_custody(
     tmp_path, monkeypatch
 ):
@@ -592,6 +633,48 @@ def test_multi_profile_acquisition_baseexception_releases_prior_lease(
     for profile in (first, second):
         with maintenance.acquire_profile_state_exclusive(profile, timeout_seconds=0.1):
             pass
+
+
+def test_multi_profile_barrier_cancellation_releases_all_leases_in_reverse(
+    tmp_path, monkeypatch
+):
+    first = _profile(tmp_path, "a-profile")
+    second = _profile(tmp_path, "b-profile")
+    acquired: list[Path] = []
+    checked: list[Path] = []
+    released: list[Path] = []
+
+    class SyntheticLease:
+        def __init__(self, profile_root: Path) -> None:
+            self.profile_root = profile_root
+
+        def close(self) -> None:
+            released.append(self.profile_root)
+
+    def acquire(profile_root: Path, *, timeout_seconds: float):
+        assert timeout_seconds >= 0
+        acquired.append(profile_root)
+        return SyntheticLease(profile_root)
+
+    def require_barrier_free(lease: SyntheticLease) -> None:
+        checked.append(lease.profile_root)
+        if lease.profile_root == second:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(maintenance, "acquire_profile_state_shared", acquire)
+    monkeypatch.setattr(
+        maintenance,
+        "require_no_recovery_barrier",
+        require_barrier_free,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        with maintenance._profile_state_mutation_scope((second, first)):
+            raise AssertionError("scope must not be entered")
+
+    assert acquired == [first, second]
+    assert checked == [first, second]
+    assert released == [second, first]
 
 
 @pytest.mark.require_symlinks

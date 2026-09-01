@@ -33,6 +33,8 @@ import time
 import weakref
 from collections import deque
 from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import wraps
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
@@ -98,9 +100,12 @@ from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_schema import SessionSchemaMixin
 from hermes_state_search import SessionSearchMixin
 from hermes_state_maintenance import (
+    SharedStateLease,
     UnsafeProfileState,
     _fsync_directory,
     _leased_profile_mutation,
+    _profile_state_mutation_scope,
+    _validate_live_lease,
 )
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
@@ -122,22 +127,162 @@ def _sessiondb_profile_roots(
     if sessions_dir is None:
         return (profile_root,)
     canonical_sessions_dir = profile_root / "sessions"
-    if (
-        type(sessions_dir) is not type(Path())
-        or sessions_dir != canonical_sessions_dir
-    ):
-        raise UnsafeProfileState
-    try:
-        named = os.stat(sessions_dir, follow_symlinks=False)
-    except FileNotFoundError:
-        # An absent exact sink has no sidecars to remove.  The profile lease
-        # still protects the database phase and any later canonical creation.
-        return (profile_root,)
-    except OSError:
-        raise UnsafeProfileState from None
-    if not stat.S_ISDIR(named.st_mode):
+    if type(sessions_dir) is not type(Path()) or sessions_dir != canonical_sessions_dir:
         raise UnsafeProfileState
     return (profile_root,)
+
+
+class _SessionSidecarAuthority:
+    """Borrowed, profile-relative authority for one canonical sessions sink."""
+
+    __slots__ = ("profile_fd", "directory_fd", "identity")
+
+    def __init__(
+        self,
+        *,
+        profile_fd: int,
+        directory_fd: int,
+        identity: Optional[tuple[int, ...]],
+    ) -> None:
+        self.profile_fd = profile_fd
+        self.directory_fd = directory_fd
+        self.identity = identity
+
+
+_SESSION_SIDECAR_AUTHORITY: ContextVar[Optional[_SessionSidecarAuthority]] = ContextVar(
+    "hermes_session_sidecar_authority", default=None
+)
+
+
+def _session_sidecar_identity(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_uid,
+        value.st_gid,
+        stat.S_IMODE(value.st_mode),
+    )
+
+
+def _valid_session_sidecar_directory(value: os.stat_result) -> bool:
+    return (
+        stat.S_ISDIR(value.st_mode)
+        and value.st_uid == os.geteuid()
+        and value.st_nlink >= 2
+    )
+
+
+def _validate_session_sidecar_authority(
+    authority: _SessionSidecarAuthority,
+) -> None:
+    if authority.directory_fd < 0:
+        try:
+            os.stat(
+                "sessions",
+                dir_fd=authority.profile_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return
+        except OSError:
+            raise UnsafeProfileState from None
+        raise UnsafeProfileState
+    try:
+        held = os.fstat(authority.directory_fd)
+        named = os.stat(
+            "sessions",
+            dir_fd=authority.profile_fd,
+            follow_symlinks=False,
+        )
+    except OSError:
+        raise UnsafeProfileState from None
+    if (
+        authority.identity is None
+        or not _valid_session_sidecar_directory(held)
+        or not _valid_session_sidecar_directory(named)
+        or _session_sidecar_identity(held) != authority.identity
+        or _session_sidecar_identity(named) != authority.identity
+    ):
+        raise UnsafeProfileState
+
+
+@contextmanager
+def _held_session_sidecar_authority(
+    lease: SharedStateLease,
+    sessions_dir: Optional[Path],
+):
+    profile_fd = _validate_live_lease(lease, SharedStateLease)
+    if sessions_dir is None:
+        yield None
+        return
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        directory_fd = os.open("sessions", flags, dir_fd=profile_fd)
+    except FileNotFoundError:
+        authority = _SessionSidecarAuthority(
+            profile_fd=profile_fd,
+            directory_fd=-1,
+            identity=None,
+        )
+        _validate_session_sidecar_authority(authority)
+        yield authority
+        return
+    except OSError:
+        raise UnsafeProfileState from None
+    try:
+        held = os.fstat(directory_fd)
+        authority = _SessionSidecarAuthority(
+            profile_fd=profile_fd,
+            directory_fd=directory_fd,
+            identity=_session_sidecar_identity(held),
+        )
+        _validate_session_sidecar_authority(authority)
+        yield authority
+    finally:
+        try:
+            os.close(directory_fd)
+        except OSError:
+            pass
+
+
+def _leased_session_sidecar_mutation(sessions_dir_resolver):
+    """Lease one SessionDB profile and retain its canonical sessions inode."""
+
+    def decorate(function):
+        @wraps(function)
+        def wrapped(*args, **kwargs):
+            session_db = args[0]
+            sessions_dir = sessions_dir_resolver(*args, **kwargs)
+            roots = _sessiondb_profile_roots(session_db, sessions_dir)
+            with _profile_state_mutation_scope(roots) as leases:
+                if len(leases) != 1 or type(leases[0]) is not SharedStateLease:
+                    raise UnsafeProfileState
+                with _held_session_sidecar_authority(
+                    leases[0],
+                    sessions_dir,
+                ) as authority:
+                    token = _SESSION_SIDECAR_AUTHORITY.set(authority)
+                    try:
+                        return function(*args, **kwargs)
+                    finally:
+                        _SESSION_SIDECAR_AUTHORITY.reset(token)
+
+        return wrapped
+
+    return decorate
+
+
+def _revalidate_current_session_sidecar_authority(
+    sessions_dir: Optional[Path],
+) -> None:
+    if sessions_dir is None:
+        return
+    authority = _SESSION_SIDECAR_AUTHORITY.get()
+    if authority is None:
+        raise UnsafeProfileState
+    _validate_session_sidecar_authority(authority)
 
 
 def _state_db_profile_roots(db_path: Path | str) -> tuple[Path, ...]:
@@ -9272,14 +9417,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         self._execute_write(_do)
 
-    @_leased_profile_mutation(
-        lambda self, sessions_dir=None: _sessiondb_profile_roots(self, sessions_dir)
-    )
+    @_leased_session_sidecar_mutation(lambda _self, sessions_dir=None: sessions_dir)
     def prune_empty_ghost_sessions(self, sessions_dir: "Optional[Path]" = None) -> int:
         """Remove empty TUI ghost sessions (no messages, no title, >24hr old)."""
         cutoff = time.time() - 86400  # Only sessions older than 24 hours
 
         def _do(conn):
+            _revalidate_current_session_sidecar_authority(sessions_dir)
             rows = conn.execute("""
                 SELECT id FROM sessions
                 WHERE source = 'tui'
@@ -13524,23 +13668,34 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         if sessions_dir is None:
             return
+        authority = _SESSION_SIDECAR_AUTHORITY.get()
+        if authority is None:
+            raise UnsafeProfileState
+        _validate_session_sidecar_authority(authority)
+        if authority.directory_fd < 0:
+            return
         for suffix in (".json", ".jsonl"):
-            p = sessions_dir / f"{session_id}{suffix}"
+            name = f"{session_id}{suffix}"
+            if "\x00" in name or Path(name).name != name:
+                continue
             try:
-                p.unlink(missing_ok=True)
+                os.unlink(name, dir_fd=authority.directory_fd)
             except OSError:
                 pass
         # request_dump files use session_id as a prefix component
         try:
-            for p in sessions_dir.glob(f"request_dump_{session_id}_*.json"):
+            prefix = f"request_dump_{session_id}_"
+            for name in os.listdir(authority.directory_fd):
+                if not name.startswith(prefix) or not name.endswith(".json"):
+                    continue
                 try:
-                    p.unlink(missing_ok=True)
+                    os.unlink(name, dir_fd=authority.directory_fd)
                 except OSError:
                     pass
         except OSError:
             pass
         try:
-            _fsync_directory(sessions_dir)
+            os.fsync(authority.directory_fd)
         except OSError:
             pass
 
@@ -13561,10 +13716,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             delegate_ids = _collect_delegate_child_ids(self._conn, [session_id])
         return [session_id, *sorted(delegate_ids)]
 
-    @_leased_profile_mutation(
-        lambda self, _session_id, sessions_dir=None, **_kwargs: (
-            _sessiondb_profile_roots(self, sessions_dir)
-        )
+    @_leased_session_sidecar_mutation(
+        lambda _self, _session_id, sessions_dir=None, **_kwargs: sessions_dir
     )
     def delete_session(
         self,
@@ -13594,6 +13747,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         )
 
         def _do(conn):
+            _revalidate_current_session_sidecar_authority(sessions_dir)
             cursor = conn.execute(
                 "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
             )
@@ -13625,10 +13779,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._remove_session_files(sessions_dir, session_id)
         return bool(deleted)
 
-    @_leased_profile_mutation(
-        lambda self, _session_id, sessions_dir=None: (
-            _sessiondb_profile_roots(self, sessions_dir)
-        )
+    @_leased_session_sidecar_mutation(
+        lambda _self, _session_id, sessions_dir=None: sessions_dir
     )
     def delete_session_if_empty(
         self,
@@ -13650,6 +13802,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         flushed. Returns True if the session was deleted.
         """
         def _do(conn):
+            _revalidate_current_session_sidecar_authority(sessions_dir)
             cursor = conn.execute(
                 """
                 DELETE FROM sessions
@@ -13674,10 +13827,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._remove_session_files(sessions_dir, session_id)
         return bool(deleted)
 
-    @_leased_profile_mutation(
-        lambda self, _session_ids, sessions_dir=None: (
-            _sessiondb_profile_roots(self, sessions_dir)
-        )
+    @_leased_session_sidecar_mutation(
+        lambda _self, _session_ids, sessions_dir=None: sessions_dir
     )
     def delete_sessions(
         self,
@@ -13721,6 +13872,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         removed_delegate_ids: list[str] = []
 
         def _do(conn):
+            _revalidate_current_session_sidecar_authority(sessions_dir)
             placeholders = ",".join("?" * len(unique_ids))
             # First, filter to IDs that actually exist — we want to
             # return the real deleted count, not the input length.
@@ -13808,8 +13960,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             return cursor.fetchone()[0]
 
-    @_leased_profile_mutation(
-        lambda self, sessions_dir=None: _sessiondb_profile_roots(self, sessions_dir)
+    @_leased_session_sidecar_mutation(
+        lambda _self, sessions_dir=None: sessions_dir
     )
     def delete_empty_sessions(
         self,
@@ -13843,6 +13995,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         removed_ids: list[str] = []
 
         def _do(conn):
+            _revalidate_current_session_sidecar_authority(sessions_dir)
             cursor = conn.execute(
                 f"SELECT id FROM sessions WHERE {self._EMPTY_SESSION_WHERE}"
             )
@@ -14190,9 +14343,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self.set_session_archived(sid, True)
         return len(ids)
 
-    @_leased_profile_mutation(
-        lambda self, older_than_days=90, source=None, sessions_dir=None, **_filters: (
-            _sessiondb_profile_roots(self, sessions_dir)
+    @_leased_session_sidecar_mutation(
+        lambda _self, older_than_days=90, source=None, sessions_dir=None, **_filters: (
+            sessions_dir
         )
     )
     def prune_sessions(
@@ -14243,6 +14396,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         removed_ids: list[str] = []
 
         def _do(conn):
+            _revalidate_current_session_sidecar_authority(sessions_dir)
             cursor = conn.execute(
                 f"SELECT s.id FROM sessions s WHERE {where}", where_params
             )

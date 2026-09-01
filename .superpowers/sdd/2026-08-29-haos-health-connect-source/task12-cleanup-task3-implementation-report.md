@@ -260,8 +260,6 @@ HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/test_session_maintenance_l
 Independent review remains required, and native Linux verification is the one
 platform gate still outstanding.
 
----
-
 ## Fix round 1 — 2026-09-01
 
 ### Status and authority
@@ -415,3 +413,134 @@ writer coverage are satisfied. Authz/RLS are not request boundaries in this
 local coordination layer; input/path validation and secret handling are
 satisfied. No dependency or secret was added. Native Linux evidence and
 independent re-review remain the only completion concerns.
+
+---
+
+## Fix round 2 — 2026-09-01
+
+### Status and scope
+
+`DONE_WITH_CONCERNS` on Darwin after addressing P2-A, P2-B, and P3-A from
+`task12-cleanup-task3-re-review-1.md`. The only completion concern is the
+unchanged native-Linux gate below; independent re-review is still required.
+
+This round changed only `hermes_state_maintenance.py`, `hermes_state.py`,
+`tests/test_session_maintenance_lock.py`, `tests/test_hermes_state.py`, and
+this report. Those are the already-approved Task 3 barrier/writer files and
+their exact tests/report. The frozen direct-writer file list and both approved
+scope rulings recorded above are unchanged. No dependency, live profile,
+network, external service, provider, process, push, merge, deployment,
+production cleanup/deletion, or Task 4 action was performed. Every behavioral
+test used synthetic temporary profiles.
+
+### Finding disposition
+
+1. **P2-A — fixed.** Retirement now records conservative publication
+   uncertainty before entering the no-replace rename syscall. Any exception
+   after that point attempts durable no-replace republication of the fixed,
+   exact-nonce blocker. This covers a catchable signal delivered after the
+   kernel move but before the helper returns, without relying on a Python
+   assignment after the mutating call. The retired exact held inode remains
+   quarantined; no path-only unlink or Task 4 cleanup was added.
+2. **P2-B — fixed.** Every audited SessionDB deletion/prune API that can remove
+   transcript sidecars now acquires the profile shared lease first, opens the
+   fixed `sessions` name no-follow through the held profile descriptor, and
+   retains that exact directory descriptor/identity for the complete DB and
+   filesystem mutation span. The held and fixed-name identities are checked
+   after admission and again immediately before database mutation. Sidecar
+   inventory, unlink, and directory fsync are descriptor-relative. The absent
+   case records absence through the held profile descriptor and refuses a
+   later object instead of following it. Descriptor close failure is
+   best-effort and cannot replace an already selected categorical outcome.
+3. **P3-A — fixed.** New focused tests inject cancellation immediately after
+   the real kernel rename, replace the canonical sessions sink both immediately
+   after lease admission and after its descriptor was captured, and record
+   reverse release of two held leases when the second barrier check is
+   interrupted. The replacement tests prove the database row, original
+   sidecar, and unrelated-profile sidecar all remain unchanged on refusal.
+
+The descriptor identity deliberately excludes mutable directory link count:
+an existing two-sidecar test exposed that Darwin changes directory link
+metadata during ordinary file removal. Type/owner/link safety is still checked
+at every validation, while stable device/inode/owner/group/mode evidence binds
+the retained authority. This preserves ordinary multi-file cleanup semantics
+without weakening the replacement proof.
+
+### Calibrated RED-to-GREEN record
+
+- Immediate post-rename cancellation RED: the real no-replace rename completed,
+  the shim raised `KeyboardInterrupt` before returning, and the fixed barrier
+  was absent (`1 failed`). GREEN: cancellation propagated, the fixed blocker
+  was republished, the retired name retained the original inode, and a later
+  shared writer observed recovery-required (`1 passed`; the neighboring
+  retirement/cancellation group also passed).
+- Post-admission sidecar replacement RED: deletion followed the replacement
+  symlink, committed the row removal, and removed the unrelated same-named
+  sidecar (`1 failed`). GREEN: exact post-lock descriptor admission rejected
+  the replacement before database mutation.
+- Post-descriptor-validation replacement RED: a deterministic `_execute_write`
+  seam replaced the fixed name after descriptor capture; the old code deleted
+  the row (`1 failed`). GREEN: immediate held/fixed identity revalidation
+  rejected the replacement and preserved both profiles (`1 passed`).
+- Existing-writer compatibility RED: the first full state run produced two
+  in-scope multi-sidecar/auto-prune failures because mutable directory link
+  metadata was treated as immutable identity (`247 passed, 3 failed`, including
+  the unchanged FTS baseline). GREEN: both focused failures passed, followed by
+  `249 passed, 1 failed`; the sole final failure is the unchanged read-only FTS
+  trace baseline already recorded above.
+- Reverse-release coverage passed on first execution because the underlying
+  `finally` already released all held leases in reverse; the new test makes the
+  two-held-lease order directly observable.
+
+No failed test was deleted, weakened, skipped, xfailed, or given a retry.
+
+### Final verification evidence
+
+- Repository-runner maintenance/static gate with retries disabled: `102
+  passed` (`96` maintenance, including cross-process same/unrelated-profile
+  stress, plus `6` frozen audit).
+- Explicit cross-process profile-scoping stress rerun: `1 passed`.
+- Final focused race and reverse-release selection: `5 passed`.
+- Full `tests/test_hermes_state.py`: `249 passed, 1 failed`; only the unchanged
+  `TestFTS5Search.test_search_projection_skips_context_enrichment_queries`
+  trace baseline failed.
+- Exact changed-writer matrix: `183 passed, 1 failed`. The failure was the
+  previously recorded combined-file HERMES_HOME order leak in
+  `test_session_store_default_db_uses_runtime_hermes_home`; its exact file
+  passed `10/10` in a clean isolated rerun.
+- Canonical deletion/lifecycle compatibility subset: `42 passed`.
+- An additional broad deletion-caller characterization returned `660 passed,
+  4 failed`. The four failures were unrelated TUI agent-build timing (two), an
+  existing non-`0700` synthetic profile fixture, and model-options state. None
+  exercises this round's barrier or sidecar authority, and none was fixed or
+  hidden.
+- Ruff lint for all four code/test files, Ruff format for the owned maintenance
+  module/focused test, `compileall`, `ty check hermes_state_maintenance.py`,
+  focused type review of the new `hermes_state.py` authority block, and `git
+  diff --check`: pass. The full legacy `hermes_state.py` type run retains 85
+  diagnostics outside the new authority block.
+- Dependency-manifest/lock delta: empty. Added-line credential, PHI,
+  prohibited-output, deleted-test, skip, xfail, and retry scans: no finding.
+  No repository-local Semgrep rules exist, and prohibited network access
+  prevents registry-rule retrieval; the frozen AST/security scans passed.
+
+### Native Linux gate still unrun
+
+`uname -s` is Darwin. Run exactly this command on native Linux with zero
+retries before claiming cross-platform completion:
+
+```sh
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/test_session_maintenance_lock.py tests/test_profile_mutation_boundary_audit.py -q
+```
+
+### Security/control review
+
+This remains high-risk crash-recovery/data-integrity work under the approved
+spec, STRIDE pass, and rollback plan; no new ADR decision was made. Exact
+lease type/liveness, fixed-schema nonce validation, no-follow
+descriptor-relative authority, monotonic interruption recovery, atomic
+no-replace retirement, same-profile sidecar binding, absent-sink refusal,
+reverse lease release, fixed path-free categories, and synthetic owner-only
+profiles are satisfied. Authz/RLS are not request boundaries in this local
+coordination layer. Input/path validation and secret handling are satisfied.
+No dependency or secret was added.

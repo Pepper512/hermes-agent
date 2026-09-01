@@ -10,6 +10,7 @@ from unittest import mock
 import pytest
 
 import hermes_state
+import hermes_state_maintenance as maintenance
 from agent.session_activity import ActivityProvenance
 from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
 from hermes_state_maintenance import UnsafeProfileState
@@ -1093,6 +1094,82 @@ class TestDeleteAndExport:
 
         assert db.get_session("same-name") is not None
         assert sidecar.exists()
+
+    @pytest.mark.require_symlinks
+    def test_delete_rejects_sessions_sink_replaced_after_lease_admission(
+        self, db, tmp_path, monkeypatch
+    ):
+        db.create_session(session_id="same-name", source="cli")
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir(mode=0o700)
+        original_sidecar = sessions_dir / "same-name.json"
+        original_sidecar.write_text("{}", encoding="utf-8")
+        unrelated_sessions = tmp_path / "unrelated-profile" / "sessions"
+        unrelated_sessions.mkdir(parents=True, mode=0o700)
+        unrelated_sidecar = unrelated_sessions / "same-name.json"
+        unrelated_sidecar.write_text("{}", encoding="utf-8")
+        held_original = tmp_path / "held-original-sessions"
+        real_require = maintenance.require_no_recovery_barrier
+        replaced = False
+
+        def admit_then_replace(lease) -> None:
+            nonlocal replaced
+            real_require(lease)
+            if not replaced:
+                replaced = True
+                sessions_dir.rename(held_original)
+                sessions_dir.symlink_to(
+                    unrelated_sessions,
+                    target_is_directory=True,
+                )
+
+        monkeypatch.setattr(
+            maintenance,
+            "require_no_recovery_barrier",
+            admit_then_replace,
+        )
+        with pytest.raises(UnsafeProfileState):
+            db.delete_session("same-name", sessions_dir=sessions_dir)
+
+        assert db.get_session("same-name") is not None
+        assert (held_original / original_sidecar.name).exists()
+        assert unrelated_sidecar.exists()
+
+    @pytest.mark.require_symlinks
+    def test_delete_rejects_sessions_sink_replaced_after_descriptor_validation(
+        self, db, tmp_path, monkeypatch
+    ):
+        db.create_session(session_id="same-name", source="cli")
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir(mode=0o700)
+        original_sidecar = sessions_dir / "same-name.json"
+        original_sidecar.write_text("{}", encoding="utf-8")
+        unrelated_sessions = tmp_path / "unrelated-profile" / "sessions"
+        unrelated_sessions.mkdir(parents=True, mode=0o700)
+        unrelated_sidecar = unrelated_sessions / "same-name.json"
+        unrelated_sidecar.write_text("{}", encoding="utf-8")
+        held_original = tmp_path / "held-original-sessions"
+        real_execute_write = db._execute_write
+        replaced = False
+
+        def replace_then_execute(callback, *args, **kwargs):
+            nonlocal replaced
+            if not replaced:
+                replaced = True
+                sessions_dir.rename(held_original)
+                sessions_dir.symlink_to(
+                    unrelated_sessions,
+                    target_is_directory=True,
+                )
+            return real_execute_write(callback, *args, **kwargs)
+
+        monkeypatch.setattr(db, "_execute_write", replace_then_execute)
+        with pytest.raises(UnsafeProfileState):
+            db.delete_session("same-name", sessions_dir=sessions_dir)
+
+        assert db.get_session("same-name") is not None
+        assert (held_original / original_sidecar.name).exists()
+        assert unrelated_sidecar.exists()
 
 
 
