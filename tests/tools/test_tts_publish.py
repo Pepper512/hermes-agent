@@ -4,6 +4,7 @@ import dis
 import os
 from pathlib import Path
 import sys
+import threading
 
 import pytest
 
@@ -1085,9 +1086,15 @@ def test_close_return_opcode_reuse_preserves_unrelated_descriptor(
     different_dir = tmp_path / "unrelated-dir"
     different_dir.mkdir()
     closer = tts_publish._close_owned_fd
-    target = max(
+    instructions = list(dis.get_instructions(closer))
+    close_load = next(
+        index
+        for index, instruction in enumerate(instructions)
+        if instruction.opname == "LOAD_ATTR" and instruction.argval == "close"
+    )
+    target = next(
         instruction.offset
-        for instruction in dis.get_instructions(closer)
+        for instruction in instructions[close_load + 1 :]
         if instruction.opname == "POP_TOP"
     )
     descriptor_root = Path("/dev/fd" if sys.platform == "darwin" else "/proc/self/fd")
@@ -1129,6 +1136,311 @@ def test_close_return_opcode_reuse_preserves_unrelated_descriptor(
     finally:
         if sentinel_fd is not None:
             os.close(sentinel_fd)
+
+
+@pytest.mark.parametrize("owner_kind", ["temp", "parent"])
+@pytest.mark.parametrize("same_inode", [False, True])
+def test_concurrent_closers_never_close_reused_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    owner_kind: str,
+    same_inode: bool,
+):
+    from tools import tts_publish
+
+    owned_file = tmp_path / "owned"
+    owned_file.write_bytes(b"owned")
+    unrelated_file = tmp_path / "unrelated"
+    unrelated_file.write_bytes(b"sentinel")
+    unrelated_dir = tmp_path / "unrelated-dir"
+    unrelated_dir.mkdir()
+    if owner_kind == "temp":
+        fd = os.open(owned_file, os.O_RDWR)
+        owner = tts_publish._PublicationTemp(fd, "owned", os.fstat(fd), "voice.mp3")
+    else:
+        fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+        owner = tts_publish._HeldParent(fd, tmp_path, os.fstat(fd))
+    real_close = os.close
+    close_entered = threading.Event()
+    release_close = threading.Event()
+    sentinel_fd: int | None = None
+    errors: list[BaseException] = []
+
+    def close_reopen_and_cancel(candidate: int) -> None:
+        nonlocal sentinel_fd
+        real_close(candidate)
+        if owner_kind == "temp":
+            reopened = owned_file if same_inode else unrelated_file
+            sentinel_fd = os.open(reopened, os.O_RDONLY)
+        else:
+            reopened = tmp_path if same_inode else unrelated_dir
+            sentinel_fd = os.open(reopened, os.O_RDONLY | os.O_DIRECTORY)
+        assert sentinel_fd == candidate
+        close_entered.set()
+        assert release_close.wait(2)
+        raise _OpcodeCancellation()
+
+    def invoke_close() -> None:
+        try:
+            tts_publish._close_owned_fd(owner)
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(tts_publish.os, "close", close_reopen_and_cancel)
+    first = threading.Thread(target=invoke_close)
+    second = threading.Thread(target=invoke_close)
+    first.start()
+    assert close_entered.wait(2)
+    second.start()
+    second.join(0.05)
+    assert second.is_alive()
+    release_close.set()
+    first.join(2)
+    assert not first.is_alive()
+    try:
+        assert sentinel_fd is not None
+        os.fstat(sentinel_fd)
+        assert len(errors) == 1
+        tts_publish._close_owned_fd(owner)
+        os.fstat(sentinel_fd)
+    finally:
+        if sentinel_fd is not None:
+            real_close(sentinel_fd)
+
+
+@pytest.mark.parametrize("owner_kind", ["temp", "parent"])
+def test_reentrant_closer_never_issues_second_native_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    owner_kind: str,
+):
+    from tools import tts_publish
+
+    owned_file = tmp_path / "owned"
+    owned_file.write_bytes(b"owned")
+    if owner_kind == "temp":
+        fd = os.open(owned_file, os.O_RDWR)
+        owner = tts_publish._PublicationTemp(fd, "owned", os.fstat(fd), "voice.mp3")
+    else:
+        fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+        owner = tts_publish._HeldParent(fd, tmp_path, os.fstat(fd))
+    real_close = os.close
+    native_calls = 0
+
+    def reenter_then_close(candidate: int) -> None:
+        nonlocal native_calls
+        native_calls += 1
+        tts_publish._close_owned_fd(owner)
+        real_close(candidate)
+
+    monkeypatch.setattr(tts_publish.os, "close", reenter_then_close)
+    tts_publish._close_owned_fd(owner)
+    assert native_calls == 1
+    assert owner.close_state == "released"
+
+
+@pytest.mark.parametrize("owner_kind", ["temp", "parent"])
+@pytest.mark.parametrize("same_inode", [False, True])
+def test_every_close_opcode_can_be_cancelled_without_deadlock_or_stale_close(
+    tmp_path: Path,
+    owner_kind: str,
+    same_inode: bool,
+):
+    from tools import tts_publish
+
+    closer = tts_publish._close_owned_fd
+    executed: list[int] = []
+    probe_file = tmp_path / "probe"
+    probe_file.write_bytes(b"probe")
+    if owner_kind == "temp":
+        probe_fd = os.open(probe_file, os.O_RDWR)
+        probe = tts_publish._PublicationTemp(
+            probe_fd,
+            "probe",
+            os.fstat(probe_fd),
+            "voice.mp3",
+        )
+    else:
+        probe_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+        probe = tts_publish._HeldParent(probe_fd, tmp_path, os.fstat(probe_fd))
+
+    def record(frame, event, _arg):
+        if frame.f_code is closer.__code__:
+            frame.f_trace_opcodes = True
+            if event == "opcode":
+                executed.append(frame.f_lasti)
+        return record
+
+    sys.settrace(record)
+    try:
+        closer(probe)
+    finally:
+        sys.settrace(None)
+
+    instructions = {
+        instruction.offset: instruction for instruction in dis.get_instructions(closer)
+    }
+    ordered = list(instructions.values())
+    close_load = next(
+        index
+        for index, instruction in enumerate(ordered)
+        if instruction.opname == "LOAD_ATTR" and instruction.argval == "close"
+    )
+    close_return = next(
+        instruction.offset
+        for instruction in ordered[close_load + 1 :]
+        if instruction.opname == "POP_TOP"
+    )
+    locked_transitions = [
+        offset
+        for offset in dict.fromkeys(executed)
+        if (
+            instructions[offset].opname == "STORE_ATTR"
+            and instructions[offset].argval
+            in {"close_active", "close_proof", "close_state"}
+        )
+        or offset == close_return
+    ]
+
+    descriptor_root = Path("/dev/fd" if sys.platform == "darwin" else "/proc/self/fd")
+    baseline = set(os.listdir(descriptor_root))
+    for index, target in enumerate(locked_transitions):
+        case = tmp_path / f"opcode-{owner_kind}-{same_inode}-{index}"
+        case.mkdir()
+        owned_file = case / "owned"
+        owned_file.write_bytes(b"owned")
+        unrelated_file = case / "unrelated"
+        unrelated_file.write_bytes(b"sentinel")
+        unrelated_dir = case / "unrelated-dir"
+        unrelated_dir.mkdir()
+        if owner_kind == "temp":
+            fd = os.open(owned_file, os.O_RDWR)
+            owner = tts_publish._PublicationTemp(
+                fd,
+                "owned",
+                os.fstat(fd),
+                "voice.mp3",
+            )
+        else:
+            fd = os.open(case, os.O_RDONLY | os.O_DIRECTORY)
+            owner = tts_publish._HeldParent(fd, case, os.fstat(fd))
+        sentinel_fd: int | None = None
+
+        def cancel(frame, event, _arg, *, target=target):
+            nonlocal sentinel_fd
+            if frame.f_code is closer.__code__:
+                frame.f_trace_opcodes = True
+                if event == "opcode" and frame.f_lasti == target:
+                    sys.settrace(None)
+                    frame.f_trace = None
+                    try:
+                        os.fstat(owner.fd)
+                    except OSError:
+                        if owner_kind == "temp":
+                            reopened = owned_file if same_inode else unrelated_file
+                            sentinel_fd = os.open(reopened, os.O_RDONLY)
+                        else:
+                            reopened = case if same_inode else unrelated_dir
+                            sentinel_fd = os.open(
+                                reopened,
+                                os.O_RDONLY | os.O_DIRECTORY,
+                            )
+                        assert sentinel_fd == owner.fd
+                    raise _OpcodeCancellation()
+            return cancel
+
+        sys.settrace(cancel)
+        try:
+            with pytest.raises(_OpcodeCancellation):
+                closer(owner)
+        finally:
+            sys.settrace(None)
+        errors: list[BaseException] = []
+
+        def retry() -> None:
+            try:
+                closer(owner)
+            except BaseException as exc:
+                errors.append(exc)
+
+        retry_thread = threading.Thread(target=retry)
+        retry_thread.start()
+        retry_thread.join(2)
+        assert not retry_thread.is_alive(), target
+        assert not errors, (target, errors)
+        if sentinel_fd is not None:
+            os.fstat(sentinel_fd)
+            os.close(sentinel_fd)
+        else:
+            with pytest.raises(OSError):
+                os.fstat(owner.fd)
+    assert not (set(os.listdir(descriptor_root)) - baseline)
+
+
+@pytest.mark.parametrize("acquisition", ["parent", "temp"])
+@pytest.mark.parametrize("same_inode", [False, True])
+def test_acquisition_cleanup_never_recloses_reused_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    acquisition: str,
+    same_inode: bool,
+):
+    from tools import tts_publish
+
+    destination = tmp_path / "voice.mp3"
+    unrelated_file = tmp_path / "unrelated"
+    unrelated_file.write_bytes(b"sentinel")
+    unrelated_dir = tmp_path / "unrelated-dir"
+    unrelated_dir.mkdir()
+    real_close = os.close
+    sentinel_fd: int | None = None
+    close_calls = 0
+    temp = None
+
+    def close_reopen_and_cancel(fd: int) -> None:
+        nonlocal close_calls, sentinel_fd
+        close_calls += 1
+        real_close(fd)
+        if acquisition == "parent":
+            reopened = tmp_path if same_inode else unrelated_dir
+            sentinel_fd = os.open(reopened, os.O_RDONLY | os.O_DIRECTORY)
+        else:
+            assert temp is not None
+            reopened = (tmp_path / temp.name) if same_inode else unrelated_file
+            sentinel_fd = os.open(reopened, os.O_RDONLY)
+        assert sentinel_fd == fd
+        raise _OpcodeCancellation()
+
+    monkeypatch.setattr(tts_publish.os, "close", close_reopen_and_cancel)
+    if acquisition == "parent":
+        monkeypatch.setattr(
+            tts_publish.os,
+            "stat",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("injected")),
+        )
+        with pytest.raises((TTSPublishError, _OpcodeCancellation)):
+            tts_publish._open_held_parent(destination)
+    else:
+        parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+        parent = tts_publish._HeldParent(parent_fd, tmp_path, os.fstat(parent_fd))
+        temp = tts_publish._create_publication_temp(parent, destination.name)
+        monkeypatch.setattr(
+            tts_publish.os,
+            "fchown",
+            lambda *_args: (_ for _ in ()).throw(OSError("injected")),
+        )
+        try:
+            with pytest.raises(BaseException):
+                tts_publish._materialize_publication_temp(parent, temp)
+        finally:
+            real_close(parent_fd)
+    try:
+        assert sentinel_fd is not None
+        os.fstat(sentinel_fd)
+        assert close_calls == 1
+    finally:
+        if sentinel_fd is not None:
+            real_close(sentinel_fd)
 
 
 @pytest.mark.parametrize("local_name", ["parent", "temp"])

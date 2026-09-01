@@ -9,7 +9,7 @@ host primitive authorized by the approved design.
 from __future__ import annotations
 
 import ctypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import errno
 import hashlib
 import os
@@ -17,6 +17,7 @@ from pathlib import Path
 import secrets
 import stat
 import sys
+import threading
 from typing import Callable, Final
 
 from agent.file_safety import is_write_approval_required, is_write_denied
@@ -60,9 +61,14 @@ class PublishedAudio:
 class _HeldParent:
     fd: int
     path: Path
-    stat: os.stat_result
+    stat: os.stat_result | None
     close_state: str = "open"
     close_proof: int | None = None
+    close_active: bool = False
+    close_lock: threading.RLock = field(
+        default_factory=threading.RLock,
+        repr=False,
+    )
 
 
 @dataclass(slots=True)
@@ -75,6 +81,11 @@ class _PublicationTemp:
     published: bool = False
     close_state: str = "open"
     close_proof: int | None = None
+    close_active: bool = False
+    close_lock: threading.RLock = field(
+        default_factory=threading.RLock,
+        repr=False,
+    )
 
 
 @dataclass(slots=True)
@@ -363,24 +374,24 @@ def _open_held_parent(
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
-    fd = -1
+    parent = _HeldParent(fd=-1, path=destination.parent, stat=None)
+    if custody is not None:
+        custody.parent = parent
     try:
-        fd = os.open(destination.parent, flags)
-        held = os.fstat(fd)
+        parent.fd = os.open(destination.parent, flags)
+        held = os.fstat(parent.fd)
+        parent.stat = held
         named = os.stat(destination.parent, follow_symlinks=False)
         if not _same_parent(held, named):
             raise TTSPublishError(_PUBLISH_ERROR)
-        parent = _HeldParent(fd=fd, path=destination.parent, stat=held)
-        if custody is not None:
-            custody.parent = parent
         return parent
     except BaseException as exc:
-        if fd >= 0 and (custody is None or custody.parent is None):
+        if parent.fd >= 0:
             try:
-                os.close(fd)
+                _close_owned_fd(parent)
             except BaseException:
                 try:
-                    os.close(fd)
+                    _close_owned_fd(parent)
                 except BaseException:
                     pass
         if isinstance(exc, TTSPublishError):
@@ -449,7 +460,10 @@ def _materialize_publication_temp(
             continue
         except OSError:
             raise TTSPublishError(_PUBLISH_ERROR) from None
+        temp.fd = fd
+        temp.name = name
         try:
+            temp.stat = os.fstat(fd)
             os.fchown(fd, os.getuid(), os.getgid())
             os.fchmod(fd, 0o600)
             held = os.fstat(fd)
@@ -461,13 +475,11 @@ def _materialize_publication_temp(
             if not _same_parent(parent_held, parent_named):
                 raise TTSPublishError(_PUBLISH_ERROR)
             parent.stat = parent_held
-            temp.fd = fd
-            temp.name = name
             temp.stat = held
             return
         except BaseException:
             try:
-                _scrub_and_close_fd(fd)
+                _scrub_and_close_owned_fd(temp)
             except AnonymousAudioScrubError:
                 raise
             raise
@@ -612,39 +624,6 @@ def _fsync_parent(fd: int) -> None:
     os.fsync(fd)
 
 
-def _scrub_and_close_fd(fd: int) -> None:
-    failed = False
-    try:
-        os.ftruncate(fd, 0)
-    except BaseException:
-        failed = True
-        try:
-            os.ftruncate(fd, 0)
-        except BaseException:
-            pass
-    try:
-        os.fsync(fd)
-    except BaseException:
-        failed = True
-    try:
-        os.close(fd)
-    except BaseException:
-        failed = True
-        try:
-            os.close(fd)
-        except BaseException:
-            pass
-    if failed:
-        raise AnonymousAudioScrubError(_SCRUB_ERROR)
-
-
-def _close_fd(fd: int) -> None:
-    try:
-        os.close(fd)
-    except OSError:
-        raise TTSPublishUncertain(_PUBLISH_UNCERTAIN) from None
-
-
 def _same_owned_open_description(
     owner: _HeldParent | _PublicationTemp,
 ) -> bool:
@@ -669,18 +648,30 @@ def _same_owned_open_description(
 
 
 def _close_owned_fd(owner: _HeldParent | _PublicationTemp) -> None:
-    if owner.close_state == "released":
-        return
-    if owner.close_state == "open":
-        proof = (1 << 60) | secrets.randbits(59)
-        os.lseek(owner.fd, proof, os.SEEK_SET)
-        owner.close_proof = proof
-        owner.close_state = "attempted"
-    elif not _same_owned_open_description(owner):
-        owner.close_state = "released"
-        return
-    os.close(owner.fd)
-    owner.close_state = "released"
+    with owner.close_lock:
+        owns_attempt = False
+        try:
+            if owner.close_active:
+                return
+            owns_attempt = True
+            owner.close_active = True
+            if owner.close_state == "released":
+                return
+            if owner.close_state == "open":
+                if owner.stat is None:
+                    owner.stat = os.fstat(owner.fd)
+                proof = (1 << 60) | secrets.randbits(59)
+                os.lseek(owner.fd, proof, os.SEEK_SET)
+                owner.close_proof = proof
+                owner.close_state = "attempted"
+            elif not _same_owned_open_description(owner):
+                owner.close_state = "released"
+                return
+            os.close(owner.fd)
+            owner.close_state = "released"
+        finally:
+            if owns_attempt:
+                owner.close_active = False
 
 
 def _scrub_and_close_owned_fd(owner: _PublicationTemp) -> None:
