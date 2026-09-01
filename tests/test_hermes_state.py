@@ -1046,6 +1046,110 @@ class TestDeleteAndExport:
         assert db.get_session("s1") is None
         assert db.message_count(session_id="s1") == 0
 
+    def test_delete_session_recursively_removes_delegate_tree(self, db):
+        db.create_session("root", "cli")
+        db.create_session(
+            "delegate",
+            "cli",
+            parent_session_id="root",
+            model_config={"_delegate_from": "root"},
+        )
+        db.create_session(
+            "nested-delegate",
+            "cli",
+            parent_session_id="delegate",
+            model_config={"_delegate_from": "delegate"},
+        )
+        for session_id in ("root", "delegate", "nested-delegate"):
+            db.append_message(session_id, role="user", content="synthetic")
+
+        assert db.get_session_delete_targets("root") == [
+            "root",
+            "delegate",
+            "nested-delegate",
+        ]
+        assert db.delete_session("root") is True
+        assert all(
+            db.get_session(session_id) is None
+            for session_id in ("root", "delegate", "nested-delegate")
+        )
+        assert db.message_count() == 0
+
+    def test_delete_session_preserves_branch_and_compression_children(self, db):
+        db.create_session("root", "cli")
+        db.create_session(
+            "branch",
+            "cli",
+            parent_session_id="root",
+            model_config={"_branched_from": "root"},
+        )
+        db.end_session("root", "compression")
+        db.create_session("compression", "cli", parent_session_id="root")
+
+        assert db.get_session_delete_targets("root") == ["root"]
+        assert db.delete_session("root") is True
+        for child_id in ("branch", "compression"):
+            child = db.get_session(child_id)
+            assert child is not None
+            assert child["parent_session_id"] is None
+
+    def test_delete_session_cascades_model_usage_rows(self, db):
+        db.create_session("root", "cli")
+        db._conn.execute(
+            "INSERT INTO session_model_usage (session_id, model) VALUES (?, ?)",
+            ("root", "synthetic-model"),
+        )
+        db._conn.commit()
+
+        assert db.delete_session("root") is True
+        assert (
+            db._conn.execute(
+                "SELECT COUNT(*) FROM session_model_usage WHERE session_id = ?",
+                ("root",),
+            ).fetchone()[0]
+            == 0
+        )
+
+    def test_delete_session_removes_only_unreferenced_system_prompt(self, db):
+        db.create_session("root", "cli")
+        db.create_session("survivor", "cli")
+        db.update_system_prompt("root", "root-only synthetic prompt")
+        db.update_system_prompt("survivor", "survivor synthetic prompt")
+        root_hash = db.get_session("root")["system_prompt_hash"]
+        survivor_hash = db.get_session("survivor")["system_prompt_hash"]
+
+        assert db.delete_session("root") is True
+        remaining = {
+            row[0]
+            for row in db._conn.execute("SELECT hash FROM system_prompts").fetchall()
+        }
+        assert root_hash not in remaining
+        assert survivor_hash in remaining
+
+    def test_delete_session_removes_delegate_sidecars_only(self, db, tmp_path):
+        db.create_session("root", "cli")
+        db.create_session(
+            "delegate",
+            "cli",
+            parent_session_id="root",
+            model_config={"_delegate_from": "root"},
+        )
+        db.create_session("survivor", "cli")
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir(mode=0o700)
+        removed = (
+            sessions_dir / "root.json",
+            sessions_dir / "request_dump_root_synthetic.json",
+            sessions_dir / "delegate.jsonl",
+        )
+        survivor = sessions_dir / "survivor.json"
+        for path in (*removed, survivor):
+            path.write_text("{}", encoding="utf-8")
+
+        assert db.delete_session("root", sessions_dir=sessions_dir) is True
+        assert all(not path.exists() for path in removed)
+        assert survivor.exists()
+
     def test_delete_rejects_unrelated_profile_sidecar_authority(self, db, tmp_path):
         db.create_session(session_id="same-name", source="cli")
         unrelated_profile = tmp_path / "unrelated-profile"

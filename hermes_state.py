@@ -32,6 +32,7 @@ import threading
 import time
 import weakref
 from collections import deque
+from collections.abc import Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
@@ -58,7 +59,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple, TypeVar
 
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _BRANCH_CHILD_SQL,
@@ -519,7 +520,7 @@ def _collect_delegate_child_ids(conn, parent_ids: List[str]) -> List[str]:
             f"OR (parent_session_id IN ({ph}) AND {df} IS NOT NULL)",
             frontier + frontier,
         )
-        frontier = [row["id"] for row in cursor.fetchall() if row["id"] not in found]
+        frontier = [row[0] for row in cursor.fetchall() if row[0] not in found]
         found.update(frontier)
     # Return only the discovered children — never the parents themselves.
     return [sid for sid in found if sid not in seeds]
@@ -538,6 +539,162 @@ def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
         )
         conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", ids)
     return ids
+
+
+class ExactDeleteCounts(NamedTuple):
+    """Fixed aggregate result for private exact session deletion."""
+
+    sessions: int
+    messages: int
+    session_model_usage: int
+    system_prompts: int
+
+
+_ZERO_EXACT_DELETE_COUNTS = ExactDeleteCounts(0, 0, 0, 0)
+_EXACT_DELETE_REFUSED = "exact session deletion refused"
+
+
+def _get_session_delete_targets_on(
+    connection: sqlite3.Connection,
+    root_id: str,
+) -> tuple[str, ...]:
+    """Return the canonical recursive delete closure on *connection*."""
+    exists = connection.execute(
+        "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (root_id,)
+    ).fetchone()
+    if exists is None:
+        return ()
+    delegate_ids = _collect_delegate_child_ids(connection, [root_id])
+    return (root_id, *sorted(delegate_ids))
+
+
+def _delete_unreferenced_system_prompts_on(
+    connection: sqlite3.Connection,
+) -> int:
+    cursor = connection.execute(
+        "DELETE FROM system_prompts "
+        "WHERE NOT EXISTS ("
+        "SELECT 1 FROM sessions "
+        "WHERE sessions.system_prompt_hash = system_prompts.hash"
+        ")"
+    )
+    return max(cursor.rowcount, 0)
+
+
+def _delete_session_root_on(
+    connection: sqlite3.Connection,
+    root_id: str,
+) -> tuple[ExactDeleteCounts, tuple[str, ...]]:
+    """Apply ordinary Hermes deletion to one root on an active transaction."""
+    targets = _get_session_delete_targets_on(connection, root_id)
+    if not targets:
+        return _ZERO_EXACT_DELETE_COUNTS, ()
+    placeholders = ",".join("?" for _ in targets)
+    message_count = connection.execute(
+        f"SELECT COUNT(*) FROM messages WHERE session_id IN ({placeholders})",
+        targets,
+    ).fetchone()[0]
+    usage_count = connection.execute(
+        "SELECT COUNT(*) FROM session_model_usage "
+        f"WHERE session_id IN ({placeholders})",
+        targets,
+    ).fetchone()[0]
+
+    removed_delegate_ids = _delete_delegate_children(connection, [root_id])
+    connection.execute(
+        "UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id = ?",
+        (root_id,),
+    )
+    connection.execute("DELETE FROM messages WHERE session_id = ?", (root_id,))
+    connection.execute("DELETE FROM sessions WHERE id = ?", (root_id,))
+    prompt_count = _delete_unreferenced_system_prompts_on(connection)
+    counts = ExactDeleteCounts(
+        sessions=len(targets),
+        messages=int(message_count),
+        session_model_usage=int(usage_count),
+        system_prompts=prompt_count,
+    )
+    return counts, (*removed_delegate_ids, root_id)
+
+
+def _delete_session_roots_exact_on(
+    connection: sqlite3.Connection,
+    roots: tuple[str, str],
+    expected_targets_by_root: Mapping[str, tuple[str, ...]],
+) -> ExactDeleteCounts:
+    """Delete exactly two independent singleton roots in a caller transaction.
+
+    The caller owns transaction begin, commit, and rollback. Every closure and
+    lineage guard is revalidated on the supplied connection before the first
+    delete statement. Refusals are deliberately categorical and contain no
+    session identifiers.
+    """
+    if not connection.in_transaction:
+        raise ValueError(_EXACT_DELETE_REFUSED)
+    if (
+        type(roots) is not tuple
+        or len(roots) != 2
+        or any(type(root) is not str or not root for root in roots)
+        or roots[0] == roots[1]
+        or not isinstance(expected_targets_by_root, Mapping)
+    ):
+        raise ValueError(_EXACT_DELETE_REFUSED)
+
+    root_set = set(roots)
+    try:
+        if set(expected_targets_by_root) != root_set or any(
+            type(expected_targets_by_root[root]) is not tuple
+            or expected_targets_by_root[root] != (root,)
+            for root in roots
+        ):
+            raise ValueError(_EXACT_DELETE_REFUSED)
+
+        closures = {
+            root: _get_session_delete_targets_on(connection, root) for root in roots
+        }
+        if any(closures[root] != expected_targets_by_root[root] for root in roots):
+            raise ValueError(_EXACT_DELETE_REFUSED)
+        closure_union = {target for closure in closures.values() for target in closure}
+        if closure_union != root_set or sum(map(len, closures.values())) != 2:
+            raise ValueError(_EXACT_DELETE_REFUSED)
+
+        model_config = "COALESCE(model_config, '{}')"
+        root_rows = connection.execute(
+            "SELECT id, parent_session_id, "
+            f"json_extract({model_config}, '$._delegate_from'), "
+            f"json_extract({model_config}, '$._branched_from'), "
+            f"json_extract({model_config}, '$._reset_from') "
+            "FROM sessions WHERE id IN (?, ?)",
+            roots,
+        ).fetchall()
+        if len(root_rows) != 2 or any(
+            any(value is not None for value in row[1:]) for row in root_rows
+        ):
+            raise ValueError(_EXACT_DELETE_REFUSED)
+        child = connection.execute(
+            "SELECT 1 FROM sessions WHERE parent_session_id IN (?, ?) LIMIT 1",
+            roots,
+        ).fetchone()
+        if child is not None:
+            raise ValueError(_EXACT_DELETE_REFUSED)
+    except (KeyError, TypeError, ValueError, sqlite3.Error):
+        raise ValueError(_EXACT_DELETE_REFUSED) from None
+
+    total = _ZERO_EXACT_DELETE_COUNTS
+    for root in roots:
+        counts, removed_targets = _delete_session_root_on(connection, root)
+        if removed_targets != (root,):
+            raise ValueError(_EXACT_DELETE_REFUSED)
+        total = ExactDeleteCounts(
+            sessions=total.sessions + counts.sessions,
+            messages=total.messages + counts.messages,
+            session_model_usage=(
+                total.session_model_usage + counts.session_model_usage
+            ),
+            system_prompts=total.system_prompts + counts.system_prompts,
+        )
+    return total
+
 
 T = TypeVar("T")
 
@@ -4676,13 +4833,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     @staticmethod
     def _delete_unreferenced_system_prompts(conn) -> None:
-        conn.execute(
-            "DELETE FROM system_prompts "
-            "WHERE NOT EXISTS ("
-            "SELECT 1 FROM sessions "
-            "WHERE sessions.system_prompt_hash = system_prompts.hash"
-            ")"
-        )
+        _delete_unreferenced_system_prompts_on(conn)
 
     @staticmethod
     def _session_row_dict(row: sqlite3.Row) -> Dict[str, Any]:
@@ -13708,13 +13859,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         reference.
         """
         with self._read_ctx() as conn:
-            exists = conn.execute(
-                "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
-            ).fetchone()
-            if not exists:
-                return []
-            delegate_ids = _collect_delegate_child_ids(self._conn, [session_id])
-        return [session_id, *sorted(delegate_ids)]
+            return list(_get_session_delete_targets_on(conn, session_id))
 
     @_leased_session_sidecar_mutation(
         lambda _self, _session_id, sessions_dir=None, **_kwargs: sessions_dir
@@ -13741,42 +13886,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         accepted for correctness. Returns True if the session was found and
         deleted.
         """
-        removed_delegate_ids: List[str] = []
+        removed_ids: tuple[str, ...] = ()
         expected_ids = (
             set(expected_delete_ids) if expected_delete_ids is not None else None
         )
 
         def _do(conn):
+            nonlocal removed_ids
             _revalidate_current_session_sidecar_authority(sessions_dir)
-            cursor = conn.execute(
-                "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
-            )
-            if cursor.fetchone() is None:
+            actual_targets = _get_session_delete_targets_on(conn, session_id)
+            if not actual_targets:
                 return False
-            if expected_ids is not None:
-                actual_ids = {
-                    session_id,
-                    *_collect_delegate_child_ids(conn, [session_id]),
-                }
-                if actual_ids != expected_ids:
-                    return False
-            removed_delegate_ids.extend(_delete_delegate_children(conn, [session_id]))
-            # Orphan remaining child sessions (branches, etc.) so FK is satisfied.
-            conn.execute(
-                "UPDATE sessions SET parent_session_id = NULL "
-                "WHERE parent_session_id = ?",
-                (session_id,),
-            )
-            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
-            conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
-            self._delete_unreferenced_system_prompts(conn)
+            if expected_ids is not None and set(actual_targets) != expected_ids:
+                return False
+            _counts, removed_ids = _delete_session_root_on(conn, session_id)
             return True
 
         deleted = self._execute_write(_do)
         if deleted:
-            for delegate_id in removed_delegate_ids:
-                self._remove_session_files(sessions_dir, delegate_id)
-            self._remove_session_files(sessions_dir, session_id)
+            for removed_id in removed_ids:
+                self._remove_session_files(sessions_dir, removed_id)
         return bool(deleted)
 
     @_leased_session_sidecar_mutation(
