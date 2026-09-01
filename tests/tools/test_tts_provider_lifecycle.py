@@ -424,6 +424,10 @@ def _assert_forced_stop_failure_runs_all_cleanup(tmp_path: Path, monkeypatch) ->
         def __init__(self, *args, **kwargs):
             real_popen.__init__(self, *args, **kwargs)
             captured["proc"] = self
+            deadline = time.monotonic() + 2
+            while not pid_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.005)
+            captured["pid_marker_ready"] = pid_file.exists()
 
     real_fallback = tts_tool._fallback_stop_command_tts_process_group
 
@@ -446,6 +450,7 @@ def _assert_forced_stop_failure_runs_all_cleanup(tmp_path: Path, monkeypatch) ->
                 inherited_sink_fd=sink_fd,
                 input_text="x",
             )
+        assert captured["pid_marker_ready"] is True
         _assert_pids_gone(pid_file)
         proc = captured["proc"]
         assert fallback_calls == [proc.pid]
