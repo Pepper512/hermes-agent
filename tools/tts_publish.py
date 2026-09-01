@@ -68,10 +68,18 @@ class _PublicationTemp:
     fd: int
     name: str
     stat: os.stat_result
+    destination_name: str
+    publication_armed: bool = False
     published: bool = False
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
+class _PublicationCustody:
+    parent: _HeldParent | None = None
+    temp: _PublicationTemp | None = None
+
+
+@dataclass(slots=True)
 class _PublicationOutcome:
     status: str
 
@@ -344,7 +352,10 @@ def _validate_destination(destination: object) -> Path:
     return canonical
 
 
-def _open_held_parent(destination: Path) -> _HeldParent:
+def _open_held_parent(
+    destination: Path,
+    custody: _PublicationCustody | None = None,
+) -> _HeldParent:
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
@@ -355,9 +366,12 @@ def _open_held_parent(destination: Path) -> _HeldParent:
         named = os.stat(destination.parent, follow_symlinks=False)
         if not _same_parent(held, named):
             raise TTSPublishError(_PUBLISH_ERROR)
-        return _HeldParent(fd=fd, path=destination.parent, stat=held)
+        parent = _HeldParent(fd=fd, path=destination.parent, stat=held)
+        if custody is not None:
+            custody.parent = parent
+        return parent
     except BaseException as exc:
-        if fd >= 0:
+        if fd >= 0 and (custody is None or custody.parent is None):
             try:
                 os.close(fd)
             except BaseException:
@@ -400,7 +414,11 @@ def _authorize_destination(parent: _HeldParent, name: str) -> bool:
     return True
 
 
-def _create_publication_temp(parent: _HeldParent) -> _PublicationTemp:
+def _create_publication_temp(
+    parent: _HeldParent,
+    destination_name: str,
+    custody: _PublicationCustody | None = None,
+) -> _PublicationTemp:
     flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
@@ -424,8 +442,18 @@ def _create_publication_temp(parent: _HeldParent) -> _PublicationTemp:
             if not _same_parent(parent_held, parent_named):
                 raise TTSPublishError(_PUBLISH_ERROR)
             parent.stat = parent_held
-            return _PublicationTemp(fd=fd, name=name, stat=held)
+            temp = _PublicationTemp(
+                fd=fd,
+                name=name,
+                stat=held,
+                destination_name=destination_name,
+            )
+            if custody is not None:
+                custody.temp = temp
+            return temp
         except BaseException:
+            if custody is not None and custody.temp is not None:
+                raise
             try:
                 _scrub_and_close_fd(fd)
             except AnonymousAudioScrubError:
@@ -634,15 +662,23 @@ def _publish_one(
     canonical_prepare: Callable[..., _PreparedPublicationCall],
     canonical_verify: Callable[[_PublicationTemp, SealedAudio], None],
 ) -> _PublicationOutcome:
+    custody = _PublicationCustody()
     parent: _HeldParent | None = None
     temp: _PublicationTemp | None = None
     outcome = _PublicationOutcome("failed")
+    pending_stop: BaseException | None = None
     try:
         if sealed._output_format != destination.suffix.lower().lstrip("."):
             raise TTSPublishError(_PUBLISH_ERROR)
-        parent = _open_held_parent(destination)
+        _open_held_parent(destination, custody)
+        parent = custody.parent
+        if parent is None:
+            raise TTSPublishError(_PUBLISH_ERROR)
         replacing = _authorize_destination(parent, destination.name)
-        temp = _create_publication_temp(parent)
+        _create_publication_temp(parent, destination.name, custody)
+        temp = custody.temp
+        if temp is None:
+            raise TTSPublishError(_PUBLISH_ERROR)
         _copy_sealed_to_publication(stage, sealed, temp)
         _fsync_publication_file(temp.fd)
         _revalidate_parent(parent)
@@ -680,6 +716,7 @@ def _publish_one(
                 signature_is_plain = False
             if not signature_is_plain:
                 raise TTSPublishError(_PUBLISH_ERROR)
+        temp.publication_armed = True
         if publication_kind == "replace":
             if (
                 observation.current_policy is not PersistencePolicy.DURABLE
@@ -710,18 +747,19 @@ def _publish_one(
             error = ctypes.get_errno() or errno.EIO
             raise OSError(error, "durable publication unavailable")
         temp.published = True
-        try:
-            _fsync_parent(parent.fd)
-        except OSError:
-            outcome = _PublicationOutcome("uncertain")
-        else:
-            outcome = _PublicationOutcome("published")
+        _fsync_parent(parent.fd)
+        outcome = _PublicationOutcome("published")
     except AnonymousAudioScrubError:
         raise
     except Exception:
         outcome = _PublicationOutcome("failed")
+    except BaseException as exc:
+        pending_stop = exc
+        outcome = _PublicationOutcome("failed")
     finally:
-        _finish_publication_ownership(stage, temp, parent, outcome)
+        _finish_publication_ownership(stage, custody.temp, custody.parent, outcome)
+    if pending_stop is not None and outcome.status != "uncertain":
+        raise pending_stop
     return outcome
 
 
@@ -736,17 +774,54 @@ def _finish_publication_ownership(
 ) -> None:
     scrub_failed = False
     close_failed = False
+    publication_uncertain = False
     first_stop: BaseException | None = None
     if temp is not None:
+        preserve_temp = temp.published
+        if temp.published and outcome.status == "failed":
+            publication_uncertain = True
+        elif temp.publication_armed and not temp.published:
+            preserve_temp = True
+            try:
+                held = os.fstat(temp.fd)
+                try:
+                    source = os.stat(
+                        temp.name,
+                        dir_fd=parent.fd if parent is not None else None,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    source = None
+                try:
+                    destination = os.stat(
+                        temp.destination_name,
+                        dir_fd=parent.fd if parent is not None else None,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    destination = None
+                source_is_held = source is not None and (
+                    source.st_dev == held.st_dev and source.st_ino == held.st_ino
+                )
+                destination_is_held = destination is not None and (
+                    destination.st_dev == held.st_dev
+                    and destination.st_ino == held.st_ino
+                )
+                if source_is_held and not destination_is_held:
+                    preserve_temp = False
+                else:
+                    publication_uncertain = True
+            except BaseException:
+                publication_uncertain = True
         try:
-            if temp.published:
+            if preserve_temp:
                 os.close(temp.fd)
             else:
                 _scrub_and_close_fd(temp.fd)
         except BaseException as exc:
             if first_stop is None:
                 first_stop = exc
-            if temp.published:
+            if preserve_temp:
                 close_failed = True
                 try:
                     os.close(temp.fd)
@@ -781,6 +856,9 @@ def _finish_publication_ownership(
             pass
     if scrub_failed:
         raise AnonymousAudioScrubError(_SCRUB_ERROR)
+    if publication_uncertain:
+        outcome.status = "uncertain"
+        return
     if close_failed:
         if first_stop is not None and not isinstance(first_stop, Exception):
             raise first_stop

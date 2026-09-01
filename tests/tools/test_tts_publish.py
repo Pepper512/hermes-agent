@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dis
 import os
 from pathlib import Path
 import sys
@@ -7,6 +8,7 @@ import sys
 import pytest
 
 from hermes_cli.persistence import PersistencePolicy, bind_persistence_policy
+from tools import tts_publish as tts_publish_module
 from tools.tts_publish import (
     PublishedAudio,
     TTSPublishError,
@@ -24,6 +26,38 @@ from tools.tts_transaction import (
 
 
 VALID_MP3 = b"ID3\x04\x00\x00\x00\x00\x00\x00synthetic-audio"
+
+
+def _publication_implementation():
+    for cell in tts_publish_module._publish_one.__closure__ or ():
+        candidate = cell.cell_contents
+        if callable(candidate) and getattr(candidate, "__name__", None) == "_publish_one":
+            return candidate
+    return tts_publish_module._publish_one
+
+
+def _cancel_at_opcode(function, *, opname: str, argval: str, occurrence: str):
+    offsets = [
+        instruction.offset
+        for instruction in dis.get_instructions(function)
+        if instruction.opname == opname and instruction.argval == argval
+    ]
+    target = min(offsets) if occurrence == "first" else max(offsets)
+
+    def trace(frame, event, _arg):
+        if frame.f_code is function.__code__:
+            frame.f_trace_opcodes = True
+            if event == "opcode" and frame.f_lasti == target:
+                sys.settrace(None)
+                frame.f_trace = None
+                raise _OpcodeCancellation()
+        return trace
+
+    return trace
+
+
+class _OpcodeCancellation(BaseException):
+    pass
 
 
 def _sealed_stage(parent: Path, payload: bytes = VALID_MP3):
@@ -765,6 +799,210 @@ def test_source_cleanup_cancellation_is_rethrown_after_other_cleanup(
     )
     with pytest.raises((Cancelled, TTSTransactionStop)):
         _publish_one(tmp_path / "stage", destination)
+    assert all(
+        path.stat().st_size == 0
+        for path in tmp_path.glob(".hermes-tts-publish-*")
+    )
+
+
+@pytest.mark.parametrize("preexisting", [False, True])
+def test_cancellation_at_publication_status_store_preserves_linearized_bytes(
+    tmp_path: Path,
+    preexisting: bool,
+):
+    destination = tmp_path / "voice.mp3"
+    if preexisting:
+        destination.write_bytes(b"old")
+    implementation = _publication_implementation()
+    trace = _cancel_at_opcode(
+        implementation,
+        opname="STORE_ATTR",
+        argval="published",
+        occurrence="last",
+    )
+    sys.settrace(trace)
+    try:
+        with pytest.raises(TTSPublishUncertain):
+            _publish_one(tmp_path / "stage", destination)
+    finally:
+        sys.settrace(None)
+    assert destination.read_bytes() == VALID_MP3
+
+
+@pytest.mark.parametrize("preexisting", [False, True])
+def test_cancellation_after_parent_fsync_is_uncertain_and_preserves_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    preexisting: bool,
+):
+    from tools import tts_publish
+
+    destination = tmp_path / "voice.mp3"
+    if preexisting:
+        destination.write_bytes(b"old")
+    real_fsync = tts_publish._fsync_parent
+
+    def fsync_then_cancel(fd):
+        real_fsync(fd)
+        raise _OpcodeCancellation()
+
+    monkeypatch.setattr(tts_publish, "_fsync_parent", fsync_then_cancel)
+    with pytest.raises(TTSPublishUncertain):
+        _publish_one(tmp_path / "stage", destination)
+    assert destination.read_bytes() == VALID_MP3
+
+
+@pytest.mark.parametrize("preexisting", [False, True])
+def test_every_executed_opcode_through_parent_fsync_preserves_linearization(
+    tmp_path: Path,
+    preexisting: bool,
+):
+    implementation = _publication_implementation()
+    instructions = {item.offset: item for item in dis.get_instructions(implementation)}
+    start = next(
+        item.offset
+        for item in instructions.values()
+        if item.opname == "STORE_ATTR" and item.argval == "publication_armed"
+    )
+    parent_fsync_line = next(
+        item.positions.lineno
+        for item in instructions.values()
+        if item.opname == "LOAD_GLOBAL" and item.argval == "_fsync_parent"
+    )
+    end = max(
+        item.offset
+        for item in instructions.values()
+        if item.positions.lineno == parent_fsync_line
+    )
+    executed: list[int] = []
+
+    def record(frame, event, _arg):
+        if frame.f_code is implementation.__code__:
+            frame.f_trace_opcodes = True
+            if event == "opcode" and start <= frame.f_lasti <= end:
+                executed.append(frame.f_lasti)
+        return record
+
+    probe = tmp_path / "probe"
+    probe.mkdir()
+    probe_destination = probe / "voice.mp3"
+    if preexisting:
+        probe_destination.write_bytes(b"old")
+    sys.settrace(record)
+    try:
+        _publish_one(probe / "stage", probe_destination)
+    finally:
+        sys.settrace(None)
+
+    for index, target in enumerate(dict.fromkeys(executed)):
+        case = tmp_path / f"case-{index}"
+        case.mkdir()
+        destination = case / "voice.mp3"
+        if preexisting:
+            destination.write_bytes(b"old")
+
+        def cancel(frame, event, _arg, *, target=target):
+            if frame.f_code is implementation.__code__:
+                frame.f_trace_opcodes = True
+                if event == "opcode" and frame.f_lasti == target:
+                    sys.settrace(None)
+                    frame.f_trace = None
+                    raise _OpcodeCancellation()
+            return cancel
+
+        error: BaseException | None = None
+        sys.settrace(cancel)
+        try:
+            _publish_one(case / "stage", destination)
+        except BaseException as exc:
+            error = exc
+        finally:
+            sys.settrace(None)
+        if destination.exists() and destination.read_bytes() == VALID_MP3:
+            assert isinstance(error, TTSPublishUncertain), (
+                target,
+                instructions[target],
+                error,
+            )
+        elif preexisting:
+            assert destination.read_bytes() == b"old"
+            assert isinstance(error, _OpcodeCancellation)
+        else:
+            assert not destination.exists()
+            assert isinstance(error, _OpcodeCancellation)
+        assert all(
+            path.stat().st_size == 0
+            for path in case.glob(".hermes-tts-publish-*")
+        )
+
+
+@pytest.mark.parametrize("local_name", ["parent", "temp"])
+def test_acquisition_store_gap_releases_registered_descriptors(
+    tmp_path: Path,
+    local_name: str,
+):
+    descriptor_root = Path("/dev/fd" if sys.platform == "darwin" else "/proc/self/fd")
+    before = set(os.listdir(descriptor_root))
+    implementation = _publication_implementation()
+    trace = _cancel_at_opcode(
+        implementation,
+        opname="STORE_FAST",
+        argval=local_name,
+        occurrence="last",
+    )
+    sys.settrace(trace)
+    try:
+        with pytest.raises(_OpcodeCancellation):
+            _publish_one(tmp_path / "stage", tmp_path / "voice.mp3")
+    finally:
+        sys.settrace(None)
+    after = set(os.listdir(descriptor_root))
+    assert not (after - before)
+    assert all(
+        path.stat().st_size == 0
+        for path in tmp_path.glob(".hermes-tts-publish-*")
+    )
+
+
+@pytest.mark.parametrize(
+    "acquirer", ["_open_held_parent", "_create_publication_temp"]
+)
+def test_acquisition_return_to_caller_gap_uses_registered_custody(
+    tmp_path: Path,
+    acquirer: str,
+):
+    descriptor_root = Path("/dev/fd" if sys.platform == "darwin" else "/proc/self/fd")
+    before = set(os.listdir(descriptor_root))
+    implementation = _publication_implementation()
+    instructions = list(dis.get_instructions(implementation))
+    start_index = next(
+        index
+        for index, instruction in enumerate(instructions)
+        if instruction.opname == "LOAD_GLOBAL" and instruction.argval == acquirer
+    )
+    target = next(
+        instruction.offset
+        for instruction in instructions[start_index + 1 :]
+        if instruction.opname == "POP_TOP"
+    )
+
+    def cancel(frame, event, _arg):
+        if frame.f_code is implementation.__code__:
+            frame.f_trace_opcodes = True
+            if event == "opcode" and frame.f_lasti == target:
+                sys.settrace(None)
+                frame.f_trace = None
+                raise _OpcodeCancellation()
+        return cancel
+
+    sys.settrace(cancel)
+    try:
+        with pytest.raises(_OpcodeCancellation):
+            _publish_one(tmp_path / "stage", tmp_path / "voice.mp3")
+    finally:
+        sys.settrace(None)
+    after = set(os.listdir(descriptor_root))
+    assert not (after - before)
     assert all(
         path.stat().st_size == 0
         for path in tmp_path.glob(".hermes-tts-publish-*")
