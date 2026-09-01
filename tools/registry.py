@@ -189,6 +189,10 @@ def _load_discovery_cache() -> Dict[str, list]:
 
 def _save_discovery_cache(cache: Dict[str, list]) -> None:
     """Best-effort atomic write of the discovery cache. Never raises."""
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return
     path = _discovery_cache_path()
     if path is None:
         return

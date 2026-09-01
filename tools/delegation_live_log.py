@@ -124,11 +124,17 @@ class LiveTranscriptWriter:
         self._lock = threading.Lock()
         self._stream_buf: List[str] = []
         self._stream_len = 0
+        self.path: Optional[Path] = None
+        from hermes_cli.persistence import persistence_disabled
+
+        if persistence_disabled():
+            self._ok = False
+            return
         try:
             base = (root if root is not None else live_transcript_root())
             d = base / delegation_id
             d.mkdir(parents=True, exist_ok=True)
-            self.path: Optional[Path] = d / f"task-{task_index}.log"
+            self.path = d / f"task-{task_index}.log"
             header = [
                 "=== Hermes subagent live transcript ===",
                 f"delegation: {delegation_id}   task: {task_index}",
@@ -151,6 +157,10 @@ class LiveTranscriptWriter:
     # ── low-level ────────────────────────────────────────────────────────
     def event(self, role: str, text: str) -> None:
         """Append one ``HH:MM:SS role ⟩ text`` line. Flushed per event."""
+        from hermes_cli.persistence import persistence_disabled
+
+        if persistence_disabled():
+            return
         if not self._ok or self.path is None:
             return
         # Single choke point: every typed helper funnels through here, so
@@ -323,6 +333,10 @@ def create_live_transcripts(
     Also opportunistically prunes stale live dirs (retention).
     """
     n = len(task_list)
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return None, [None] * n, []
     try:
         prune_stale_live_dirs()
     except Exception:
@@ -355,6 +369,10 @@ def _manifest_path(delegation_id: str) -> Path:
 def _write_manifest(delegation_id: str, task_list: List[Dict[str, Any]],
                     paths: List[str], model: Optional[str] = None,
                     provider: Optional[str] = None) -> None:
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return
     try:
         manifest = {
             "delegation_id": delegation_id,
@@ -387,6 +405,10 @@ def _write_manifest(delegation_id: str, task_list: List[Dict[str, Any]],
 def update_manifest_statuses(delegation_id: Optional[str],
                              results: List[Dict[str, Any]]) -> None:
     """Best-effort per-task status update once the batch has aggregated."""
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return
     if not delegation_id:
         return
     try:

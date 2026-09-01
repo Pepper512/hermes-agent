@@ -22,6 +22,34 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts" / "check-windows-footguns.py"
+TTS_ANONYMOUS_PRODUCTION_FILES = (
+    "agent/tts_provider.py",
+    "hermes_cli/persistence.py",
+    "tools/tts_adapters.py",
+    "tools/tts_publish.py",
+    "tools/tts_staging.py",
+    "tools/tts_tool.py",
+    "tools/tts_transaction.py",
+)
+
+
+def test_tts_anonymous_production_has_no_windows_only_host_api_calls():
+    """Keep the Task 1-7 production surface safe to import on Windows."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            *(str(REPO_ROOT / path) for path in TTS_ANONYMOUS_PRODUCTION_FILES),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        stdin=subprocess.DEVNULL,
+    )
+    assert result.returncode == 0, (
+        "Task 1-7 Windows footgun check failed:\n"
+        f"{result.stdout}\n{result.stderr}"
+    )
 
 
 def test_full_repo_scan_has_no_unsuppressed_windows_footguns():

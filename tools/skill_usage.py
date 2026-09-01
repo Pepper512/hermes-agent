@@ -88,6 +88,11 @@ def _usage_file() -> Path:
 @contextmanager
 def _usage_file_lock():
     """Serialize .usage.json read-modify-write cycles across processes."""
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        yield
+        return
     lock_path = _usage_file().with_suffix(".json.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -680,6 +685,10 @@ def load_usage() -> Dict[str, Dict[str, Any]]:
 
 def save_usage(data: Dict[str, Dict[str, Any]]) -> bool:
     """Write the usage map atomically and report whether it committed."""
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return False
     path = _usage_file()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -750,7 +759,9 @@ def _mutate(skill_name: str, mutator, *, require_curation_eligible: bool = False
     onto a skill the curator can't manage (e.g. an ``archived`` flag on a
     hub-installed skill).
     """
-    if not skill_name:
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled() or not skill_name:
         return None
     try:
         if require_curation_eligible and not is_curation_eligible(skill_name):

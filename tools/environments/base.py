@@ -122,6 +122,10 @@ class _BoundedOutputCollector:
 
     def _maybe_spill(self, text: str) -> None:
         """Tee ``text`` to the spill file (opened lazily on first overflow)."""
+        from hermes_cli.persistence import persistence_disabled
+
+        if persistence_disabled():
+            return
         if self._spill_path is None or self._spill_capped:
             return
         try:
@@ -157,11 +161,21 @@ class _BoundedOutputCollector:
         with self._lock:
             if self._spill_fh is None:
                 return None
+            from hermes_cli.persistence import persistence_disabled
+
+            discard = persistence_disabled()
             try:
                 self._spill_fh.close()
             except OSError:
                 pass
             self._spill_fh = None
+            if discard:
+                try:
+                    if self._spill_path is not None:
+                        self._spill_path.unlink()
+                except OSError:
+                    pass
+                return None
             return str(self._spill_path)
 
     @property
@@ -1055,7 +1069,9 @@ class BaseEnvironment(ABC):
             # accumulate-everything semantics.
             capture_limit = _UNBOUNDED_CAPTURE_CHARS
         spill_path = None
-        if bounded_capture:
+        from hermes_cli.persistence import persistence_disabled
+
+        if bounded_capture and not persistence_disabled():
             # Foreground terminal path: tee overflow to a spill file so a
             # truncated result is recoverable without re-running (the file
             # only gets created if output actually exceeds the cap).

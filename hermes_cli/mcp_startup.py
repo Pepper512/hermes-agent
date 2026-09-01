@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 from contextlib import nullcontext
+from contextvars import copy_context
 from typing import Optional
 
 _mcp_discovery_lock = threading.Lock()
@@ -110,8 +111,10 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
                     global _mcp_discovery_thread, _mcp_discovery_started
                     _mcp_discovery_thread = None
 
+        context = copy_context()
         thread = threading.Thread(
-            target=_discover,
+            target=context.run,
+            args=(_discover,),
             name=thread_name,
             daemon=True,
         )

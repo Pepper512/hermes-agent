@@ -91,6 +91,36 @@ def test_pre_transcription_in_valid_hooks():
     assert "pre_transcription" in plugins_mod.VALID_HOOKS
 
 
+def test_ephemeral_policy_suppresses_raw_pre_transcription_payload(monkeypatch):
+    from hermes_cli.persistence import PersistencePolicy, bind_persistence_policy
+
+    captured = []
+    monkeypatch.setattr(
+        plugins_mod,
+        "has_hook",
+        lambda name: captured.append(("has", name)) or True,
+    )
+    monkeypatch.setattr(
+        plugins_mod,
+        "invoke_hook",
+        lambda name, **kwargs: captured.append((name, kwargs))
+        or [{"prompt": "rewritten"}],
+    )
+
+    with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
+        result = transcription_tools._apply_pre_transcription_hook(
+            file_path="/private/audio/path.ogg",
+            provider="private-provider",
+            model="private-model",
+            language="en",
+            prompt="private-prompt",
+            source="private-source",
+        )
+
+    assert result == ("private-model", None, "private-prompt")
+    assert captured == []
+
+
 # ---------------------------------------------------------------------------
 # Prompt threading into backends (API boundary stubbed)
 # ---------------------------------------------------------------------------

@@ -422,6 +422,10 @@ def install_cli(timeout_s: int = 600) -> Tuple[bool, str]:
 
 def _workspace_dir(task_id: Optional[str]) -> Optional[str]:
     """Stable per-task scratch dir that persists across browser_exec calls"""
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return None
     existing = os.environ.get("BH_AGENT_WORKSPACE")
     if existing:
         return existing
@@ -733,6 +737,15 @@ def browser_exec(
 ):
     """Run Python code through the browser-use CLI, and return its output"""
     from tools.registry import tool_error, tool_result
+    from hermes_cli.persistence import persistence_disabled
+
+    # Browser Use owns daemon/session/runtime artifacts outside Hermes's
+    # process and workspace.  Hermes cannot prove exclusive ownership of
+    # those paths (especially named-session IPC and screenshot paths), so an
+    # ephemeral invocation must fail closed before discovery, configuration,
+    # backend resolution, or subprocess launch can create any of them.
+    if persistence_disabled():
+        return tool_error("browser-use is unavailable in ephemeral mode", success=False)
 
     if not code or not code.strip():
         return tool_error("No code provided. Pass Python that uses the pre-imported helpers, e.g. new_tab(\"https://example.com\") then print(page_info()).")
@@ -846,10 +859,12 @@ def browser_exec(
     except OSError as e:
         return tool_error(f"Failed to launch browser-use CLI: {e}")
 
+    stdout = proc.stdout or ""
+
     result = {
         "success": proc.returncode == 0,
         "exit_code": proc.returncode,
-        "output": proc.stdout,
+        "output": stdout,
     }
     if workspace:
         result["workspace"] = workspace

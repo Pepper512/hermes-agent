@@ -30,6 +30,11 @@ from typing import Optional
 
 from gateway.session_context import declare_stateless_channel
 from hermes_cli.fallback_config import get_fallback_chain
+from hermes_cli.persistence import (
+    PersistencePolicy,
+    bind_persistence_policy,
+    coerce_persistence_policy,
+)
 
 
 def _normalize_toolsets(toolsets: object = None) -> list[str] | None:
@@ -206,6 +211,7 @@ def run_oneshot(
     toolsets: object = None,
     skills: object = None,
     usage_file: Optional[str] = None,
+    persistence_policy: object = PersistencePolicy.DURABLE,
 ) -> int:
     """Execute a single prompt and print only the final content block.
 
@@ -224,6 +230,37 @@ def run_oneshot(
 
     Returns the exit code.  The caller owns process termination.
     """
+    policy = coerce_persistence_policy(persistence_policy)
+    # Bind before any config, plugin, model, SessionDB, memory, or logging
+    # helper runs.  This makes the invocation policy visible to lower-level
+    # fail-closed guards for the complete one-shot lifecycle.
+    with bind_persistence_policy(policy):
+        return _run_oneshot_bound(
+            prompt,
+            model=model,
+            provider=provider,
+            toolsets=toolsets,
+            skills=skills,
+            usage_file=usage_file,
+            policy=policy,
+        )
+
+
+def _run_oneshot_bound(
+    prompt: str,
+    *,
+    model: Optional[str],
+    provider: Optional[str],
+    toolsets: object,
+    skills: object,
+    usage_file: Optional[str],
+    policy: PersistencePolicy,
+) -> int:
+    """Run one invocation with its persistence policy already bound."""
+    if policy is PersistencePolicy.EPHEMERAL and usage_file:
+        sys.stderr.write("hermes -z: invalid ephemeral invocation\n")
+        return 2
+
     # Silence every stdlib logger for the duration.  AIAgent, tools, and
     # provider adapters all log to stderr through the root logger; file
     # handlers added by setup_logging() keep working (they're attached to
@@ -283,6 +320,7 @@ def run_oneshot(
                     toolsets=explicit_toolsets,
                     use_config_toolsets=use_config_toolsets,
                     skills=skills,
+                    persistence_policy=policy,
                 )
             except BaseException as exc:  # noqa: BLE001
                 # Capture anything that escapes the agent (including OSError
@@ -303,10 +341,14 @@ def run_oneshot(
         # Re-raise control-flow exceptions so the parent handles them as usual
         # (Ctrl-C / explicit sys.exit() inside the agent).
         if isinstance(failure, (KeyboardInterrupt, SystemExit)):
-            _write_usage_file(usage_file, result, failure=repr(failure))
+            if policy is PersistencePolicy.DURABLE:
+                _write_usage_file(usage_file, result, failure=repr(failure))
             raise failure
-        _write_usage_file(usage_file, result, failure=str(failure))
-        real_stderr.write(f"hermes -z: agent failed: {failure}\n")
+        if policy is PersistencePolicy.DURABLE:
+            _write_usage_file(usage_file, result, failure=str(failure))
+            real_stderr.write(f"hermes -z: agent failed: {failure}\n")
+        else:
+            real_stderr.write("hermes -z: agent failed\n")
         real_stderr.flush()
         return 1
 
@@ -361,6 +403,7 @@ def _run_agent(
     toolsets: object = None,
     use_config_toolsets: bool = True,
     skills: object = None,
+    persistence_policy: object = PersistencePolicy.DURABLE,
 ) -> tuple[str, dict]:
     """Build an AIAgent exactly like a normal CLI chat turn would, then
     run a single conversation.  Returns ``(final_response, run_result)``."""
@@ -477,7 +520,9 @@ def _run_agent(
 
     skills_prompt = _build_preloaded_skills_prompt(skills)
 
-    session_db = _create_session_db_for_oneshot()
+    policy = coerce_persistence_policy(persistence_policy)
+    ephemeral = policy is PersistencePolicy.EPHEMERAL
+    session_db = None if ephemeral else _create_session_db_for_oneshot()
     # The try spans agent construction (not just ``chat``) so the SQLite store
     # opened above is always closed — including when ``AIAgent(...)`` itself
     # raises on a provider/config error. The one-shot exit path hard-exits via
@@ -500,6 +545,9 @@ def _run_agent(
             quiet_mode=True,
             platform="cli",
             session_db=session_db,
+            persistence_policy=policy,
+            skip_memory=ephemeral,
+            skip_background_review=ephemeral,
             credential_pool=runtime.get("credential_pool"),
             fallback_model=_fb or None,
             ephemeral_system_prompt=skills_prompt,

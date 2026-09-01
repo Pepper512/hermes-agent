@@ -853,6 +853,10 @@ def _save_blocked_payload(command: str) -> Optional[str]:
     Returns the saved path, or None on any failure (the hint then falls
     back to the manual write_file recipe).
     """
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return None
     try:
         from hermes_constants import get_hermes_home
         import time as _time

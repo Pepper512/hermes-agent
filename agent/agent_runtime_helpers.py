@@ -513,7 +513,9 @@ def note_turn_start(agent, turn_id: str):
     # false overlap against the parent's real turn) nor pop the parent's
     # slot at their persist (note_turn_persisted skips them symmetrically).
     session_id = getattr(agent, "session_id", None)
-    if session_id and not getattr(agent, "_persist_disabled", False):
+    from hermes_cli.persistence import persistence_disabled
+
+    if session_id and not persistence_disabled(agent):
         now = time.time()
         with _INFLIGHT_TURNS_LOCK:
             entry = _INFLIGHT_TURNS_BY_SESSION.get(session_id)
@@ -549,7 +551,9 @@ def note_turn_persisted(agent):
     # forks never registered a session slot, and their persist funnel still
     # runs — popping here would steal the live parent turn's slot and make
     # the tripwire under-report the real overlap it exists to catch.
-    if not getattr(agent, "_persist_disabled", False):
+    from hermes_cli.persistence import persistence_disabled
+
+    if not persistence_disabled(agent):
         session_id = getattr(agent, "_inflight_turn_session_id", None) or getattr(
             agent, "session_id", None
         )
@@ -2061,6 +2065,10 @@ def dump_api_request_debug(
     like timeout). Intended for debugging provider-side 4xx failures where
     retries are not useful.
     """
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled(agent):
+        return None
     try:
         body = copy.deepcopy(api_kwargs)
         body.pop("timeout", None)

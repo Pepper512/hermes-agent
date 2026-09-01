@@ -60,6 +60,24 @@ def test_no_hook_falls_through_to_builtin(monkeypatch):
     assert result.retryable is True
 
 
+def test_ephemeral_policy_suppresses_raw_error_classification_dispatch(monkeypatch):
+    from hermes_cli.persistence import PersistencePolicy, bind_persistence_policy
+
+    captured = []
+
+    def capture(name, **kwargs):
+        captured.append((name, kwargs))
+        return [{"reason": "billing"}]
+
+    monkeypatch.setattr(plugins_mod, "invoke_hook", capture)
+
+    with bind_persistence_policy(PersistencePolicy.EPHEMERAL):
+        result = _classify_unclaimed_error()
+
+    assert result.reason == FailoverReason.unknown
+    assert captured == []
+
+
 # ── Plugin classification wins over built-ins ───────────────────────────
 
 

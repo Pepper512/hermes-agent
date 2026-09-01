@@ -47,7 +47,7 @@ import datetime
 import logging
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -235,6 +235,10 @@ def normalize_reference_images(value: Any) -> Optional[List[str]]:
 
 def _images_cache_dir() -> Path:
     """Return ``$HERMES_HOME/cache/images/``, creating parents as needed."""
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        raise RuntimeError("image cache unavailable in ephemeral mode")
     from hermes_constants import get_hermes_home
 
     path = get_hermes_home() / "cache" / "images"
@@ -247,7 +251,7 @@ def save_b64_image(
     *,
     prefix: str = "image",
     extension: str = "png",
-) -> Path:
+) -> Union[Path, str]:
     """Decode base64 image data and write it under ``$HERMES_HOME/cache/images/``.
 
     Returns the absolute :class:`Path` to the saved file.
@@ -255,6 +259,13 @@ def save_b64_image(
     Filename format: ``<prefix>_<YYYYMMDD_HHMMSS>_<short-uuid>.<ext>``.
     """
     raw = base64.b64decode(b64_data)
+    if len(raw) > 25 * 1024 * 1024:
+        raise ValueError("Generated image exceeds 25MB in-memory cap")
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        mime_extension = "jpeg" if extension.lower() in {"jpg", "jpeg"} else extension.lower()
+        return f"data:image/{mime_extension};base64,{base64.b64encode(raw).decode('ascii')}"
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     short = uuid.uuid4().hex[:8]
     path = _images_cache_dir() / f"{prefix}_{ts}_{short}.{extension}"
@@ -281,7 +292,7 @@ def save_url_image(
     prefix: str = "image",
     timeout: float = 60.0,
     max_bytes: int = 25 * 1024 * 1024,
-) -> Path:
+) -> Union[Path, str]:
     """Download an image URL and write it under ``$HERMES_HOME/cache/images/``.
 
     Used by providers (xAI, fallback OpenAI) whose API returns an *ephemeral*
@@ -312,6 +323,22 @@ def save_url_image(
                 break
     if extension is None:
         extension = "png"
+
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        payload = bytearray()
+        for chunk in response.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            payload.extend(chunk)
+            if len(payload) > max_bytes:
+                raise ValueError("Generated image exceeds in-memory cap")
+        if not payload:
+            raise ValueError("Generated image was empty")
+        mime_extension = "jpeg" if extension in {"jpg", "jpeg"} else extension
+        encoded = base64.b64encode(bytes(payload)).decode("ascii")
+        return f"data:image/{mime_extension};base64,{encoded}"
 
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     short = uuid.uuid4().hex[:8]

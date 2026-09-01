@@ -28,8 +28,6 @@ import os
 import uuid
 from typing import Any, Dict
 
-from hermes_constants import get_hermes_home
-
 logger = logging.getLogger(__name__)
 
 
@@ -41,25 +39,35 @@ class DebugSession:
     """
 
     def __init__(self, tool_name: str, *, env_var: str) -> None:
+        from hermes_cli.persistence import persistence_disabled
+
         self.tool_name = tool_name
-        self.enabled = os.getenv(env_var, "false").lower() == "true"
+        self.enabled = (
+            os.getenv(env_var, "false").lower() == "true"
+            and not persistence_disabled()
+        )
         self.session_id = str(uuid.uuid4()) if self.enabled else ""
-        self.log_dir = get_hermes_home() / "logs"
+        self.log_dir = None
         self._calls: list[Dict[str, Any]] = []
         self._start_time = datetime.datetime.now().isoformat() if self.enabled else ""
 
         if self.enabled:
+            from hermes_constants import get_hermes_home
+
+            self.log_dir = get_hermes_home() / "logs"
             self.log_dir.mkdir(parents=True, exist_ok=True)
             logger.debug("%s debug mode enabled - Session ID: %s",
                          tool_name, self.session_id)
 
     @property
     def active(self) -> bool:
-        return self.enabled
+        from hermes_cli.persistence import persistence_disabled
+
+        return self.enabled and not persistence_disabled()
 
     def log_call(self, call_name: str, call_data: Dict[str, Any]) -> None:
         """Append a tool-call entry to the in-memory log."""
-        if not self.enabled:
+        if not self.active:
             return
         self._calls.append({
             "timestamp": datetime.datetime.now().isoformat(),
@@ -69,7 +77,7 @@ class DebugSession:
 
     def save(self) -> None:
         """Flush the in-memory log to a JSON file in the logs directory."""
-        if not self.enabled:
+        if not self.active or self.log_dir is None:
             return
         try:
             filename = f"{self.tool_name}_debug_{self.session_id}.json"
@@ -90,7 +98,7 @@ class DebugSession:
 
     def get_session_info(self) -> Dict[str, Any]:
         """Return a summary dict suitable for returning from get_debug_session_info()."""
-        if not self.enabled:
+        if not self.active or self.log_dir is None:
             return {
                 "enabled": False,
                 "session_id": None,

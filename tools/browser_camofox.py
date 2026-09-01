@@ -861,6 +861,9 @@ def camofox_get_images(task_id: Optional[str] = None) -> str:
 def camofox_vision(question: str, annotate: bool = False,
                    task_id: Optional[str] = None) -> str:
     """Take a screenshot and analyze it with vision AI via Camofox."""
+    from hermes_cli.persistence import persistence_disabled
+
+    ephemeral = persistence_disabled()
     try:
         session = _get_session(task_id)
         if not session["tab_id"]:
@@ -876,14 +879,18 @@ def camofox_vision(question: str, annotate: bool = False,
             params={"userId": session["user_id"]},
         )
 
-        # Save screenshot to cache
-        from hermes_constants import get_hermes_home
-        screenshots_dir = get_hermes_home() / "browser_screenshots"
-        screenshots_dir.mkdir(parents=True, exist_ok=True)
-        screenshot_path = str(screenshots_dir / f"browser_screenshot_{uuid.uuid4().hex[:8]}.png")
+        screenshot_path = None
+        if not ephemeral:
+            # Durable mode keeps its existing user-shareable capture.
+            from hermes_constants import get_hermes_home
 
-        with open(screenshot_path, "wb") as f:
-            f.write(resp.content)
+            screenshots_dir = get_hermes_home() / "browser_screenshots"
+            screenshots_dir.mkdir(parents=True, exist_ok=True)
+            screenshot_path = str(
+                screenshots_dir / f"browser_screenshot_{uuid.uuid4().hex[:8]}.png"
+            )
+            with open(screenshot_path, "wb") as f:
+                f.write(resp.content)
 
         # Encode for vision LLM
         img_b64 = base64.b64encode(resp.content).decode("utf-8")
@@ -946,12 +953,16 @@ def camofox_vision(question: str, annotate: bool = False,
         from agent.redact import redact_sensitive_text
         analysis = redact_sensitive_text(analysis)
 
-        return json.dumps({
+        response_data = {
             "success": True,
             "analysis": analysis,
-            "screenshot_path": screenshot_path,
-        })
+        }
+        if screenshot_path is not None:
+            response_data["screenshot_path"] = screenshot_path
+        return json.dumps(response_data)
     except Exception as e:
+        if ephemeral:
+            return tool_error("Browser vision analysis failed", success=False)
         return tool_error(str(e), success=False)
 
 
@@ -970,5 +981,4 @@ def camofox_console(clear: bool = False, task_id: Optional[str] = None) -> str:
         "note": "Console log capture is not available with the Camofox backend. "
                 "Use browser_snapshot or browser_vision to inspect page state.",
     })
-
 

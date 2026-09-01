@@ -1524,7 +1524,9 @@ def clear_skills_system_prompt_cache(*, clear_snapshot: bool = False) -> None:
     """Drop the in-process skills prompt cache (and optionally the disk snapshot)."""
     with _SKILLS_PROMPT_CACHE_LOCK:
         _SKILLS_PROMPT_CACHE.clear()
-    if clear_snapshot:
+    from hermes_cli.persistence import persistence_disabled
+
+    if clear_snapshot and not persistence_disabled():
         try:
             _skills_prompt_snapshot_path().unlink(missing_ok=True)
         except OSError as e:
@@ -1601,6 +1603,10 @@ def _write_skills_snapshot(
     category_descriptions: dict[str, str],
 ) -> None:
     """Persist skill metadata to disk for fast cold-start reuse."""
+    from hermes_cli.persistence import persistence_disabled
+
+    if persistence_disabled():
+        return
     payload = {
         "version": _SKILLS_SNAPSHOT_VERSION,
         "manifest": manifest,
